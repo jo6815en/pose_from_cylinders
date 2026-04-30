@@ -122,6 +122,28 @@ class CylinderHead(nn.Module):
         confidence = torch.sigmoid(y[..., 4:5])  # [0, 1]
 
         return torch.cat([center, radius, confidence], dim=-1)
+    
+class VisionHead(nn.Module):
+    def __init__(self, embed_dim=256, num_bins=32):
+        super().__init__()
+        self.num_bins = num_bins
+
+        self.mlp = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim),
+            nn.GELU(),
+            nn.Linear(embed_dim, num_bins * 3),
+        )
+
+    def forward(self, x):
+        y = self.mlp(x)  # (B, num_bins*3)
+        y = y.view(x.shape[0], self.num_bins, 3)
+
+        # unpack
+        occ = torch.sigmoid(y[..., 0])          # [0,1]
+        radius = F.softplus(y[..., 1])          # >0
+        depth = F.softplus(y[..., 2])           # >0
+
+        return torch.stack([occ, radius, depth], dim=-1)
 
 
 class PairImageCylinderModel(nn.Module):
@@ -146,7 +168,7 @@ class PairImageCylinderModel(nn.Module):
             num_heads=num_heads,
             dropout=dropout,
         )
-        self.head = CylinderHead(embed_dim=embed_dim, num_cylinders=num_cylinders)
+        self.head = VisionHead(embed_dim=embed_dim, num_bins=32)
 
     def forward(self, img_a, img_b):
         feat = self.backbone(img_a, img_b)

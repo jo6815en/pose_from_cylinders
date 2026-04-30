@@ -2,6 +2,50 @@ import torch
 import torch.nn.functional as F
 from scipy.optimize import linear_sum_assignment
 
+def vision_supervised_loss(
+    pred,
+    target,
+    lambda_occ=1.0,
+    lambda_radius=1.0,
+    lambda_depth=1.0,
+):
+    """
+    pred, target: [B, num_bins, 3]
+    """
+
+    occ_p = pred[..., 0]
+    rad_p = pred[..., 1]
+    dep_p = pred[..., 2]
+
+    occ_t = target[..., 0]
+    rad_t = target[..., 1]
+    dep_t = target[..., 2]
+
+    # -----------------------
+    # 1. Occupancy (classification)
+    # -----------------------
+    occ_loss = F.binary_cross_entropy(occ_p, occ_t)
+
+    # -----------------------
+    # 2. Mask (där cylinder finns)
+    # -----------------------
+    mask = occ_t > 0.5
+
+    if mask.any():
+        radius_loss = F.mse_loss(rad_p[mask], rad_t[mask])
+        depth_loss = F.mse_loss(dep_p[mask], dep_t[mask])
+    else:
+        radius_loss = torch.tensor(0.0, device=pred.device)
+        depth_loss = torch.tensor(0.0, device=pred.device)
+
+    total = (
+        lambda_occ * occ_loss +
+        lambda_radius * radius_loss +
+        lambda_depth * depth_loss
+    )
+
+    return total
+
 def consistency_loss(pred1, pred2, lambda_radius=1.0, lambda_conf=0.1, lambda_conf_reg=0.01):
     """
     pred1, pred2: [B, K, 5]
