@@ -18,8 +18,8 @@ class PatchEmbed(nn.Module):
         )
 
     def forward(self, x):
-        x = self.proj(x)
-        x = x.flatten(2).transpose(1, 2)
+        x = self.proj(x)                 # (B, D, H', W')
+        x = x.flatten(2).transpose(1, 2) # (B, N, D)
         return x
 
 
@@ -98,36 +98,13 @@ class PairViTBackbone(nn.Module):
             x = block(x)
 
         x = self.norm(x)
-        return x[:, 0]
+        return x[:, 0]  # CLS token
 
 
-class CylinderHead(nn.Module):
-    def __init__(self, embed_dim=256, num_cylinders=4):
-        super().__init__()
-        self.num_cylinders = num_cylinders
-        self.out_dim = num_cylinders * 5  # (cx, cy, cz, radius, confidence)
-
-        self.mlp = nn.Sequential(
-            nn.Linear(embed_dim, embed_dim),
-            nn.GELU(),
-            nn.Linear(embed_dim, self.out_dim),
-        )
-
-    def forward(self, x):
-        y = self.mlp(x)
-        y = y.view(x.shape[0], self.num_cylinders, 5)
-
-        center = torch.tanh(y[..., 0:3])      # [-1, 1]
-        radius = F.softplus(y[..., 3:4])      # > 0
-        confidence = torch.sigmoid(y[..., 4:5])  # [0, 1]
-
-        return torch.cat([center, radius, confidence], dim=-1)
-    
 class VisionHead(nn.Module):
     def __init__(self, embed_dim=256, num_bins=32):
         super().__init__()
         self.num_bins = num_bins
-
         self.mlp = nn.Sequential(
             nn.Linear(embed_dim, embed_dim),
             nn.GELU(),
@@ -135,15 +112,32 @@ class VisionHead(nn.Module):
         )
 
     def forward(self, x):
-        y = self.mlp(x)  # (B, num_bins*3)
+        y = self.mlp(x)  # (B, num_bins * 3)
         y = y.view(x.shape[0], self.num_bins, 3)
 
-        # unpack
-        occ = torch.sigmoid(y[..., 0])          # [0,1]
-        radius = F.softplus(y[..., 1])          # >0
-        depth = F.softplus(y[..., 2])           # >0
+        occ = torch.sigmoid(y[..., 0])      # [0, 1]
+        radius = F.softplus(y[..., 1])     # > 0
+        depth = F.softplus(y[..., 2])      # > 0
 
-        return torch.stack([occ, radius, depth], dim=-1)
+        return torch.stack([occ, radius, depth], dim=-1)  # (B, num_bins, 3)
+
+
+class PoseHead(nn.Module):
+    def __init__(self, embed_dim=256, hidden_dim=256):
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(embed_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, 4),  # tx, ty, sin(yaw), cos(yaw)
+        )
+
+    def forward(self, x):
+        y = self.mlp(x)
+        t = y[:, :2]
+        yaw_vec = F.normalize(y[:, 2:], dim=-1)
+        return torch.cat([t, yaw_vec], dim=-1)
 
 
 class PairImageCylinderModel(nn.Module):
@@ -155,7 +149,7 @@ class PairImageCylinderModel(nn.Module):
         embed_dim=256,
         depth=4,
         num_heads=4,
-        num_cylinders=4,
+        num_bins=32,
         dropout=0.1,
     ):
         super().__init__()
@@ -168,9 +162,11 @@ class PairImageCylinderModel(nn.Module):
             num_heads=num_heads,
             dropout=dropout,
         )
-        self.head = VisionHead(embed_dim=embed_dim, num_bins=32)
+        self.vision_head = VisionHead(embed_dim=embed_dim, num_bins=num_bins)
+        self.pose_head = PoseHead(embed_dim=embed_dim)
 
     def forward(self, img_a, img_b):
         feat = self.backbone(img_a, img_b)
-        return self.head(feat)
-
+        vision_pred = self.vision_head(feat)
+        pose_pred = self.pose_head(feat)
+        return vision_pred, pose_pred

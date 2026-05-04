@@ -2,49 +2,85 @@ import torch
 import torch.nn.functional as F
 from scipy.optimize import linear_sum_assignment
 
-def vision_supervised_loss(
-    pred,
-    target,
-    lambda_occ=1.0,
-    lambda_radius=1.0,
-    lambda_depth=1.0,
-):
+import torch
+import torch.nn.functional as F
+
+
+def vision_loss(pred_vision, target_vision):
     """
-    pred, target: [B, num_bins, 3]
+    pred_vision:   (B, num_bins, 3)
+    target_vision:  (B, num_bins, 3)
+
+    Kan användas direkt om target har samma struktur:
+    [occupancy, radius, depth]
     """
+    pred_occ = pred_vision[..., 0]
+    pred_rad = pred_vision[..., 1]
+    pred_dep = pred_vision[..., 2]
 
-    occ_p = pred[..., 0]
-    rad_p = pred[..., 1]
-    dep_p = pred[..., 2]
+    tgt_occ = target_vision[..., 0]
+    tgt_rad = target_vision[..., 1]
+    tgt_dep = target_vision[..., 2]
 
-    occ_t = target[..., 0]
-    rad_t = target[..., 1]
-    dep_t = target[..., 2]
-
-    # -----------------------
-    # 1. Occupancy (classification)
-    # -----------------------
-    occ_loss = F.binary_cross_entropy(occ_p, occ_t)
-
-    # -----------------------
-    # 2. Mask (där cylinder finns)
-    # -----------------------
-    mask = occ_t > 0.5
-
-    if mask.any():
-        radius_loss = F.mse_loss(rad_p[mask], rad_t[mask])
-        depth_loss = F.mse_loss(dep_p[mask], dep_t[mask])
-    else:
-        radius_loss = torch.tensor(0.0, device=pred.device)
-        depth_loss = torch.tensor(0.0, device=pred.device)
-
-    total = (
-        lambda_occ * occ_loss +
-        lambda_radius * radius_loss +
-        lambda_depth * depth_loss
+    # Om occupancy är 0/1 fungerar BCE bra.
+    # Om dina targets är mjuka värden kan MSE också fungera.
+    occ_loss = F.binary_cross_entropy(
+        pred_occ.clamp(1e-6, 1 - 1e-6),
+        tgt_occ
     )
 
-    return total
+    rad_loss = F.smooth_l1_loss(pred_rad, tgt_rad)
+    dep_loss = F.smooth_l1_loss(pred_dep, tgt_dep)
+
+    return occ_loss + rad_loss + dep_loss
+
+
+def pose_loss(pred_pose, target_pose, t_weight=1.0, q_weight=1.0):
+    """
+    pred_pose:   (B, 7) = [tx, ty, tz, qw, qx, qy, qz]
+    target_pose:  (B, 7)
+    """
+    pred_t = pred_pose[:, :3]
+    pred_q = F.normalize(pred_pose[:, 3:], dim=-1)
+
+    tgt_t = target_pose[:, :3]
+    tgt_q = F.normalize(target_pose[:, 3:], dim=-1)
+
+    # Translation
+    t_loss = F.smooth_l1_loss(pred_t, tgt_t)
+
+    # Quaternion:
+    # q och -q representerar samma rotation, så vi tar absolutvärdet.
+    dot = torch.sum(pred_q * tgt_q, dim=-1).abs()
+    q_loss = (1.0 - dot).mean()
+
+    return t_weight * t_loss + q_weight * q_loss
+
+def pose_loss_2d(pred_pose, target_pose, t_weight=1.0, yaw_weight=1.0):
+    """
+    pred_pose:   (B, 4) = [tx, ty, sin(yaw), cos(yaw)]
+    target_pose: (B, 4)
+    """
+    pred_t = pred_pose[:, :2]
+    pred_yaw_vec = F.normalize(pred_pose[:, 2:], dim=-1)
+
+    tgt_t = target_pose[:, :2]
+    tgt_yaw_vec = F.normalize(target_pose[:, 2:], dim=-1)
+
+    # translation i xy
+    t_loss = F.smooth_l1_loss(pred_t, tgt_t)
+
+    # yaw via sin/cos
+    yaw_loss = F.mse_loss(pred_yaw_vec, tgt_yaw_vec)
+
+    return t_weight * t_loss + yaw_weight * yaw_loss
+
+
+def supervised_loss(pred_vision, target_vision, pred_pose, target_pose, lambda_pose=1.0):
+    l_vis = vision_loss(pred_vision, target_vision)
+    l_pose = pose_loss_2d(pred_pose, target_pose)
+    return l_vis + lambda_pose * l_pose, l_vis, l_pose
+
 
 def consistency_loss(pred1, pred2, lambda_radius=1.0, lambda_conf=0.1, lambda_conf_reg=0.01):
     """
