@@ -1,75 +1,125 @@
-from pathlib import Path
-import random
+from __future__ import annotations
+
 import json
-from PIL import Image
+import random
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Dict, List, Optional
 
 import torch
+from PIL import Image
 from torch.utils.data import Dataset
 from torchvision import transforms
 
 
+@dataclass(frozen=True)
+class _Sample:
+    scene_dir: Path
+    pair: Dict[str, Any]
+    scene_camera1: Optional[Dict[str, Any]]
+    scene_camera2: Optional[Dict[str, Any]]
+
+
 class SceneTwoPairsDataset(Dataset):
+    """Dataset for paired cylinder scenes.
+
+    Each dataset item corresponds to one pair inside one scene.
+    This avoids the old behavior where __getitem__ randomly sampled a pair
+    from a scene, which made epoch length and sampling non-deterministic.
+    """
+
     def __init__(
         self,
-        root_dir="dataset",
-        image_size=128,
-        scale_xy=2.8, 
-        return_paths=False,
-    ):
+        root_dir: str | Path = "dataset",
+        image_size: int = 128,
+        return_paths: bool = False,
+        shuffle_pairs: bool = False,
+    ) -> None:
         self.root_dir = Path(root_dir)
         self.return_paths = return_paths
-        self.scale_xy = scale_xy
+        self.shuffle_pairs = shuffle_pairs
 
-        self.transform = transforms.Compose([
-            transforms.Resize((image_size, image_size)),
-            transforms.ToTensor(),
-        ])
+        self.transform = transforms.Compose(
+            [
+                transforms.Resize((image_size, image_size)),
+                transforms.ToTensor(),
+            ]
+        )
 
-        self.scenes = []
-
+        self.samples: List[_Sample] = []
         for scene_dir in sorted(self.root_dir.glob("scene_*")):
             label_file = scene_dir / "labels.json"
             if not label_file.exists():
                 continue
 
-            with open(label_file, "r") as f:
+            with open(label_file, "r", encoding="utf-8") as f:
                 data = json.load(f)
 
             pairs = data.get("pairs", [])
-            if len(pairs) >= 1:
-                self.scenes.append(data)
+            if not isinstance(pairs, list) or not pairs:
+                continue
 
-        if not self.scenes:
-            raise ValueError(f"Inga scener hittades i {root_dir}")
+            scene_camera1 = data.get("camera1")
+            scene_camera2 = data.get("camera2")
 
-        self.length = len(self.scenes)
+            for pair in pairs:
+                if not isinstance(pair, dict):
+                    continue
+                if "image1" not in pair or "image2" not in pair:
+                    continue
+                if "vision1" not in pair or "vision2" not in pair:
+                    continue
+                self.samples.append(
+                    _Sample(
+                        scene_dir=scene_dir,
+                        pair=pair,
+                        scene_camera1=scene_camera1,
+                        scene_camera2=scene_camera2,
+                    )
+                )
 
-    def __len__(self):
-        return self.length
+        if not self.samples:
+            raise ValueError(f"Inga giltiga par hittades i {self.root_dir}")
 
-    def _load_image(self, path):
-        return self.transform(Image.open(path).convert("RGB"))
+    def __len__(self) -> int:
+        return len(self.samples)
 
-    def _load_vision(self, vision):
-        return torch.tensor(vision, dtype=torch.float32)
+    def _resolve_path(self, scene_dir: Path, maybe_path: Any) -> Path:
+        path = Path(maybe_path)
+        if path.is_absolute():
+            return path
 
-    def _camera_to_matrix(self, camera):
-        """
-        Bygger world->camera extrinsic-matris från R och t.
-        Förutsätter att camera["R"] och camera["t"] finns.
-        """
-        R = torch.tensor(camera["R"], dtype=torch.float32)
-        t = torch.tensor(camera["t"], dtype=torch.float32).view(3)
+        candidate = scene_dir / path
+        if candidate.exists():
+            return candidate
+
+        # Fall back to the raw relative path so callers get a useful error later.
+        return path
+
+    def _load_image(self, path: Path) -> torch.Tensor:
+        with Image.open(path) as img:
+            img = img.convert("RGB")
+            return self.transform(img)
+
+    def _load_vision(self, vision: Any) -> torch.Tensor:
+        return torch.as_tensor(vision, dtype=torch.float32)
+
+    def _camera_to_matrix(self, camera: Dict[str, Any]) -> torch.Tensor:
+        if "R" not in camera or "t" not in camera:
+            raise KeyError('camera måste innehålla nycklarna "R" och "t"')
+
+        R = torch.as_tensor(camera["R"], dtype=torch.float32)
+        t = torch.as_tensor(camera["t"], dtype=torch.float32).reshape(3)
+
+        if R.shape != (3, 3):
+            raise ValueError(f"Förväntade R med shape (3, 3), fick {tuple(R.shape)}")
 
         T = torch.eye(4, dtype=torch.float32)
         T[:3, :3] = R
         T[:3, 3] = t
         return T
 
-    def _rotation_matrix_to_quaternion(self, R):
-        """
-        Returnerar quaternion som [qw, qx, qy, qz].
-        """
+    def _rotation_matrix_to_quaternion(self, R: torch.Tensor) -> torch.Tensor:
         trace = R[0, 0] + R[1, 1] + R[2, 2]
 
         if trace > 0.0:
@@ -100,103 +150,58 @@ class SceneTwoPairsDataset(Dataset):
         q = torch.stack([qw, qx, qy, qz])
         q = q / (torch.linalg.norm(q) + 1e-8)
 
-        # Gör representationen unik-ish
+        # Make the representation deterministic up to sign.
         if q[0] < 0:
             q = -q
-
         return q
-    
-    def _yaw_from_rotation_matrix(self, R):
-        """
-        Antag z-up: yaw runt z-axeln.
-        Returnerar vinkel i radianer.
-        """
-        return torch.atan2(R[1, 0], R[0, 0])
 
-    def _relative_pose(self, camera1, camera2):
-        """
-        Returnerar relativ pose som:
-        [tx, ty, tz, qw, qx, qy, qz]
-        för transformen från camera1 till camera2.
-
-        Förutsätter world->camera extrinsics.
-        """
+    def _relative_pose(self, camera1: Dict[str, Any], camera2: Dict[str, Any]) -> torch.Tensor:
         T1 = self._camera_to_matrix(camera1)
         T2 = self._camera_to_matrix(camera2)
-
-        # relativ transform från 1 till 2
         T_rel = T2 @ torch.linalg.inv(T1)
-
         t = T_rel[:3, 3]
-        R = T_rel[:3, :3]
-        q = self._rotation_matrix_to_quaternion(R)
-
+        q = self._rotation_matrix_to_quaternion(T_rel[:3, :3])
         return torch.cat([t, q], dim=0)
-    
-    def _relative_pose_2d(self, camera1, camera2):
-        """
-        Returnerar:
-        [tx, ty, sin(yaw), cos(yaw)]
-        """
 
+    def _relative_pose_2d(self, camera1: Dict[str, Any], camera2: Dict[str, Any]) -> torch.Tensor:
         T1 = self._camera_to_matrix(camera1)
         T2 = self._camera_to_matrix(camera2)
-
         T_rel = T2 @ torch.linalg.inv(T1)
 
-        # XY translation + normalisering
-        t = T_rel[:2, 3] / self.scale_xy
-
-        # yaw
+        t_xy = T_rel[:2, 3]
         R = T_rel[:3, :3]
         yaw = torch.atan2(R[1, 0], R[0, 0])
 
-        pose = torch.tensor(
-            [t[0], t[1], torch.sin(yaw), torch.cos(yaw)],
+        return torch.tensor(
+            [t_xy[0], t_xy[1], torch.sin(yaw), torch.cos(yaw)],
             dtype=torch.float32,
         )
-        return pose
 
-    def __getitem__(self, idx):
-        scene = self.scenes[idx % len(self.scenes)]
-        pairs = scene["pairs"]
+    def __getitem__(self, idx: int):
+        sample = self.samples[idx]
+        pair = sample.pair
+        scene_dir = sample.scene_dir
 
-        # välj ett par från scenen
-        p = random.choice(pairs)
-
-        path_a = p["image1"]
-        path_b = p["image2"]
+        path_a = self._resolve_path(scene_dir, pair["image1"])
+        path_b = self._resolve_path(scene_dir, pair["image2"])
 
         img_a = self._load_image(path_a)
         img_b = self._load_image(path_b)
 
-        # vision target för första bilden
-        vision_a = self._load_vision(p["vision1"])
-        vision_b = self._load_vision(p["vision2"])
+        vision_a = self._load_vision(pair["vision1"])
+        vision_b = self._load_vision(pair["vision2"])
 
-        # cameras kan ligga i pair eller på scene-nivå
-        camera1 = p.get("camera1", scene.get("camera1"))
-        camera2 = p.get("camera2", scene.get("camera2"))
+        camera1 = pair.get("camera1", sample.scene_camera1)
+        camera2 = pair.get("camera2", sample.scene_camera2)
 
         if camera1 is None or camera2 is None:
             raise KeyError(
-                "Saknar camera1/camera2 i pair eller scene. "
-                "Lägg in dem i labels.json."
+                "Saknar camera1/camera2 i pair eller scene. Lägg in dem i labels.json."
             )
 
-        # pose_ab = self._relative_pose(camera1, camera2)
         pose_ab = self._relative_pose_2d(camera1, camera2)
 
         if self.return_paths:
-            return (
-                img_a, vision_a,
-                img_b, vision_b,
-                pose_ab,
-                path_a, path_b
-            )
+            return img_a, vision_a, img_b, vision_b, pose_ab, str(path_a), str(path_b), camera1, camera2
 
-        return (
-            img_a, vision_a,
-            img_b, vision_b,
-            pose_ab
-        )
+        return img_a, vision_a, img_b, vision_b, pose_ab
