@@ -6,14 +6,21 @@ import torch
 import torch.nn.functional as F
 
 
-def vision_loss(pred_vision, target_vision):
+def single_vision_loss(
+    pred_vision,
+    target_vision,
+    occ_thresh=0.5,
+    lambda_occ=1.0,
+    lambda_radius=1.0,
+    lambda_depth=1.0,
+):
     """
-    pred_vision:   (B, num_bins, 3)
-    target_vision:  (B, num_bins, 3)
+    pred_vision, target_vision: (B, num_bins, 3)
+        channel 0 = occupancy
+        channel 1 = radius
+        channel 2 = depth
+    """
 
-    Kan användas direkt om target har samma struktur:
-    [occupancy, radius, depth]
-    """
     pred_occ = pred_vision[..., 0]
     pred_rad = pred_vision[..., 1]
     pred_dep = pred_vision[..., 2]
@@ -22,65 +29,131 @@ def vision_loss(pred_vision, target_vision):
     tgt_rad = target_vision[..., 1]
     tgt_dep = target_vision[..., 2]
 
-    # Om occupancy är 0/1 fungerar BCE bra.
-    # Om dina targets är mjuka värden kan MSE också fungera.
+    # 1) Occupancy: BCE
     occ_loss = F.binary_cross_entropy(
-        pred_occ.clamp(1e-6, 1 - 1e-6),
+        pred_occ.clamp(1e-6, 1.0 - 1e-6),
         tgt_occ
     )
 
-    rad_loss = F.smooth_l1_loss(pred_rad, tgt_rad)
-    dep_loss = F.smooth_l1_loss(pred_dep, tgt_dep)
+    # 2) Radius + depth only where occupancy is on
+    mask = (tgt_occ > occ_thresh).float()
 
-    return occ_loss + rad_loss + dep_loss
+    rad_l1 = F.l1_loss(pred_rad, tgt_rad, reduction="none")
+    dep_l1 = F.l1_loss(pred_dep, tgt_dep, reduction="none")
+
+    rad_loss = (rad_l1 * mask).sum() / mask.sum().clamp_min(1.0)
+    dep_loss = (dep_l1 * mask).sum() / mask.sum().clamp_min(1.0)
+
+    total = (
+        lambda_occ * occ_loss +
+        lambda_radius * rad_loss +
+        lambda_depth * dep_loss
+    )
+
+    return total, occ_loss, rad_loss, dep_loss
 
 
-def pose_loss(pred_pose, target_pose, t_weight=1.0, q_weight=1.0):
+def relative_pose_loss_2d(
+    pred_pose,
+    target_pose,
+    t_weight=1.0,
+    r_weight=1.0,
+):
     """
-    pred_pose:   (B, 7) = [tx, ty, tz, qw, qx, qy, qz]
-    target_pose:  (B, 7)
+    pred_pose, target_pose: (B, 4) = [tx, ty, sin(yaw), cos(yaw)]
     """
-    pred_t = pred_pose[:, :3]
-    pred_q = F.normalize(pred_pose[:, 3:], dim=-1)
 
-    tgt_t = target_pose[:, :3]
-    tgt_q = F.normalize(target_pose[:, 3:], dim=-1)
-
-    # Translation
-    t_loss = F.smooth_l1_loss(pred_t, tgt_t)
-
-    # Quaternion:
-    # q och -q representerar samma rotation, så vi tar absolutvärdet.
-    dot = torch.sum(pred_q * tgt_q, dim=-1).abs()
-    q_loss = (1.0 - dot).mean()
-
-    return t_weight * t_loss + q_weight * q_loss
-
-def pose_loss_2d(pred_pose, target_pose, t_weight=1.0, yaw_weight=1.0):
-    """
-    pred_pose:   (B, 4) = [tx, ty, sin(yaw), cos(yaw)]
-    target_pose: (B, 4)
-    """
     pred_t = pred_pose[:, :2]
-    pred_yaw_vec = F.normalize(pred_pose[:, 2:], dim=-1)
-
     tgt_t = target_pose[:, :2]
-    tgt_yaw_vec = F.normalize(target_pose[:, 2:], dim=-1)
 
-    # translation i xy
+    pred_r = F.normalize(pred_pose[:, 2:], dim=-1)
+    tgt_r = F.normalize(target_pose[:, 2:], dim=-1)
+
     t_loss = F.smooth_l1_loss(pred_t, tgt_t)
+    r_loss = F.mse_loss(pred_r, tgt_r)
 
-    # yaw via sin/cos
-    yaw_loss = F.mse_loss(pred_yaw_vec, tgt_yaw_vec)
-
-    return t_weight * t_loss + yaw_weight * yaw_loss
+    total = t_weight * t_loss + r_weight * r_loss
+    return total, t_loss, r_loss
 
 
-def supervised_loss(pred_vision, target_vision, pred_pose, target_pose, lambda_pose=1.0):
-    l_vis = vision_loss(pred_vision, target_vision)
-    l_pose = pose_loss_2d(pred_pose, target_pose)
-    return l_vis + lambda_pose * l_pose, l_vis, l_pose
+def supervised_loss(
+    pred_vision,
+    target_vision_a,
+    target_vision_b,
+    pred_pose,
+    target_pose,
+    lambda_pose=1.0,
+    lambda_vis_a=1.0,
+    lambda_vis_b=1.0,
+    occ_thresh=0.5,
+    lambda_occ=1.0,
+    lambda_radius=1.0,
+    lambda_depth=1.0,
+    t_weight=1.0,
+    r_weight=1.0,
+):
+    """
+    Passar in både om modellen ger:
+      - en enda vision-prediction: pred_vision = Tensor
+      - eller två vision-predictions: pred_vision = (pred_vis_a, pred_vis_b)
 
+    Om pred_vision är en Tensor används samma prediction mot båda targets.
+    """
+
+    if isinstance(pred_vision, (tuple, list)):
+        pred_vis_a, pred_vis_b = pred_vision
+        print("Yes this is correct!")
+    else:
+        pred_vis_a = pred_vision
+        pred_vis_b = pred_vision
+        print("No, this is not correct!")
+
+    vis_a_total, vis_a_occ, vis_a_rad, vis_a_dep = single_vision_loss(
+        pred_vis_a,
+        target_vision_a,
+        occ_thresh=occ_thresh,
+        lambda_occ=lambda_occ,
+        lambda_radius=lambda_radius,
+        lambda_depth=lambda_depth,
+    )
+
+    vis_b_total, vis_b_occ, vis_b_rad, vis_b_dep = single_vision_loss(
+        pred_vis_b,
+        target_vision_b,
+        occ_thresh=occ_thresh,
+        lambda_occ=lambda_occ,
+        lambda_radius=lambda_radius,
+        lambda_depth=lambda_depth,
+    )
+
+    pose_total, t_loss, r_loss = relative_pose_loss_2d(
+        pred_pose,
+        target_pose,
+        t_weight=t_weight,
+        r_weight=r_weight,
+    )
+
+    total = lambda_vis_a * vis_a_total + lambda_vis_b * vis_b_total + lambda_pose * pose_total
+
+    return {
+        "total": total,
+        "vision_a": vis_a_total,
+        "vision_b": vis_b_total,
+        "vision_a_occ": vis_a_occ,
+        "vision_a_radius": vis_a_rad,
+        "vision_a_depth": vis_a_dep,
+        "vision_b_occ": vis_b_occ,
+        "vision_b_radius": vis_b_rad,
+        "vision_b_depth": vis_b_dep,
+        "pose": pose_total,
+        "translation": t_loss,
+        "rotation": r_loss,
+    }
+
+
+# --------------------------------
+# ----- Not used now -------------
+# --------------------------------
 
 def consistency_loss(pred1, pred2, lambda_radius=1.0, lambda_conf=0.1, lambda_conf_reg=0.01):
     """
