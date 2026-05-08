@@ -32,11 +32,11 @@ class SceneTwoPairsDataset(Dataset):
         self,
         root_dir: str | Path = "dataset",
         image_size: int = 128,
-        return_paths: bool = False,
+        debugg: bool = False,
         shuffle_pairs: bool = False,
     ) -> None:
         self.root_dir = Path(root_dir)
-        self.return_paths = return_paths
+        self.debugg = debugg
         self.shuffle_pairs = shuffle_pairs
 
         self.transform = transforms.Compose(
@@ -201,7 +201,7 @@ class SceneTwoPairsDataset(Dataset):
 
         pose_ab = self._relative_pose_2d(camera1, camera2)
 
-        if self.return_paths:
+        if self.debugg:
             return img_a, vision_a, img_b, vision_b, pose_ab, str(path_a), str(path_b), camera1, camera2
 
         return img_a, vision_a, img_b, vision_b, pose_ab
