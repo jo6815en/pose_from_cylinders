@@ -189,7 +189,6 @@ class SceneTwoPairsDataset(Dataset):
         img_b = self._load_image(path_b)
 
         vision_a = self._load_vision(pair["vision1"])
-        vision_b = self._load_vision(pair["vision2"])
 
         camera1 = pair.get("camera1", sample.scene_camera1)
         camera2 = pair.get("camera2", sample.scene_camera2)
@@ -202,6 +201,6 @@ class SceneTwoPairsDataset(Dataset):
         pose_ab = self._relative_pose_2d(camera1, camera2)
 
         if self.debugg:
-            return img_a, vision_a, img_b, vision_b, pose_ab, str(path_a), str(path_b), camera1, camera2
+            return img_a, vision_a, img_b, pose_ab, str(path_a), str(path_b), camera1, camera2
 
-        return img_a, vision_a, img_b, vision_b, pose_ab
+        return img_a, vision_a, img_b, pose_ab

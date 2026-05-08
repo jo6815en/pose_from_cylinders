@@ -63,7 +63,7 @@ def bug_check(idx=0):
     dataset = SceneTwoPairsDataset("dataset", debugg=True)
     sample = dataset[idx]
 
-    img_a, vision_a, img_b, vision_b, pose, path_a, path_b, camera1, camera2 = sample
+    img_a, vision_a, img_b, pose, path_a, path_b, camera1, camera2 = sample
     raw_pair = dataset.samples[idx].pair
     scene_dir = dataset.samples[idx].scene_dir
 

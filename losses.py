@@ -6,7 +6,7 @@ import torch
 import torch.nn.functional as F
 
 
-def single_vision_loss(
+def vision_loss(
     pred_vision,
     target_vision,
     occ_thresh=0.5,
@@ -79,47 +79,22 @@ def relative_pose_loss_2d(
 def supervised_loss(
     pred_vision,
     target_vision_a,
-    target_vision_b,
     pred_pose,
     target_pose,
     lambda_pose=1.0,
     lambda_vis_a=1.0,
-    lambda_vis_b=1.0,
     occ_thresh=0.5,
     lambda_occ=1.0,
     lambda_radius=1.0,
     lambda_depth=1.0,
     t_weight=1.0,
     r_weight=1.0,
-):
-    """
-    Passar in både om modellen ger:
-      - en enda vision-prediction: pred_vision = Tensor
-      - eller två vision-predictions: pred_vision = (pred_vis_a, pred_vis_b)
+):    
+    pred_vis_a = pred_vision
 
-    Om pred_vision är en Tensor används samma prediction mot båda targets.
-    """
-
-    if isinstance(pred_vision, (tuple, list)):
-        pred_vis_a, pred_vis_b = pred_vision
-        print("Yes this is correct!")
-    else:
-        pred_vis_a = pred_vision
-        pred_vis_b = pred_vision
-        print("No, this is not correct!")
-
-    vis_a_total, vis_a_occ, vis_a_rad, vis_a_dep = single_vision_loss(
+    vis_a_total, vis_a_occ, vis_a_rad, vis_a_dep = vision_loss(
         pred_vis_a,
         target_vision_a,
-        occ_thresh=occ_thresh,
-        lambda_occ=lambda_occ,
-        lambda_radius=lambda_radius,
-        lambda_depth=lambda_depth,
-    )
-
-    vis_b_total, vis_b_occ, vis_b_rad, vis_b_dep = single_vision_loss(
-        pred_vis_b,
-        target_vision_b,
         occ_thresh=occ_thresh,
         lambda_occ=lambda_occ,
         lambda_radius=lambda_radius,
@@ -133,18 +108,14 @@ def supervised_loss(
         r_weight=r_weight,
     )
 
-    total = lambda_vis_a * vis_a_total + lambda_vis_b * vis_b_total + lambda_pose * pose_total
+    total = lambda_vis_a * vis_a_total + lambda_pose * pose_total
 
     return {
         "total": total,
         "vision_a": vis_a_total,
-        "vision_b": vis_b_total,
         "vision_a_occ": vis_a_occ,
         "vision_a_radius": vis_a_rad,
         "vision_a_depth": vis_a_dep,
-        "vision_b_occ": vis_b_occ,
-        "vision_b_radius": vis_b_rad,
-        "vision_b_depth": vis_b_dep,
         "pose": pose_total,
         "translation": t_loss,
         "rotation": r_loss,
