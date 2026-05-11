@@ -122,146 +122,105 @@ def supervised_loss(
     }
 
 
-# --------------------------------
-# ----- Not used now -------------
-# --------------------------------
-
-def consistency_loss(pred1, pred2, lambda_radius=1.0, lambda_conf=0.1, lambda_conf_reg=0.01):
-    """
-    pred1, pred2: [B, K, 5]
-      cylinder = (cx, cy, cz, radius, confidence)
-
-    Returnerar:
-      scalar loss
-    """
-    B, K, D = pred1.shape
-    assert D == 5, "Förväntar [B, K, 5]"
-
-    total_loss = 0.0
-
-    for b in range(B):
-        c1 = pred1[b]  # [K, 5]
-        c2 = pred2[b]  # [K, 5]
-
-        center1 = c1[:, :3]          # [K, 3]
-        radius1 = c1[:, 3:4]         # [K, 1]
-        conf1 = c1[:, 4:5]           # [K, 1]
-
-        center2 = c2[:, :3]
-        radius2 = c2[:, 3:4]
-        conf2 = c2[:, 4:5]
-
-        # Pairwise cost matrix: [K, K]
-        center_cost = ((center1[:, None, :] - center2[None, :, :]) ** 2).sum(dim=-1)
-        radius_cost = ((radius1[:, None, :] - radius2[None, :, :]) ** 2).squeeze(-1)
-
-        cost = center_cost + lambda_radius * radius_cost
-
-        # Hungarian matching
-        row_ind, col_ind = linear_sum_assignment(cost.detach().cpu().numpy())
-
-        # Matchade loss-termer
-        matched_center = F.mse_loss(center1[row_ind], center2[col_ind])
-        matched_radius = F.mse_loss(radius1[row_ind], radius2[col_ind])
-
-        matched_conf = F.mse_loss(conf1[row_ind], conf2[col_ind])
-        conf_reg = (conf1.mean() + conf2.mean()) * 0.5
-
-
-        sample_loss = (
-                    matched_center
-                    + lambda_radius * matched_radius
-                    + lambda_conf * matched_conf
-                    + lambda_conf_reg * conf_reg
-                )
-        
-        total_loss = total_loss + sample_loss
-
-    return total_loss / B
-
-
-def sinkhorn(log_alpha, n_iters=20):
-    """
-    log_alpha: [B, K, K]
-    Returnerar en ungefär doubly-stochastic matris P med shape [B, K, K]
-    """
-    for _ in range(n_iters):
-        log_alpha = log_alpha - torch.logsumexp(log_alpha, dim=-1, keepdim=True)
-        log_alpha = log_alpha - torch.logsumexp(log_alpha, dim=-2, keepdim=True)
-    return torch.exp(log_alpha)
-
-
-def consistency_loss_fast(
-    pred1,
-    pred2,
-    lambda_radius=5.0,
-    lambda_conf=0.1,
-    lambda_conf_reg=0.01,
-    lambda_geom=10.0,
-    temperature=0.02,
-    sinkhorn_iters=30,
+def consistency_loss(
+    pred_vision_1,
+    pred_vision_2,
+    occ_thresh=0.5,
+    match_thresh=0.25,
+    lambda_occ=1.0,
+    lambda_radius=1.0,
+    lambda_depth=1.0,
 ):
     """
-    pred1, pred2: [B, K, 5]
-      cylinder = (cx, cy, cz, radius, confidence)
+    pred_vision_1, pred_vision_2: (B, num_bins, 3)
+        channel 0 = occupancy
+        channel 1 = radius
+        channel 2 = depth
 
-    Snabb, vectoriserad approximation till set consistency loss.
+    Jämför bara cylindrar som verkar motsvara samma objekt.
+    Extra cylindrar i ena vyn ignoreras.
     """
-    assert pred1.shape == pred2.shape
-    B, K, D = pred1.shape
-    assert D == 5, "Förväntar [B, K, 5]"
 
-    c1 = pred1
-    c2 = pred2
+    total_loss = pred_vision_1.new_tensor(0.0)
+    total_occ = pred_vision_1.new_tensor(0.0)
+    total_rad = pred_vision_1.new_tensor(0.0)
+    total_dep = pred_vision_1.new_tensor(0.0)
 
-    center1 = c1[..., :3]      # [B, K, 3]
-    radius1 = c1[..., 3:4]     # [B, K, 1]
-    conf1 = c1[..., 4:5]       # [B, K, 1]
+    batch_size = pred_vision_1.shape[0]
+    valid_batches = 0
 
-    center2 = c2[..., :3]
-    radius2 = c2[..., 3:4]
-    conf2 = c2[..., 4:5]
+    for b in range(batch_size):
+        v1 = pred_vision_1[b]
+        v2 = pred_vision_2[b]
 
-    # Pairwise cost per batch: [B, K, K]
-    center_cost = torch.cdist(center1, center2, p=2).pow(2)
-    radius_cost = (radius1.unsqueeze(2) - radius2.unsqueeze(1)).pow(2).squeeze(-1)
+        occ1 = v1[:, 0]
+        rad1 = v1[:, 1]
+        dep1 = v1[:, 2]
 
-    cost = center_cost + lambda_radius * radius_cost
+        occ2 = v2[:, 0]
+        rad2 = v2[:, 1]
+        dep2 = v2[:, 2]
 
-    # Soft matching matrix, batchad och GPU-vänlig
-    P = sinkhorn(-cost / temperature, n_iters=sinkhorn_iters)  # [B, K, K]
+        m1 = occ1 > occ_thresh
+        m2 = occ2 > occ_thresh
 
-    # Matcha pred2 mot pred1
-    matched2 = torch.bmm(P, c2)                      # [B, K, 5]
-    matched1 = torch.bmm(P.transpose(1, 2), c1)      # [B, K, 5]
+        if m1.sum() == 0 or m2.sum() == 0:
+            continue
 
-    # Geometrisk consistency
-    geom_loss = F.mse_loss(c1[..., :4], matched2[..., :4])
+        f1 = torch.stack([rad1[m1], dep1[m1]], dim=-1)  # (N1, 2)
+        f2 = torch.stack([rad2[m2], dep2[m2]], dim=-1)  # (N2, 2)
 
-    geom_loss = lambda_geom * geom_loss
+        o1 = occ1[m1]
+        o2 = occ2[m2]
 
-    # Confidence consistency
-    conf_loss = F.mse_loss(conf1, matched2[..., 4:5])
+        # Pairwise cost mellan möjliga cylinder-matchningar
+        cost = torch.cdist(f1, f2, p=1)  # (N1, N2)
 
-    # Enkel regularization: håll confidence lite sparsam
-    conf_reg = 0.5 * (conf1.mean() + conf2.mean())
+        # Mutual nearest neighbors
+        nn12 = cost.argmin(dim=1)  # for each in v1 -> best in v2
+        nn21 = cost.argmin(dim=0)  # for each in v2 -> best in v1
 
-    return geom_loss + lambda_conf * conf_loss + lambda_conf_reg * conf_reg
+        matched_i = []
+        matched_j = []
 
+        for i in range(cost.shape[0]):
+            j = nn12[i].item()
+            if nn21[j].item() == i and cost[i, j] < match_thresh:
+                matched_i.append(i)
+                matched_j.append(j)
 
-def diversity_loss(pred):
-    centers = pred[..., :3]
-    conf = pred[..., 4:5]
+        if len(matched_i) == 0:
+            continue
 
-    B, K, _ = centers.shape
+        idx1 = torch.tensor(matched_i, device=pred_vision_1.device)
+        idx2 = torch.tensor(matched_j, device=pred_vision_1.device)
 
-    d = torch.cdist(centers, centers, p=2)
+        # Occupancy consistency för de matchade cylindrarna
+        loss_occ = F.mse_loss(o1[idx1], o2[idx2])
 
-    eye = torch.eye(K, device=pred.device).bool()
-    d = d.masked_fill(eye.unsqueeze(0), float("inf"))
+        # Radius + depth consistency
+        loss_rad = F.l1_loss(f1[idx1, 0], f2[idx2, 0])
+        loss_dep = F.l1_loss(f1[idx1, 1], f2[idx2, 1])
 
-    weight = conf @ conf.transpose(1, 2)
+        loss = (
+            lambda_occ * loss_occ +
+            lambda_radius * loss_rad +
+            lambda_depth * loss_dep
+        )
 
-    penalty = (1.0 / (d + 1e-3)) * weight
+        total_loss = total_loss + loss
+        total_occ = total_occ + loss_occ
+        total_rad = total_rad + loss_rad
+        total_dep = total_dep + loss_dep
+        valid_batches += 1
 
-    return penalty.mean()
+    if valid_batches == 0:
+        zero = pred_vision_1.new_tensor(0.0)
+        return zero, zero, zero, zero
+
+    total_loss = total_loss / valid_batches
+    total_occ = total_occ / valid_batches
+    total_rad = total_rad / valid_batches
+    total_dep = total_dep / valid_batches
+
+    return total_loss, total_occ, total_rad, total_dep

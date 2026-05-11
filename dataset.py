@@ -23,9 +23,14 @@ class _Sample:
 class SceneTwoPairsDataset(Dataset):
     """Dataset for paired cylinder scenes.
 
-    Each dataset item corresponds to one pair inside one scene.
-    This avoids the old behavior where __getitem__ randomly sampled a pair
-    from a scene, which made epoch length and sampling non-deterministic.
+    Default:
+        Returns one pair per item:
+            img_a, vision_a, img_b, pose_ab
+
+    Optional:
+        If return_two_pairs=True, returns two pairs from the same scene:
+            img_a1, vision_a1, img_b1, pose_ab1,
+            img_a2, vision_a2, img_b2, pose_ab2
     """
 
     def __init__(
@@ -34,10 +39,12 @@ class SceneTwoPairsDataset(Dataset):
         image_size: int = 128,
         debugg: bool = False,
         shuffle_pairs: bool = False,
+        return_two_pairs: bool = False,
     ) -> None:
         self.root_dir = Path(root_dir)
         self.debugg = debugg
         self.shuffle_pairs = shuffle_pairs
+        self.return_two_pairs = return_two_pairs
 
         self.transform = transforms.Compose(
             [
@@ -80,6 +87,13 @@ class SceneTwoPairsDataset(Dataset):
 
         if not self.samples:
             raise ValueError(f"Inga giltiga par hittades i {self.root_dir}")
+
+        if self.shuffle_pairs:
+            random.shuffle(self.samples)
+
+        self.scene_to_indices: Dict[Path, List[int]] = {}
+        for idx, sample in enumerate(self.samples):
+            self.scene_to_indices.setdefault(sample.scene_dir, []).append(idx)
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -155,14 +169,6 @@ class SceneTwoPairsDataset(Dataset):
             q = -q
         return q
 
-    def _relative_pose(self, camera1: Dict[str, Any], camera2: Dict[str, Any]) -> torch.Tensor:
-        T1 = self._camera_to_matrix(camera1)
-        T2 = self._camera_to_matrix(camera2)
-        T_rel = T2 @ torch.linalg.inv(T1)
-        t = T_rel[:3, 3]
-        q = self._rotation_matrix_to_quaternion(T_rel[:3, :3])
-        return torch.cat([t, q], dim=0)
-
     def _relative_pose_2d(self, camera1: Dict[str, Any], camera2: Dict[str, Any]) -> torch.Tensor:
         T1 = self._camera_to_matrix(camera1)
         T2 = self._camera_to_matrix(camera2)
@@ -177,7 +183,7 @@ class SceneTwoPairsDataset(Dataset):
             dtype=torch.float32,
         )
 
-    def __getitem__(self, idx: int):
+    def _get_pair(self, idx: int):
         sample = self.samples[idx]
         pair = sample.pair
         scene_dir = sample.scene_dir
@@ -187,7 +193,6 @@ class SceneTwoPairsDataset(Dataset):
 
         img_a = self._load_image(path_a)
         img_b = self._load_image(path_b)
-
         vision_a = self._load_vision(pair["vision1"])
 
         camera1 = pair.get("camera1", sample.scene_camera1)
@@ -204,3 +209,28 @@ class SceneTwoPairsDataset(Dataset):
             return img_a, vision_a, img_b, pose_ab, str(path_a), str(path_b), camera1, camera2
 
         return img_a, vision_a, img_b, pose_ab
+
+    def _sample_second_index_same_scene(self, idx: int) -> int:
+        scene_dir = self.samples[idx].scene_dir
+        candidates = self.scene_to_indices[scene_dir]
+
+        if len(candidates) == 1:
+            return idx
+
+        other_candidates = [i for i in candidates if i != idx]
+        return random.choice(other_candidates)
+
+    def __getitem__(self, idx: int):
+        if not self.return_two_pairs:
+            return self._get_pair(idx)
+
+        idx2 = self._sample_second_index_same_scene(idx)
+
+        pair1 = self._get_pair(idx)
+        pair2 = self._get_pair(idx2)
+
+        if self.debugg:
+            # pair1 and pair2 each contain extra debug info
+            return pair1, pair2
+
+        return (*pair1, *pair2)

@@ -4,3 +4,4 @@ __pycache__/
 venv/
 data/
 dataset/
+dataset_no_background/
