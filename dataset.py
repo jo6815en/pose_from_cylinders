@@ -212,6 +212,7 @@ class SceneTwoPairsDataset(Dataset):
         img_a = self._load_image(path_a)
         img_b = self._load_image(path_b)
         vision_a = self._load_vision(pair["vision1"])
+        vision_b = self._load_vision(pair["vision2"])
 
         camera1 = pair.get("camera1", sample.scene_camera1)
         camera2 = pair.get("camera2", sample.scene_camera2)
@@ -226,7 +227,7 @@ class SceneTwoPairsDataset(Dataset):
         if self.debugg:
             return img_a, vision_a, img_b, pose_ab, str(path_a), str(path_b), camera1, camera2
 
-        return img_a, vision_a, img_b, pose_ab
+        return img_a, vision_a, img_b, vision_a, pose_ab
 
     def _sample_second_index_same_scene(self, idx: int) -> int:
         scene_dir = self.samples[idx].scene_dir

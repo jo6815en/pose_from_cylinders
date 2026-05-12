@@ -96,12 +96,14 @@ def relative_pose_loss_2d(
 
 
 def supervised_loss(
-    pred_vision,
+    pred_vision_a,
     target_vision_a,
+    pred_vision_b,
+    target_vision_b,
     pred_pose,
     target_pose,
     lambda_pose=1.0,
-    lambda_vis_a=1.0,
+    lambda_vis=1.0,
     occ_thresh=0.5,
     lambda_occ=1.0,
     lambda_radius=1.0,
@@ -109,7 +111,8 @@ def supervised_loss(
     t_weight=1.0,
     r_weight=1.0,
 ):    
-    pred_vis_a = pred_vision
+    pred_vis_a = pred_vision_a
+    pred_vis_b = pred_vision_b
 
     vis_a_total, vis_a_occ, vis_a_rad, vis_a_dep = vision_loss(
         pred_vis_a,
@@ -120,6 +123,16 @@ def supervised_loss(
         lambda_depth=lambda_depth,
     )
 
+    vis_b_total, vis_b_occ, vis_b_rad, vis_b_dep = vision_loss(
+        pred_vis_b,
+        target_vision_b,
+        occ_thresh=occ_thresh,
+        lambda_occ=lambda_occ,
+        lambda_radius=lambda_radius,
+        lambda_depth=lambda_depth,
+    )
+
+
     pose_total, t_loss, r_loss = relative_pose_loss_2d(
         pred_pose,
         target_pose,
@@ -127,7 +140,7 @@ def supervised_loss(
         r_weight=r_weight,
     )
 
-    total = lambda_vis_a * vis_a_total + lambda_pose * pose_total
+    total = (lambda_vis * vis_a_total + lambda_vis * vis_b_total)/2.0  + lambda_pose * pose_total
 
     return {
         "total": total,
