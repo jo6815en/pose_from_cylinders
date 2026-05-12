@@ -100,15 +100,33 @@ class SceneTwoPairsDataset(Dataset):
 
     def _resolve_path(self, scene_dir: Path, maybe_path: Any) -> Path:
         path = Path(maybe_path)
-        if path.is_absolute():
-            return path
 
+        # Nya rekommenderade formatet:
+        # "images/pair_003_cam1.png"
         candidate = scene_dir / path
         if candidate.exists():
             return candidate
 
-        # Fall back to the raw relative path so callers get a useful error later.
-        return path
+        # Om path råkar vara absolut och finns
+        if path.is_absolute() and path.exists():
+            return path
+
+        # Backward compatibility:
+        # Om gamla labels innehåller "dataset/scene_000/images/..."
+        # försök plocka ut delen efter scene_xxx
+        parts = path.parts
+        for i, part in enumerate(parts):
+            if part.startswith("scene_"):
+                stripped = Path(*parts[i + 1:])
+                candidate = scene_dir / stripped
+                if candidate.exists():
+                    return candidate
+
+        # Ge tydligt fel
+        raise FileNotFoundError(
+            f"Kunde inte hitta filen för path={maybe_path}. "
+            f"Försökte relativt till scene_dir={scene_dir}."
+        )
 
     def _load_image(self, path: Path) -> torch.Tensor:
         with Image.open(path) as img:

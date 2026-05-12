@@ -6,6 +6,25 @@ import torch
 import torch.nn.functional as F
 
 
+def add_sup_losses(
+        total_vis,
+        total_radius,
+        total_pose,
+        total_depth,
+        total_t,
+        total_r,
+        loss_out
+):
+    total_vis += loss_out["vision_a"].item()
+    total_radius += loss_out["vision_a_radius"].item()
+    total_pose += loss_out["pose"].item()
+    total_depth += loss_out["vision_a_depth"].item()
+    total_t += loss_out["translation"].item()
+    total_r += loss_out["rotation"].item()
+
+    return total_vis, total_radius, total_pose, total_depth, total_t, total_r,
+
+
 def vision_loss(
     pred_vision,
     target_vision,
