@@ -1,10 +1,5 @@
 import torch
 import torch.nn.functional as F
-from scipy.optimize import linear_sum_assignment
-
-import torch
-import torch.nn.functional as F
-
 
 def add_sup_losses(
         total_vis,
@@ -32,9 +27,9 @@ def add_con_losses(
         loss_out
 ):
     total_con += loss_out["total"].item()
-    total_occ += loss_out["total_occ"].item()
-    total_rad += loss_out["total_rad"].item()
-    total_dep += loss_out["total_dep"].item()
+    total_occ += loss_out["occ"].item()
+    total_rad += loss_out["radius"].item()
+    total_dep += loss_out["depth"].item()
     
     return total_con, total_occ, total_rad, total_dep
 
@@ -262,7 +257,13 @@ def consistency_loss(
 
     if valid_batches == 0:
         zero = pred_vision_1.new_tensor(0.0)
-        return zero, zero, zero, zero
+        print("No valid batches")
+        return {
+            "total": zero,
+            "occ": zero,
+            "radius": zero,
+            "depth": zero,
+        }
 
     total_loss = total_loss / valid_batches
     total_occ = total_occ / valid_batches
@@ -270,8 +271,8 @@ def consistency_loss(
     total_dep = total_dep / valid_batches
 
     return {
-        "total": total_loss, 
-        "total_occ": total_occ,
-        "total_rad": total_rad,
-        "total_dep": total_dep
-        }
+        "total": total_loss,
+        "occ": total_occ,
+        "radius": total_rad,
+        "depth": total_dep,
+    }
