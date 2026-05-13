@@ -166,7 +166,12 @@ class PairImageCylinderModel(nn.Module):
         self.pose_head = PoseHead(embed_dim=embed_dim)
 
     def forward(self, img_a, img_b):
-        feat = self.backbone(img_a, img_b)
-        vision_pred = self.vision_head(feat)
-        pose_pred = self.pose_head(feat)
-        return vision_pred, pose_pred
+        feat_ab = self.backbone(img_a, img_b)
+        feat_ba = self.backbone(img_b, img_a)
+
+        vision_pred_a = self.vision_head(feat_ab)
+        vision_pred_b = self.vision_head(feat_ba)
+
+        pose_pred = self.pose_head(feat_ab)
+
+        return vision_pred_a, vision_pred_b, pose_pred
