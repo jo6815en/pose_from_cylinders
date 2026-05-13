@@ -24,6 +24,20 @@ def add_sup_losses(
 
     return total_vis, total_radius, total_pose, total_depth, total_t, total_r,
 
+def add_con_losses(
+        total_con,
+        total_occ,
+        total_rad,
+        total_dep,
+        loss_out
+):
+    total_con += loss_out["total"].item()
+    total_occ += loss_out["total_occ"].item()
+    total_rad += loss_out["total_rad"].item()
+    total_dep += loss_out["total_dep"].item()
+    
+    return total_con, total_occ, total_rad, total_dep
+
 
 def vision_loss(
     pred_vision,
@@ -255,4 +269,9 @@ def consistency_loss(
     total_rad = total_rad / valid_batches
     total_dep = total_dep / valid_batches
 
-    return total_loss, total_occ, total_rad, total_dep
+    return {
+        "total": total_loss, 
+        "total_occ": total_occ,
+        "total_rad": total_rad,
+        "total_dep": total_dep
+        }
