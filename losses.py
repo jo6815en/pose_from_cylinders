@@ -257,7 +257,6 @@ def consistency_loss(
 
     if valid_batches == 0:
         zero = pred_vision_1.new_tensor(0.0)
-        print("No valid batches")
         return {
             "total": zero,
             "occ": zero,
