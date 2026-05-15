@@ -33,6 +33,20 @@ def add_con_losses(
     
     return total_con, total_occ, total_rad, total_dep
 
+def add_reproj_losses(
+        total_reproj,
+        total_occ,
+        total_rad,
+        total_dep,
+        loss_out
+):
+    total_reproj += loss_out["total"].item()
+    total_occ += loss_out["occ"].item()
+    total_rad += loss_out["radius"].item()
+    total_dep += loss_out["depth"].item()
+    
+    return total_reproj, total_occ, total_rad, total_dep
+
 
 def vision_loss(
     pred_vision,
@@ -274,4 +288,129 @@ def consistency_loss(
         "occ": total_occ,
         "radius": total_rad,
         "depth": total_dep,
+    }
+
+
+def reprojection_loss_2d(
+    vision_a,
+    vision_b,
+    pose_ab,
+    occ_thresh=0.5,
+    lambda_occ=1.0,
+    lambda_radius=1.0,
+    lambda_depth=1.0,
+    u_min=-1.0,
+    u_max=1.0,
+):
+    """
+    vision_a, vision_b: (B, N, 3) = [occ, radius, depth]
+    pose_ab: (B, 4) = [tx, ty, sin(yaw), cos(yaw)]
+
+    Matchar generatorns vision-binning:
+    u = x / y
+    där x = lateral/sida, y = framåt/depth.
+
+    u_min=-1, u_max=1 motsvarar ungefär 90 graders FOV.
+    """
+    B, N, _ = vision_a.shape
+    device = vision_a.device
+    dtype = vision_a.dtype
+
+    occ_a = vision_a[..., 0]
+    rad_a = vision_a[..., 1]
+    dep_a = vision_a[..., 2]
+
+    occ_b = vision_b[..., 0]
+    rad_b = vision_b[..., 1]
+    dep_b = vision_b[..., 2]
+
+    # Bin centers i generatorns u-koordinat
+    bin_size = (u_max - u_min) / N
+    u_centers = torch.linspace(
+        u_min + 0.5 * bin_size,
+        u_max - 0.5 * bin_size,
+        N,
+        device=device,
+        dtype=dtype,
+    )
+
+    u_a = u_centers.view(1, N).expand(B, N)
+
+    # Avprojicera från u + depth till BEV
+    # u = x / y, depth = y
+    y_a = dep_a
+    x_a = u_a * dep_a
+
+    tx = pose_ab[:, 0].view(B, 1)
+    ty = pose_ab[:, 1].view(B, 1)
+    s = pose_ab[:, 2].view(B, 1)
+    c = pose_ab[:, 3].view(B, 1)
+
+    # A -> B
+    x_b = c * x_a - s * y_a + tx
+    y_b = s * x_a + c * y_a + ty
+
+    # Projicera till B:s u-koordinat
+    dep_proj = y_b
+    u_proj = x_b / (y_b + 1e-6)
+
+    # u -> bin-index
+    bin_pos = (u_proj - u_min) / (u_max - u_min) * N - 0.5
+
+    j0 = torch.floor(bin_pos).long()
+    j1 = j0 + 1
+
+    w1 = bin_pos - j0.float()
+    w0 = 1.0 - w1
+
+    valid = (
+        (occ_a > occ_thresh)
+        & (dep_a > 0)
+        & (dep_proj > 0)
+        & (u_proj >= u_min)
+        & (u_proj <= u_max)
+        & (j0 >= 0)
+        & (j1 < N)
+    )
+
+    j0 = j0.clamp(0, N - 1)
+    j1 = j1.clamp(0, N - 1)
+
+    occ0 = occ_b.gather(1, j0)
+    occ1 = occ_b.gather(1, j1)
+
+    rad0 = rad_b.gather(1, j0)
+    rad1 = rad_b.gather(1, j1)
+
+    dep0 = dep_b.gather(1, j0)
+    dep1 = dep_b.gather(1, j1)
+
+    occ_sample = w0 * occ0 + w1 * occ1
+    rad_sample = w0 * rad0 + w1 * rad1
+    dep_sample = w0 * dep0 + w1 * dep1
+
+    valid_f = valid.float()
+    denom = valid_f.sum().clamp_min(1.0)
+
+    occ_loss = ((1.0 - occ_sample) ** 2 * valid_f).sum() / denom
+
+    radius_loss = (
+        torch.abs(rad_sample - rad_a) * valid_f
+    ).sum() / denom
+
+    depth_loss = (
+        torch.abs(dep_sample - dep_proj) / (dep_a.abs() + 1e-6) * valid_f
+    ).sum() / denom
+
+    total = (
+        lambda_occ * occ_loss
+        + lambda_radius * radius_loss
+        + lambda_depth * depth_loss
+    )
+
+    return {
+        "total": total,
+        "occ": occ_loss,
+        "radius": radius_loss,
+        "depth": depth_loss,
     }
