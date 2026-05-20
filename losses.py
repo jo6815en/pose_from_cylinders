@@ -1,5 +1,126 @@
 import torch
 import torch.nn.functional as F
+import math
+
+def vision_to_cylinder_centers(
+    vision: torch.Tensor,
+    fov_degrees: float = 90.0,
+    depth_channel: int = 2,
+    occ_channel: int = 0,
+) -> torch.Tensor:
+    """
+    Converts vision bins to 2D center points.
+
+    Assumes:
+        vision shape: [B, N, C] or [N, C]
+        occ_channel contains one-hot/soft occupancy over bins
+        depth_channel contains depth d per bin
+
+    Returns:
+        centers: [B, 2] or [2]
+    """
+    squeeze_batch = False
+    if vision.dim() == 2:
+        vision = vision.unsqueeze(0)
+        squeeze_batch = True
+
+    num_bins = vision.shape[1]
+    device = vision.device
+    dtype = vision.dtype
+
+    occ = vision[..., occ_channel]
+    depth = vision[..., depth_channel]
+
+    bin_idx = torch.argmax(occ, dim=1)
+
+    fov = math.radians(fov_degrees)
+    theta_min = -0.5 * fov
+    theta_max = 0.5 * fov
+
+    theta_bins = torch.linspace(
+        theta_min,
+        theta_max,
+        num_bins,
+        device=device,
+        dtype=dtype,
+    )
+
+    theta = theta_bins[bin_idx]
+    d = depth[torch.arange(vision.shape[0], device=device), bin_idx]
+
+    centers = torch.stack(
+        [
+            d * torch.cos(theta),
+            d * torch.sin(theta),
+        ],
+        dim=-1,
+    )
+
+    if squeeze_batch:
+        centers = centers.squeeze(0)
+
+    return centers
+
+
+def match_vision_to_target_cylinders(
+    vision: torch.Tensor,
+    target_cylinders: torch.Tensor,
+    fov_degrees: float = 90.0,
+    depth_channel: int = 2,
+    occ_channel: int = 0,
+) -> dict:
+    """
+    Matches predicted/target vision center to closest GT cylinder.
+
+    target_cylinders shape:
+        [M, 4] or [B, M, 4]
+        columns: x, y, r, h
+    """
+    pred_centers = vision_to_cylinder_centers(
+        vision,
+        fov_degrees=fov_degrees,
+        depth_channel=depth_channel,
+        occ_channel=occ_channel,
+    )
+
+    squeeze_batch = False
+    if target_cylinders.dim() == 2:
+        target_cylinders = target_cylinders.unsqueeze(0)
+        pred_centers = pred_centers.unsqueeze(0)
+        squeeze_batch = True
+
+    gt_centers = target_cylinders[..., :2]
+
+    distances = torch.cdist(
+        pred_centers.unsqueeze(1),
+        gt_centers,
+    ).squeeze(1)
+
+    matched_idx = torch.argmin(distances, dim=1)
+    matched_distance = distances[
+        torch.arange(distances.shape[0], device=distances.device),
+        matched_idx,
+    ]
+
+    matched_cylinders = target_cylinders[
+        torch.arange(target_cylinders.shape[0], device=target_cylinders.device),
+        matched_idx,
+    ]
+
+    result = {
+        "pred_centers": pred_centers,
+        "matched_indices": matched_idx,
+        "matched_distances": matched_distance,
+        "matched_cylinders": matched_cylinders,
+    }
+
+    if squeeze_batch:
+        result = {
+            key: value.squeeze(0) if value.dim() > 0 else value
+            for key, value in result.items()
+        }
+
+    return result
 
 def add_sup_losses(
         total_vis,

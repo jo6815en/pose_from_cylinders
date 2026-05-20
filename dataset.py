@@ -18,6 +18,7 @@ class _Sample:
     pair: Dict[str, Any]
     scene_camera1: Optional[Dict[str, Any]]
     scene_camera2: Optional[Dict[str, Any]]
+    cylinders: List[Dict[str, Any]]
 
 
 class SceneTwoPairsDataset(Dataset):
@@ -25,24 +26,22 @@ class SceneTwoPairsDataset(Dataset):
 
     Default:
         Returns one pair per item:
-            img_a, vision_a, img_b, pose_ab
+            img_a, vision_a, img_b, vision_b, pose_ab, target_cylinders
 
     Optional:
-        If return_two_pairs=True, returns two pairs from the same scene:
-            img_a1, vision_a1, img_b1, pose_ab1,
-            img_a2, vision_a2, img_b2, pose_ab2
+        If return_two_pairs=True, returns two pairs from the same scene.
     """
 
     def __init__(
         self,
         root_dir: str | Path = "dataset",
         image_size: int = 128,
-        debugg: bool = False,
+        debug: bool = False,
         shuffle_pairs: bool = False,
         return_two_pairs: bool = False,
     ) -> None:
         self.root_dir = Path(root_dir)
-        self.debugg = debugg
+        self.debug = debug
         self.shuffle_pairs = shuffle_pairs
         self.return_two_pairs = return_two_pairs
 
@@ -68,6 +67,7 @@ class SceneTwoPairsDataset(Dataset):
 
             scene_camera1 = data.get("camera1")
             scene_camera2 = data.get("camera2")
+            cylinders = data.get("cylinders", [])
 
             for pair in pairs:
                 if not isinstance(pair, dict):
@@ -76,12 +76,14 @@ class SceneTwoPairsDataset(Dataset):
                     continue
                 if "vision1" not in pair or "vision2" not in pair:
                     continue
+
                 self.samples.append(
                     _Sample(
                         scene_dir=scene_dir,
                         pair=pair,
                         scene_camera1=scene_camera1,
                         scene_camera2=scene_camera2,
+                        cylinders=cylinders,
                     )
                 )
 
@@ -101,28 +103,21 @@ class SceneTwoPairsDataset(Dataset):
     def _resolve_path(self, scene_dir: Path, maybe_path: Any) -> Path:
         path = Path(maybe_path)
 
-        # Nya rekommenderade formatet:
-        # "images/pair_003_cam1.png"
         candidate = scene_dir / path
         if candidate.exists():
             return candidate
 
-        # Om path råkar vara absolut och finns
         if path.is_absolute() and path.exists():
             return path
 
-        # Backward compatibility:
-        # Om gamla labels innehåller "dataset/scene_000/images/..."
-        # försök plocka ut delen efter scene_xxx
         parts = path.parts
         for i, part in enumerate(parts):
             if part.startswith("scene_"):
-                stripped = Path(*parts[i + 1:])
+                stripped = Path(*parts[i + 1 :])
                 candidate = scene_dir / stripped
                 if candidate.exists():
                     return candidate
 
-        # Ge tydligt fel
         raise FileNotFoundError(
             f"Kunde inte hitta filen för path={maybe_path}. "
             f"Försökte relativt till scene_dir={scene_dir}."
@@ -135,6 +130,12 @@ class SceneTwoPairsDataset(Dataset):
 
     def _load_vision(self, vision: Any) -> torch.Tensor:
         return torch.as_tensor(vision, dtype=torch.float32)
+
+    def _load_cylinders(self, cylinders: Any) -> torch.Tensor:
+        return torch.as_tensor(
+            [[c["x"], c["y"], c["r"], c["h"]] for c in cylinders],
+            dtype=torch.float32,
+        )
 
     def _camera_to_matrix(self, camera: Dict[str, Any]) -> torch.Tensor:
         if "R" not in camera or "t" not in camera:
@@ -182,12 +183,13 @@ class SceneTwoPairsDataset(Dataset):
         q = torch.stack([qw, qx, qy, qz])
         q = q / (torch.linalg.norm(q) + 1e-8)
 
-        # Make the representation deterministic up to sign.
         if q[0] < 0:
             q = -q
         return q
 
-    def _relative_pose_2d(self, camera1: Dict[str, Any], camera2: Dict[str, Any]) -> torch.Tensor:
+    def _relative_pose_2d(
+        self, camera1: Dict[str, Any], camera2: Dict[str, Any]
+    ) -> torch.Tensor:
         T1 = self._camera_to_matrix(camera1)
         T2 = self._camera_to_matrix(camera2)
         T_rel = T2 @ torch.linalg.inv(T1)
@@ -213,6 +215,7 @@ class SceneTwoPairsDataset(Dataset):
         img_b = self._load_image(path_b)
         vision_a = self._load_vision(pair["vision1"])
         vision_b = self._load_vision(pair["vision2"])
+        target_cylinders = self._load_cylinders(sample.cylinders)
 
         camera1 = pair.get("camera1", sample.scene_camera1)
         camera2 = pair.get("camera2", sample.scene_camera2)
@@ -224,10 +227,20 @@ class SceneTwoPairsDataset(Dataset):
 
         pose_ab = self._relative_pose_2d(camera1, camera2)
 
-        if self.debugg:
-            return img_a, vision_a, img_b, pose_ab, str(path_a), str(path_b), camera1, camera2
+        if self.debug:
+            return (
+                img_a,
+                vision_a,
+                img_b,
+                pose_ab,
+                target_cylinders,
+                str(path_a),
+                str(path_b),
+                camera1,
+                camera2,
+            )
 
-        return img_a, vision_a, img_b, vision_b, pose_ab
+        return img_a, vision_a, img_b, vision_b, pose_ab, target_cylinders
 
     def _sample_second_index_same_scene(self, idx: int) -> int:
         scene_dir = self.samples[idx].scene_dir
@@ -248,8 +261,7 @@ class SceneTwoPairsDataset(Dataset):
         pair1 = self._get_pair(idx)
         pair2 = self._get_pair(idx2)
 
-        if self.debugg:
-            # pair1 and pair2 each contain extra debug info
+        if self.debug:
             return pair1, pair2
 
         return (*pair1, *pair2)
