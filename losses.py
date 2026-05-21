@@ -420,18 +420,18 @@ def reprojection_loss_2d(
     lambda_occ=1.0,
     lambda_radius=1.0,
     lambda_depth=1.0,
-    u_min=-1.0,
-    u_max=1.0,
+    fov_degrees=90.0,
 ):
     """
-    vision_a, vision_b: (B, N, 3) = [occ, radius, depth]
+    vision_a, vision_b: (B, N, 3) = [occ, radius, radial_depth]
     pose_ab: (B, 4) = [tx, ty, sin(yaw), cos(yaw)]
 
-    Matchar generatorns vision-binning:
-    u = x / y
-    där x = lateral/sida, y = framåt/depth.
+    Bin motsvarar theta.
+    Depth är radialt avstånd d.
 
-    u_min=-1, u_max=1 motsvarar ungefär 90 graders FOV.
+    Representation:
+        x = d * cos(theta)
+        y = d * sin(theta)
     """
     B, N, _ = vision_a.shape
     device = vision_a.device
@@ -445,22 +445,21 @@ def reprojection_loss_2d(
     rad_b = vision_b[..., 1]
     dep_b = vision_b[..., 2]
 
-    # Bin centers i generatorns u-koordinat
-    bin_size = (u_max - u_min) / N
-    u_centers = torch.linspace(
-        u_min + 0.5 * bin_size,
-        u_max - 0.5 * bin_size,
-        N,
-        device=device,
-        dtype=dtype,
+    fov = torch.tensor(fov_degrees * torch.pi / 180.0, device=device, dtype=dtype)
+    theta_min = -0.5 * fov
+    theta_max = 0.5 * fov
+    theta_bin_size = fov / N
+
+    theta_centers = (
+        theta_min
+        + (torch.arange(N, device=device, dtype=dtype) + 0.5) * theta_bin_size
     )
 
-    u_a = u_centers.view(1, N).expand(B, N)
+    theta_a = theta_centers.view(1, N).expand(B, N)
 
-    # Avprojicera från u + depth till BEV
-    # u = x / y, depth = y
-    y_a = dep_a
-    x_a = u_a * dep_a
+    # Avprojicera vision A till 2D-punkter
+    x_a = dep_a * torch.cos(theta_a)
+    y_a = dep_a * torch.sin(theta_a)
 
     tx = pose_ab[:, 0].view(B, 1)
     ty = pose_ab[:, 1].view(B, 1)
@@ -471,12 +470,12 @@ def reprojection_loss_2d(
     x_b = c * x_a - s * y_a + tx
     y_b = s * x_a + c * y_a + ty
 
-    # Projicera till B:s u-koordinat
-    dep_proj = y_b
-    u_proj = x_b / (y_b + 1e-6)
+    # Projicera till B-representation
+    theta_proj = torch.atan2(y_b, x_b)
+    dep_proj = torch.sqrt(x_b**2 + y_b**2)
 
-    # u -> bin-index
-    bin_pos = (u_proj - u_min) / (u_max - u_min) * N - 0.5
+    # theta -> bin-position
+    bin_pos = (theta_proj - theta_min) / theta_bin_size - 0.5
 
     j0 = torch.floor(bin_pos).long()
     j1 = j0 + 1
@@ -488,8 +487,8 @@ def reprojection_loss_2d(
         (occ_a > occ_thresh)
         & (dep_a > 0)
         & (dep_proj > 0)
-        & (u_proj >= u_min)
-        & (u_proj <= u_max)
+        & (theta_proj >= theta_min)
+        & (theta_proj < theta_max)
         & (j0 >= 0)
         & (j1 < N)
     )
