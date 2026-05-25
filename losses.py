@@ -17,7 +17,7 @@ def add_sup_losses(
     total_t += loss_out["translation"].item()
     total_r += loss_out["rotation"].item()
 
-    return total_vis, total_radius, total_pose, total_depth, total_t, total_r,
+    return total_vis, total_radius, total_pose, total_depth, total_t, total_r
 
 def match_vision_to_target_cylinders(
     pred_vision,
