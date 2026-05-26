@@ -58,14 +58,8 @@ def match_vision_to_target_cylinders(
     tgt_dep = target_vision[..., 2]
     tgt_id = target_vision[..., 3].long()
 
-    # x = torch.cos(theta).view(1, N)
-    # y = torch.sin(theta).view(1, N)
-
-    # pred_pts = torch.stack([pred_dep * x, pred_dep * y, pred_dep], dim=-1)
-    # tgt_pts = torch.stack([tgt_dep * x, tgt_dep * y, tgt_dep], dim=-1)
-
-    x = torch.sin(theta).view(1, N)
-    y = torch.cos(theta).view(1, N)
+    x = torch.cos(theta).view(1, N)
+    y = torch.sin(theta).view(1, N)
 
     pred_pts = torch.stack([pred_dep * x, pred_dep * y], dim=-1)
     tgt_pts = torch.stack([tgt_dep * x, tgt_dep * y], dim=-1)
@@ -216,10 +210,8 @@ def matched_reprojection_loss_2d(
 
     def vision_points_2d(vision):
         depth = vision[..., 2]
-        # x = depth * torch.cos(theta).view(1, N)
-        # y = depth * torch.sin(theta).view(1, N)
-        x = depth * torch.sin(theta).view(1, N)
-        y = depth * torch.cos(theta).view(1, N)
+        x = depth * torch.cos(theta).view(1, N)
+        y = depth * torch.sin(theta).view(1, N)
         return torch.stack([x, y], dim=-1)
 
     pts_a = vision_points_2d(pred_vision_a)
