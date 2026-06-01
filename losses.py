@@ -1,6 +1,7 @@
 import torch
 import torch.nn.functional as F
 
+
 def add_sup_losses(
         total_vis,
         total_radius,
@@ -19,6 +20,114 @@ def add_sup_losses(
 
     return total_vis, total_radius, total_pose, total_depth, total_t, total_r
 
+
+def match_sinkhorn_between_views(
+    vision_a,
+    vision_b,
+    pose_ab,
+    occ_thresh=0.5,
+    fov_degrees=90.0,
+    lambda_pos=1.0,
+    lambda_radius=1.0,
+    temperature=0.1,
+    sinkhorn_iters=50,
+):
+    squeeze_batch = False
+    if vision_a.dim() == 2:
+        vision_a = vision_a.unsqueeze(0)
+        vision_b = vision_b.unsqueeze(0)
+        pose_ab = pose_ab.unsqueeze(0)
+        squeeze_batch = True
+
+    B, N, _ = vision_a.shape
+    device = vision_a.device
+    dtype = vision_a.dtype
+
+    fov = torch.tensor(fov_degrees * torch.pi / 180.0, device=device, dtype=dtype)
+    theta = torch.linspace(-0.5 * fov, 0.5 * fov, N, device=device, dtype=dtype)
+
+    def vision_points_2d(vision):
+        depth = vision[..., 2]
+        x = depth * torch.cos(theta).view(1, N)
+        y = depth * torch.sin(theta).view(1, N)
+        return torch.stack([x, y], dim=-1)
+
+    def sinkhorn(log_alpha, n_iters):
+        for _ in range(n_iters):
+            log_alpha = log_alpha - torch.logsumexp(log_alpha, dim=1, keepdim=True)
+            log_alpha = log_alpha - torch.logsumexp(log_alpha, dim=0, keepdim=True)
+        return log_alpha.exp()
+
+    pts_a = vision_points_2d(vision_a)
+    pts_b = vision_points_2d(vision_b)
+
+    occ_a = vision_a[..., 0]
+    rad_a = vision_a[..., 1]
+
+    occ_b = vision_b[..., 0]
+    rad_b = vision_b[..., 1]
+
+    t = pose_ab[:, :2]
+
+    yaw_vec = F.normalize(pose_ab[:, 2:], dim=-1)
+    sin_yaw = yaw_vec[:, 0]
+    cos_yaw = yaw_vec[:, 1]
+
+    out = []
+
+    for b in range(B):
+        mask_a = occ_a[b] > occ_thresh
+        mask_b = occ_b[b] > occ_thresh
+
+        if mask_a.sum() == 0 or mask_b.sum() == 0:
+            out.append({
+                "indices_a": torch.empty(0, device=device, dtype=torch.long),
+                "matched_indices_b": torch.empty(0, device=device, dtype=torch.long),
+                "matched_cost": torch.empty(0, device=device, dtype=dtype),
+                "match_prob": torch.empty(0, device=device, dtype=dtype),
+            })
+            continue
+
+        idx_a = torch.where(mask_a)[0]
+        idx_b = torch.where(mask_b)[0]
+
+        xa = pts_a[b, idx_a]
+        xb = pts_b[b, idx_b]
+
+        s = sin_yaw[b]
+        c = cos_yaw[b]
+
+        R = torch.stack([
+            torch.stack([c, -s]),
+            torch.stack([s,  c]),
+        ])
+
+        xa_in_b = xa @ R.T + t[b]
+
+        pos_cost = torch.cdist(xa_in_b, xb, p=2)
+
+        ra = rad_a[b, idx_a]
+        rb = rad_b[b, idx_b]
+        rad_cost = torch.abs(ra[:, None] - rb[None, :])
+
+        cost = lambda_pos * pos_cost + lambda_radius * rad_cost
+
+        log_alpha = -cost / temperature
+        P = sinkhorn(log_alpha, sinkhorn_iters)
+
+        best_local_b = P.argmax(dim=1)
+        matched_idx_b = idx_b[best_local_b]
+
+        out.append({
+            "indices_a": idx_a,
+            "matched_indices_b": matched_idx_b,
+            "matched_cost": cost[torch.arange(cost.shape[0], device=device), best_local_b],
+            "match_prob": P[torch.arange(P.shape[0], device=device), best_local_b],
+        })
+
+    return out[0] if squeeze_batch else out
+
+
 def match_vision_to_target_cylinders(
     pred_vision,
     target_vision,
@@ -27,13 +136,6 @@ def match_vision_to_target_cylinders(
     lambda_pos=1.0,
     lambda_radius=1.0,
 ):
-    """
-    pred_vision/target_vision: [B, N, 4] eller [N, 4]
-    channels: [occupancy, radius, depth, id]
-
-    Returnerar target-id för varje pred-cylinder med occupancy > occ_thresh.
-    """
-
     squeeze_batch = False
     if pred_vision.dim() == 2:
         pred_vision = pred_vision.unsqueeze(0)
@@ -45,9 +147,7 @@ def match_vision_to_target_cylinders(
     dtype = pred_vision.dtype
 
     fov = torch.tensor(fov_degrees * torch.pi / 180.0, device=device, dtype=dtype)
-    theta_min = -0.5 * fov
-    theta_max = 0.5 * fov
-    theta = torch.linspace(theta_min, theta_max, N, device=device, dtype=dtype)
+    theta = torch.linspace(-0.5 * fov, 0.5 * fov, N, device=device, dtype=dtype)
 
     pred_occ = pred_vision[..., 0]
     pred_rad = pred_vision[..., 1]
@@ -105,64 +205,125 @@ def match_vision_to_target_cylinders(
 
     return out[0] if squeeze_batch else out
 
+
+def _get_pair_matches(
+    pred_vision_a,
+    target_vision_a,
+    pred_vision_b,
+    target_vision_b,
+    relative_pose_pred=None,
+    matching_mode="gt",
+    occ_thresh=0.5,
+    fov_degrees=90.0,
+):
+    if matching_mode == "gt":
+        match_a = match_vision_to_target_cylinders(
+            pred_vision_a,
+            target_vision_a,
+            occ_thresh=occ_thresh,
+            fov_degrees=fov_degrees,
+        )
+
+        match_b = match_vision_to_target_cylinders(
+            pred_vision_b,
+            target_vision_b,
+            occ_thresh=occ_thresh,
+            fov_degrees=fov_degrees,
+        )
+
+        return match_a, match_b
+
+    if matching_mode == "sinkhorn":
+        if relative_pose_pred is None:
+            raise ValueError("relative_pose_pred krävs när matching_mode='sinkhorn'")
+
+        match_ab = match_sinkhorn_between_views(
+            pred_vision_a,
+            pred_vision_b,
+            relative_pose_pred,
+            occ_thresh=occ_thresh,
+            fov_degrees=fov_degrees,
+        )
+
+        return match_ab, None
+
+    raise ValueError(f"Okänt matching_mode: {matching_mode}. Använd 'gt' eller 'sinkhorn'.")
+
+
 def matched_radius_consistency_loss(
     pred_vision_a,
     target_vision_a,
     pred_vision_b,
     target_vision_b,
+    relative_pose_pred=None,
     occ_thresh=0.5,
+    fov_degrees=90.0,
+    matching_mode="gt",
 ):
-    match_a = match_vision_to_target_cylinders(
+    match_a, match_b = _get_pair_matches(
         pred_vision_a,
         target_vision_a,
-        occ_thresh=occ_thresh,
-    )
-
-    match_b = match_vision_to_target_cylinders(
         pred_vision_b,
         target_vision_b,
+        relative_pose_pred=relative_pose_pred,
+        matching_mode=matching_mode,
         occ_thresh=occ_thresh,
+        fov_degrees=fov_degrees,
     )
 
-    squeeze_batch = False
     if pred_vision_a.dim() == 2:
         pred_vision_a = pred_vision_a.unsqueeze(0)
         pred_vision_b = pred_vision_b.unsqueeze(0)
         match_a = [match_a]
-        match_b = [match_b]
-        squeeze_batch = True
+        if match_b is not None:
+            match_b = [match_b]
 
     losses = []
 
-    for batch_i, (ma, mb) in enumerate(zip(match_a, match_b)):
-        ids_a = ma["matched_ids"]
-        ids_b = mb["matched_ids"]
+    if matching_mode == "sinkhorn":
+        for batch_i, m in enumerate(match_a):
+            idx_a = m["indices_a"]
+            idx_b = m["matched_indices_b"]
 
-        pred_idx_a = ma["pred_indices"]
-        pred_idx_b = mb["pred_indices"]
-
-        if ids_a.numel() == 0 or ids_b.numel() == 0:
-            continue
-
-        for cid in ids_a.unique():
-            pos_a = torch.where(ids_a == cid)[0]
-            pos_b = torch.where(ids_b == cid)[0]
-
-            if pos_b.numel() == 0:
+            if idx_a.numel() == 0 or idx_b.numel() == 0:
                 continue
 
-            ia = pred_idx_a[pos_a[0]]
-            ib = pred_idx_b[pos_b[0]]
-
-            radius_a = pred_vision_a[batch_i, ia, 1]
-            radius_b = pred_vision_b[batch_i, ib, 1]
+            radius_a = pred_vision_a[batch_i, idx_a, 1]
+            radius_b = pred_vision_b[batch_i, idx_b, 1]
 
             losses.append(F.l1_loss(radius_a, radius_b, reduction="mean"))
 
+    else:
+        for batch_i, (ma, mb) in enumerate(zip(match_a, match_b)):
+            ids_a = ma["matched_ids"]
+            ids_b = mb["matched_ids"]
+
+            pred_idx_a = ma["pred_indices"]
+            pred_idx_b = mb["pred_indices"]
+
+            if ids_a.numel() == 0 or ids_b.numel() == 0:
+                continue
+
+            for cid in ids_a.unique():
+                pos_a = torch.where(ids_a == cid)[0]
+                pos_b = torch.where(ids_b == cid)[0]
+
+                if pos_b.numel() == 0:
+                    continue
+
+                ia = pred_idx_a[pos_a[0]]
+                ib = pred_idx_b[pos_b[0]]
+
+                radius_a = pred_vision_a[batch_i, ia, 1]
+                radius_b = pred_vision_b[batch_i, ib, 1]
+
+                losses.append(F.l1_loss(radius_a, radius_b, reduction="mean"))
+
     if len(losses) == 0:
-        return torch.zeros((), device=pred_vision_a.device, dtype=pred_vision_a.dtype)
+        return pred_vision_a.new_tensor(0.0)
 
     return torch.stack(losses).mean()
+
 
 def matched_reprojection_loss_2d(
     pred_vision_a,
@@ -172,24 +333,15 @@ def matched_reprojection_loss_2d(
     relative_pose_pred,
     occ_thresh=0.5,
     fov_degrees=90.0,
+    matching_mode="gt",
 ):
-    """
-    pred/target vision: [B, N, 4] eller [N, 4]
-    channels: [occupancy, radius, depth, id]
-
-    relative_pose_pred: [B, 4] = [tx, ty, sin(yaw), cos(yaw)]
-    """
-
-    match_a = match_vision_to_target_cylinders(
+    match_a, match_b = _get_pair_matches(
         pred_vision_a,
         target_vision_a,
-        occ_thresh=occ_thresh,
-        fov_degrees=fov_degrees,
-    )
-
-    match_b = match_vision_to_target_cylinders(
         pred_vision_b,
         target_vision_b,
+        relative_pose_pred=relative_pose_pred,
+        matching_mode=matching_mode,
         occ_thresh=occ_thresh,
         fov_degrees=fov_degrees,
     )
@@ -199,7 +351,8 @@ def matched_reprojection_loss_2d(
         pred_vision_b = pred_vision_b.unsqueeze(0)
         relative_pose_pred = relative_pose_pred.unsqueeze(0)
         match_a = [match_a]
-        match_b = [match_b]
+        if match_b is not None:
+            match_b = [match_b]
 
     B, N, _ = pred_vision_a.shape
     device = pred_vision_a.device
@@ -225,36 +378,53 @@ def matched_reprojection_loss_2d(
 
     losses = []
 
-    for batch_i, (ma, mb) in enumerate(zip(match_a, match_b)):
-        ids_a = ma["matched_ids"]
-        ids_b = mb["matched_ids"]
+    for batch_i in range(B):
+        if matching_mode == "sinkhorn":
+            m = match_a[batch_i]
 
-        pred_idx_a = ma["pred_indices"]
-        pred_idx_b = mb["pred_indices"]
+            idx_a = m["indices_a"]
+            idx_b = m["matched_indices_b"]
 
-        if ids_a.numel() == 0 or ids_b.numel() == 0:
-            continue
-
-        for cid in ids_a.unique():
-            pos_a = torch.where(ids_a == cid)[0]
-            pos_b = torch.where(ids_b == cid)[0]
-
-            if pos_b.numel() == 0:
+            if idx_a.numel() == 0 or idx_b.numel() == 0:
                 continue
 
-            ia = pred_idx_a[pos_a[0]]
-            ib = pred_idx_b[pos_b[0]]
+            pairs = zip(idx_a, idx_b)
 
+        else:
+            ma = match_a[batch_i]
+            mb = match_b[batch_i]
+
+            ids_a = ma["matched_ids"]
+            ids_b = mb["matched_ids"]
+
+            pred_idx_a = ma["pred_indices"]
+            pred_idx_b = mb["pred_indices"]
+
+            if ids_a.numel() == 0 or ids_b.numel() == 0:
+                continue
+
+            pairs = []
+
+            for cid in ids_a.unique():
+                pos_a = torch.where(ids_a == cid)[0]
+                pos_b = torch.where(ids_b == cid)[0]
+
+                if pos_b.numel() == 0:
+                    continue
+
+                pairs.append((pred_idx_a[pos_a[0]], pred_idx_b[pos_b[0]]))
+
+        s = sin_yaw[batch_i]
+        c = cos_yaw[batch_i]
+
+        R = torch.stack([
+            torch.stack([c, -s]),
+            torch.stack([s,  c]),
+        ])
+
+        for ia, ib in pairs:
             x_a = pts_a[batch_i, ia]
             x_b = pts_b[batch_i, ib]
-
-            s = sin_yaw[batch_i]
-            c = cos_yaw[batch_i]
-
-            R = torch.stack([
-                torch.stack([c, -s]),
-                torch.stack([s,  c]),
-            ])
 
             x_b_pred = R @ x_a + t[batch_i]
 
@@ -274,13 +444,6 @@ def vision_loss(
     lambda_radius=1.0,
     lambda_depth=1.0,
 ):
-    """
-    pred_vision, target_vision: (B, num_bins, 3)
-        channel 0 = occupancy
-        channel 1 = radius
-        channel 2 = depth
-    """
-
     pred_occ = pred_vision[..., 0]
     pred_rad = pred_vision[..., 1]
     pred_dep = pred_vision[..., 2]
@@ -289,13 +452,11 @@ def vision_loss(
     tgt_rad = target_vision[..., 1]
     tgt_dep = target_vision[..., 2]
 
-    # 1) Occupancy: BCE
     occ_loss = F.binary_cross_entropy(
         pred_occ.clamp(1e-6, 1.0 - 1e-6),
         tgt_occ
     )
 
-    # 2) Radius + depth only where occupancy is on
     mask = (tgt_occ > occ_thresh).float()
 
     rad_l1 = F.l1_loss(pred_rad, tgt_rad, reduction="none")
@@ -319,10 +480,6 @@ def relative_pose_loss_2d(
     t_weight=1.0,
     r_weight=1.0,
 ):
-    """
-    pred_pose, target_pose: (B, 4) = [tx, ty, sin(yaw), cos(yaw)]
-    """
-
     pred_t = pred_pose[:, :2]
     tgt_t = target_pose[:, :2]
 
@@ -351,12 +508,9 @@ def supervised_loss(
     lambda_depth=1.0,
     t_weight=1.0,
     r_weight=1.0,
-):    
-    pred_vis_a = pred_vision_a
-    pred_vis_b = pred_vision_b
-
+):
     vis_a_total, vis_a_occ, vis_a_rad, vis_a_dep = vision_loss(
-        pred_vis_a,
+        pred_vision_a,
         target_vision_a,
         occ_thresh=occ_thresh,
         lambda_occ=lambda_occ,
@@ -365,14 +519,13 @@ def supervised_loss(
     )
 
     vis_b_total, vis_b_occ, vis_b_rad, vis_b_dep = vision_loss(
-        pred_vis_b,
+        pred_vision_b,
         target_vision_b,
         occ_thresh=occ_thresh,
         lambda_occ=lambda_occ,
         lambda_radius=lambda_radius,
         lambda_depth=lambda_depth,
     )
-
 
     pose_total, t_loss, r_loss = relative_pose_loss_2d(
         pred_pose,
@@ -381,7 +534,10 @@ def supervised_loss(
         r_weight=r_weight,
     )
 
-    total = (lambda_vis * vis_a_total + lambda_vis * vis_b_total)/2.0  + lambda_pose * pose_total
+    total = (
+        lambda_vis * vis_a_total +
+        lambda_vis * vis_b_total
+    ) / 2.0 + lambda_pose * pose_total
 
     return {
         "total": total,
@@ -404,16 +560,6 @@ def consistency_loss(
     lambda_radius=1.0,
     lambda_depth=1.0,
 ):
-    """
-    pred_vision_1, pred_vision_2: (B, num_bins, 3)
-        channel 0 = occupancy
-        channel 1 = radius
-        channel 2 = depth
-
-    Jämför bara cylindrar som verkar motsvara samma objekt.
-    Extra cylindrar i ena vyn ignoreras.
-    """
-
     total_loss = pred_vision_1.new_tensor(0.0)
     total_occ = pred_vision_1.new_tensor(0.0)
     total_rad = pred_vision_1.new_tensor(0.0)
@@ -440,18 +586,16 @@ def consistency_loss(
         if m1.sum() == 0 or m2.sum() == 0:
             continue
 
-        f1 = torch.stack([rad1[m1], dep1[m1]], dim=-1)  # (N1, 2)
-        f2 = torch.stack([rad2[m2], dep2[m2]], dim=-1)  # (N2, 2)
+        f1 = torch.stack([rad1[m1], dep1[m1]], dim=-1)
+        f2 = torch.stack([rad2[m2], dep2[m2]], dim=-1)
 
         o1 = occ1[m1]
         o2 = occ2[m2]
 
-        # Pairwise cost mellan möjliga cylinder-matchningar
-        cost = torch.cdist(f1, f2, p=1)  # (N1, N2)
+        cost = torch.cdist(f1, f2, p=1)
 
-        # Mutual nearest neighbors
-        nn12 = cost.argmin(dim=1)  # for each in v1 -> best in v2
-        nn21 = cost.argmin(dim=0)  # for each in v2 -> best in v1
+        nn12 = cost.argmin(dim=1)
+        nn21 = cost.argmin(dim=0)
 
         matched_i = []
         matched_j = []
@@ -468,10 +612,7 @@ def consistency_loss(
         idx1 = torch.tensor(matched_i, device=pred_vision_1.device)
         idx2 = torch.tensor(matched_j, device=pred_vision_1.device)
 
-        # Occupancy consistency för de matchade cylindrarna
         loss_occ = F.mse_loss(o1[idx1], o2[idx2])
-
-        # Radius + depth consistency
         loss_rad = F.l1_loss(f1[idx1, 0], f2[idx2, 0])
         loss_dep = F.l1_loss(f1[idx1, 1], f2[idx2, 1])
 
@@ -507,4 +648,3 @@ def consistency_loss(
         "radius": total_rad,
         "depth": total_dep,
     }
-
