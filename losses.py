@@ -208,15 +208,18 @@ def match_vision_to_target_cylinders(
 
 def _get_pair_matches(
     pred_vision_a,
-    target_vision_a,
-    pred_vision_b,
-    target_vision_b,
+    target_vision_a=None,
+    pred_vision_b=None,
+    target_vision_b=None,
     relative_pose_pred=None,
     matching_mode="gt",
     occ_thresh=0.5,
     fov_degrees=90.0,
 ):
     if matching_mode == "gt":
+        if target_vision_a is None or target_vision_b is None:
+            raise ValueError("target_vision_a och target_vision_b krävs när matching_mode='gt'")
+
         match_a = match_vision_to_target_cylinders(
             pred_vision_a,
             target_vision_a,
@@ -249,12 +252,11 @@ def _get_pair_matches(
 
     raise ValueError(f"Okänt matching_mode: {matching_mode}. Använd 'gt' eller 'sinkhorn'.")
 
-
 def matched_radius_consistency_loss(
     pred_vision_a,
-    target_vision_a,
-    pred_vision_b,
-    target_vision_b,
+    target_vision_a=None,
+    pred_vision_b=None,
+    target_vision_b=None,
     relative_pose_pred=None,
     occ_thresh=0.5,
     fov_degrees=90.0,
@@ -320,21 +322,23 @@ def matched_radius_consistency_loss(
                 losses.append(F.l1_loss(radius_a, radius_b, reduction="mean"))
 
     if len(losses) == 0:
-        return pred_vision_a.new_tensor(0.0)
+        return pred_vision_a.sum() * 0.0
 
     return torch.stack(losses).mean()
 
-
 def matched_reprojection_loss_2d(
     pred_vision_a,
-    target_vision_a,
-    pred_vision_b,
-    target_vision_b,
-    relative_pose_pred,
+    target_vision_a=None,
+    pred_vision_b=None,
+    target_vision_b=None,
+    relative_pose_pred=None,
     occ_thresh=0.5,
     fov_degrees=90.0,
     matching_mode="gt",
 ):
+    if relative_pose_pred is None:
+        raise ValueError("relative_pose_pred krävs för matched_reprojection_loss_2d")
+
     match_a, match_b = _get_pair_matches(
         pred_vision_a,
         target_vision_a,
@@ -431,10 +435,10 @@ def matched_reprojection_loss_2d(
             losses.append(F.smooth_l1_loss(x_b_pred, x_b, reduction="mean"))
 
     if len(losses) == 0:
-        return pred_vision_a.new_tensor(0.0)
+        return pred_vision_a.sum() * 0.0
+    
 
     return torch.stack(losses).mean()
-
 
 def vision_loss(
     pred_vision,
