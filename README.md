@@ -1,32 +1,32 @@
 # Pose from Cylinders
 
-Det här repot tränar en bildparmodell som använder cylindrar i scenen som geometriska ankare. Modellen tar två bilder som input och predikterar både
+This repository trains an image-pair model that uses cylinders in a scene as geometric anchors. Given two images, the model predicts both:
 
-- en `vision`-representation för varje bild: `[occupancy, radius, depth]` per horisontellt bin
-- en relativ 2D-pose mellan bilderna: `[tx, ty, sin(yaw), cos(yaw)]`
+- a `vision` representation for each image: `[occupancy, radius, depth]` per horizontal bin
+- a relative 2D pose between the images: `[tx, ty, sin(yaw), cos(yaw)]`
 
-Huvudflödet ligger i `train.ipynb`. Där skapas dataset, modell, losses, träningsloopar, valideringsplottar och visualiseringar av predikterade cylindrar.
+The main workflow lives in `train.ipynb`. It creates the datasets, model, losses, training loops, validation plots, inference views, and visualizations of predicted cylinders.
 
-## Repoöversikt
+## Repository Overview
 
-- `train.ipynb`: huvudsaklig notebook för träning, validering, inferens och plotting.
-- `analyze_dataset.ipynb`: analys/debug av dataset och kameraposer.
-- `model.py`: parmodell med patch-embedding, Transformer-backbone, vision-head och pose-head.
-- `dataset.py`: datasetklass för syntetiska cylinderscener med labels i `labels.json`.
-- `colmap_pair_dataset.py`: datasetklass för bildpar med relativa COLMAP-poser.
-- `losses.py`: supervised loss, pose loss, vision loss, Sinkhorn-matchning, radius consistency och reprojection loss.
-- `utils.py`: plotting och små hjälpfunktioner för pose/vision-output.
-- `debugger.py`: hjälpfunktioner för att inspektera kameror, yaw och datasetposter.
-- `ex_train_loop.py`: minimalt exempel på att läsa `ColmapPairDataset`.
-- `working_requirements.txt`: beroenden som använts i arbetsmiljön.
+- `train.ipynb`: main notebook for training, validation, inference, and plotting.
+- `analyze_dataset.ipynb`: dataset and camera-pose analysis/debugging.
+- `model.py`: pair model with patch embedding, Transformer backbone, vision head, and pose head.
+- `dataset.py`: dataset class for synthetic cylinder scenes with `labels.json` annotations.
+- `colmap_pair_dataset.py`: dataset class for image pairs with relative COLMAP poses.
+- `losses.py`: supervised loss, pose loss, vision loss, Sinkhorn matching, radius consistency, and reprojection loss.
+- `utils.py`: plotting utilities and small pose/vision helper functions.
+- `debugger.py`: helpers for inspecting cameras, yaw, and dataset entries.
+- `ex_train_loop.py`: minimal example for reading `ColmapPairDataset`.
+- `working_requirements.txt`: dependencies used in the working environment.
 
 ## Data
 
-Datamapparna är git-ignorerade och förväntas ligga lokalt i reporoten.
+The data directories are ignored by git and are expected to exist locally in the repository root.
 
-### Syntetisk cylinderdata
+### Synthetic Cylinder Data
 
-`SceneTwoPairsDataset` läser mappar med den här strukturen:
+`SceneTwoPairsDataset` reads directories with this structure:
 
 ```text
 dataset/
@@ -38,7 +38,7 @@ dataset/
       ...
 ```
 
-Samma format används för exempelvis:
+The same format is used for directories such as:
 
 ```text
 dataset/
@@ -46,27 +46,27 @@ valdataset/
 testdataset/
 ```
 
-Varje `labels.json` ska innehålla en lista `pairs`, där varje pair har:
+Each `labels.json` should contain a `pairs` list where each pair has:
 
 - `image1`, `image2`
 - `vision1`, `vision2`
-- `camera1`, `camera2`, antingen i pair-objektet eller på scen-nivå
+- `camera1`, `camera2`, either on the pair object or at scene level
 
-`vision` tolkas som en array med shape `(num_bins, 4)` i labels:
+The labeled `vision` array has shape `(num_bins, 4)`:
 
 ```text
 [occupancy, radius, depth, cylinder_id]
 ```
 
-Modellen predikterar motsvarande `(num_bins, 3)`:
+The model predicts the corresponding `(num_bins, 3)` representation:
 
 ```text
 [occupancy, radius, depth]
 ```
 
-### Forest/COLMAP-data
+### Forest/COLMAP Data
 
-`ColmapPairDataset` läser:
+`ColmapPairDataset` reads:
 
 ```text
 forestdataset/
@@ -75,50 +75,50 @@ forestdataset/
   relative_poses.json
 ```
 
-Varje post i `relative_poses.json` ska innehålla:
+Each entry in `relative_poses.json` should contain:
 
 - `from_image`
 - `to_image`
-- `T_ab`, en relativ 4x4-transform från kamera/frame A till B
+- `T_ab`, a relative 4x4 transform from camera/frame A to B
 
 ## Installation
 
-Skapa och aktivera en virtuell miljö:
+Create and activate a virtual environment:
 
 ```bash
 python3 -m venv venv
 source venv/bin/activate
 ```
 
-Installera beroenden:
+Install dependencies:
 
 ```bash
 pip install -r working_requirements.txt
 ```
 
-Starta sedan Jupyter och öppna `train.ipynb`:
+Start Jupyter and open `train.ipynb`:
 
 ```bash
 jupyter notebook
 ```
 
-Om `jupyter` inte finns i miljön behöver det installeras separat:
+If `jupyter` is not available in the environment, install it separately:
 
 ```bash
 pip install notebook
 ```
 
-## Träning
+## Training
 
-Det rekommenderade flödet är att köra `train.ipynb` uppifrån och ned:
+The recommended workflow is to run `train.ipynb` from top to bottom:
 
-1. Importera beroenden och skapa `device`.
-2. Skapa `PairImageCylinderModel`.
-3. Skapa `train_loader`, `val_loader` och `forest_loader`.
-4. Kör träningscellen.
-5. Kör plotcellerna för loss-kurvor och inferens.
+1. Import dependencies and create `device`.
+2. Create `PairImageCylinderModel`.
+3. Create `train_loader`, `val_loader`, and `forest_loader`.
+4. Run the training cell.
+5. Run the plotting cells for loss curves and inference.
 
-Notebooken använder för närvarande bland annat:
+The notebook currently uses a configuration like:
 
 ```python
 PairImageCylinderModel(
@@ -131,47 +131,51 @@ PairImageCylinderModel(
 )
 ```
 
-De viktigaste loss-delarna är:
+The main loss terms are:
 
-- supervised vision loss mot syntetiska labels
-- supervised relativ pose loss
-- matchad radius consistency mellan vyer
-- matchad 2D reprojection loss mellan vyer
-- extra forest/COLMAP-konsistens efter en start-epoch
+- supervised vision loss against synthetic labels
+- supervised relative pose loss
+- matched radius consistency between views
+- matched 2D reprojection loss between views
+- additional forest/COLMAP consistency after a start epoch
 
-## Visualisering
+## Visualization
 
-`utils.py` innehåller hjälpfunktionen:
+`utils.py` provides:
 
 ```python
 plot_estimated_cylinders_on_images(images, visions, occ_threshold=0.6, flip_x=True)
 ```
 
-Den ritar predikterade cylindrar som vertikala overlay-band ovanpå bilderna. `flip_x=True` används eftersom vision-binarnas riktning är speglad relativt bildens x-koordinat.
+It draws predicted cylinders as vertical overlay bands on top of the images. `flip_x=True` is used because the vision-bin direction is mirrored relative to the image x-coordinate.
 
-I `train.ipynb` finns celler för att:
+`train.ipynb` includes cells for:
 
-- plotta GT vs predikterad `occupancy`, `radius` och `depth`
-- plotta predikterade cylindrar på syntetiska testbilder
-- plotta predikterade cylindrar på ett sample från `forest_loader`
-- plotta relativ pose med `plot_relative_pose`
+- plotting ground-truth vs predicted `occupancy`, `radius`, and `depth`
+- plotting predicted cylinders on synthetic test images
+- plotting predicted cylinders on a sample from `forest_loader`
+- plotting relative pose with `plot_relative_pose`
 
-## Snabba kontroller
+## Quick Checks
 
-Kontrollera att Python-filerna kompilerar:
+Check that the Python files compile:
 
 ```bash
 venv/bin/python -m py_compile model.py dataset.py colmap_pair_dataset.py losses.py utils.py debugger.py
 ```
 
-Kontrollera att notebooken är giltig JSON:
+Check that the notebook is valid JSON:
 
 ```bash
 python3 -c "import json; json.load(open('train.ipynb')); print('notebook json ok')"
 ```
 
-## Anteckningar
+## License
 
-- Datamapparna är inte versionshanterade enligt `.gitignore`.
-- `train.ipynb` är det levande experimentflödet och kan innehålla körda celloutputs.
-- Forest-datan saknar cylinder-GT; där används modellens prediktioner och geometriska konsistens mellan vyer.
+This project is licensed under the MIT License. See `LICENSE` for details.
+
+## Notes
+
+- Data directories are not versioned according to `.gitignore`.
+- `train.ipynb` is the active experiment workflow and may contain executed cell outputs.
+- The forest data has no cylinder ground truth; it uses model predictions and geometric consistency between views.
