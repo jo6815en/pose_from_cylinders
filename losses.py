@@ -20,7 +20,6 @@ def add_sup_losses(
 
     return total_vis, total_radius, total_pose, total_depth, total_t, total_r
 
-
 def match_sinkhorn_between_views(
     vision_a,
     vision_b,
@@ -31,6 +30,8 @@ def match_sinkhorn_between_views(
     lambda_radius=1.0,
     temperature=0.1,
     sinkhorn_iters=50,
+    dustbin_cost=1.0,
+    min_match_prob=0.0,
 ):
     squeeze_batch = False
     if vision_a.dim() == 2:
@@ -85,6 +86,7 @@ def match_sinkhorn_between_views(
                 "matched_indices_b": torch.empty(0, device=device, dtype=torch.long),
                 "matched_cost": torch.empty(0, device=device, dtype=dtype),
                 "match_prob": torch.empty(0, device=device, dtype=dtype),
+                "dustbin_prob": torch.empty(0, device=device, dtype=dtype),
             })
             continue
 
@@ -112,17 +114,59 @@ def match_sinkhorn_between_views(
 
         cost = lambda_pos * pos_cost + lambda_radius * rad_cost
 
-        log_alpha = -cost / temperature
-        P = sinkhorn(log_alpha, sinkhorn_iters)
+        n_a, n_b = cost.shape
 
-        best_local_b = P.argmax(dim=1)
+        cost_ext = torch.full(
+            (n_a + 1, n_b + 1),
+            dustbin_cost,
+            device=device,
+            dtype=dtype,
+        )
+
+        cost_ext[:n_a, :n_b] = cost
+
+        log_alpha = -cost_ext / temperature
+        P_ext = sinkhorn(log_alpha, sinkhorn_iters)
+
+        P_real = P_ext[:n_a, :n_b]
+        P_dustbin_col = P_ext[:n_a, n_b]
+
+        best_col_ext = P_ext[:n_a, :].argmax(dim=1)
+
+        keep = best_col_ext < n_b
+
+        if min_match_prob > 0.0:
+            best_prob_ext = P_ext[
+                torch.arange(n_a, device=device),
+                best_col_ext
+            ]
+            keep = keep & (best_prob_ext >= min_match_prob)
+
+        if keep.sum() == 0:
+            out.append({
+                "indices_a": torch.empty(0, device=device, dtype=torch.long),
+                "matched_indices_b": torch.empty(0, device=device, dtype=torch.long),
+                "matched_cost": torch.empty(0, device=device, dtype=dtype),
+                "match_prob": torch.empty(0, device=device, dtype=dtype),
+                "dustbin_prob": P_dustbin_col,
+            })
+            continue
+
+        kept_rows = torch.where(keep)[0]
+        best_local_b = best_col_ext[kept_rows]
+
+        matched_idx_a = idx_a[kept_rows]
         matched_idx_b = idx_b[best_local_b]
 
+        matched_cost = cost[kept_rows, best_local_b]
+        match_prob = P_real[kept_rows, best_local_b]
+
         out.append({
-            "indices_a": idx_a,
+            "indices_a": matched_idx_a,
             "matched_indices_b": matched_idx_b,
-            "matched_cost": cost[torch.arange(cost.shape[0], device=device), best_local_b],
-            "match_prob": P[torch.arange(P.shape[0], device=device), best_local_b],
+            "matched_cost": matched_cost,
+            "match_prob": match_prob,
+            "dustbin_prob": P_dustbin_col[kept_rows],
         })
 
     return out[0] if squeeze_batch else out
