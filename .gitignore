@@ -5,6 +5,7 @@ venv/
 data/
 dataset/
 dataset_no_background/
+dataset_normal/
 testdataset/
 valdataset/
 forestdataset/
