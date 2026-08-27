@@ -9,3 +9,5 @@ dataset_normal/
 testdataset/
 valdataset/
 forestdataset/
+logs/
+runs/
