@@ -2,7 +2,7 @@ import argparse
 import json
 import os
 import random
-
+import time
 import numpy as np
 import torch
 from torch.utils.data import DataLoader
@@ -37,6 +37,11 @@ def train_one_epoch(
     lambda_radius,
 ):
     model.train()
+
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
+
+    epoch_start = time.perf_counter()
 
     totals = {
         "total": 0.0,
@@ -153,10 +158,27 @@ def train_one_epoch(
         totals["radius_consistency"] += radius_cons.item()
         totals["reprojection"] += reproj.item()
 
-    return {
-        key: value / len(loader)
-        for key, value in totals.items()
-    }
+        epoch_time = time.perf_counter() - epoch_start
+
+        peak_gpu_gb = 0.0
+
+        if device.type == "cuda":
+            peak_gpu_gb = torch.cuda.max_memory_allocated(device) / (1024 ** 3)
+
+        metrics = {
+            key: value / len(loader)
+            for key, value in totals.items()
+        }
+
+        metrics["epoch_time_sec"] = epoch_time
+        metrics["peak_gpu_gb"] = peak_gpu_gb
+
+    return metrics
+
+    #return {
+    #    key: value / len(loader)
+    #    for key, value in totals.items()
+    #}
 
 
 @torch.no_grad()
@@ -358,6 +380,8 @@ def main():
             f"pose={train_metrics['pose']:.4f} | "
             f"radius_cons={train_metrics['radius_consistency']:.4f} | "
             f"reproj={train_metrics['reprojection']:.4f}"
+            f" | time={train_metrics['epoch_time_sec']:.1f}s"
+            f" | peak_gpu={train_metrics['peak_gpu_gb']:.2f}GB"
         )
 
         if epoch == 1 or epoch % args.val_interval == 0:
