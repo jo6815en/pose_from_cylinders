@@ -16,13 +16,6 @@ from losses import (
 )
 
 
-def set_seed(seed: int) -> None:
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-
-
 def move_batch_to_device(batch, device):
     return tuple(x.to(device, non_blocking=True) for x in batch)
 
@@ -247,7 +240,6 @@ def main():
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--val-interval", type=int, default=10)
-    parser.add_argument("--seed", type=int, default=42)
 
     parser.add_argument("--img-size", type=int, default=128)
     parser.add_argument("--patch-size", type=int, default=8)
@@ -267,8 +259,6 @@ def main():
     )
 
     args = parser.parse_args()
-
-    set_seed(args.seed)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
