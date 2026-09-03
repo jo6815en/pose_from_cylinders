@@ -333,6 +333,7 @@ def main():
     )
 
     history = []
+    best_val_loss = float("inf")
 
     for epoch in range(1, args.epochs + 1):
         train_metrics = train_one_epoch(
@@ -380,6 +381,26 @@ def main():
                 f"val_radius_cons={val_metrics['radius_consistency']:.4f} | "
                 f"val_reproj={val_metrics['reprojection']:.4f}"
             )
+            if val_metrics["total"] < best_val_loss:
+                best_val_loss = val_metrics["total"]
+
+                torch.save(
+                    {
+                        "epoch": epoch,
+                        "model_state_dict": model.state_dict(),
+                        "optimizer_state_dict": optimizer.state_dict(),
+                        "args": vars(args),
+                        "history": history + [row],
+                        "best_val_loss": best_val_loss,
+                    },
+                    os.path.join(
+                        args.output_dir,
+                        "checkpoints",
+                        "best.pt",
+                    ),
+                )
+
+                log += f" | BEST (val_tot={best_val_loss:.4f})"
 
         print(log, flush=True)
 
