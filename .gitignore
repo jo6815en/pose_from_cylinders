@@ -12,4 +12,4 @@ forestdataset/
 logs/
 runs/
 arrhenius_runs/
-best_model.pth
+best_model.pt
