@@ -28,6 +28,8 @@ def train_one_epoch(
     occ_thresh,
     lambda_occ,
     lambda_radius,
+    radius_cons_weight,
+    reproj_weight,
 ):
     model.train()
 
@@ -129,8 +131,7 @@ def train_one_epoch(
         radius_cons = (radius_cons1 + radius_cons2) / 2.0
         reproj = (reproj1 + reproj2) / 2.0
 
-        # Same weighting as the current notebook.
-        loss = sup_loss # + 5.0 * radius_cons + 10.0 * reproj
+        loss = sup_loss + radius_cons_weight * radius_cons + reproj_weight * reproj
 
         loss.backward()
         optimizer.step()
@@ -325,7 +326,17 @@ def main():
     history = []
     best_val_loss = float("inf")
 
+    # Consistency-loss warm-up settings.
+    radius_cons_final_weight = 0.1
+    reproj_final_weight = 0.1
+    warmup_epochs = 30
+
     for epoch in range(1, args.epochs + 1):
+        if warmup_epochs <= 0:
+            warmup_factor = 1.0
+        else:
+            warmup_factor = min(1.0, epoch / warmup_epochs)
+
         train_metrics = train_one_epoch(
             model,
             train_loader,
@@ -334,6 +345,8 @@ def main():
             args.occ_thresh,
             args.lambda_occ,
             args.lambda_radius,
+            warmup_factor * radius_cons_final_weight,
+            warmup_factor * reproj_final_weight,
         )
 
         row = {
