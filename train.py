@@ -130,7 +130,7 @@ def train_one_epoch(
         reproj = (reproj1 + reproj2) / 2.0
 
         # Same weighting as the current notebook.
-        loss = sup_loss + 5.0 * radius_cons + 10.0 * reproj
+        loss = sup_loss # + 5.0 * radius_cons + 10.0 * reproj
 
         loss.backward()
         optimizer.step()
