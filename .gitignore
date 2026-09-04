@@ -12,4 +12,5 @@ forestdataset/
 logs/
 runs/
 arrhenius_runs/
+papers/
 best_model.pt
