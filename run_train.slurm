@@ -6,8 +6,8 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --gpus=1
-#SBATCH -t 05:00:00
-#SBATCH -J pose_train_test
+#SBATCH -t 12:00:00
+#SBATCH -J save_best_modell
 
 #SBATCH -o logs/%x-%j.out
 #SBATCH -e logs/%x-%j.err
@@ -34,7 +34,8 @@ echo "Starting training..."
 
 srun python train.py \
     --epochs 300 \
-    --batch-size 16 \
-    --output-dir runs/slurm_test
+    --batch-size 256 \
+    --lr 1e-3\
+    --output-dir runs/slurm_${SLURM_JOB_ID}
 
 echo "Training finished."
