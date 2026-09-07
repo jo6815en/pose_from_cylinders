@@ -36,6 +36,6 @@ srun python train.py \
     --epochs 300 \
     --batch-size 256 \
     --lr 1e-3\
-    --output-dir runs/slurm_${SLURM_JOB_ID}
+    --output-dir runs/slurm_${SLURM_JOB_NAME}
 
 echo "Training finished."
