@@ -7,7 +7,7 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --gpus=1
 #SBATCH -t 12:00:00
-#SBATCH -J save_best_modell
+#SBATCH -J with_warm_up
 
 #SBATCH -o logs/%x-%j.out
 #SBATCH -e logs/%x-%j.err
