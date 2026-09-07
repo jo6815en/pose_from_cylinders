@@ -9,6 +9,7 @@ dataset_normal/
 testdataset/
 valdataset/
 forestdataset/
+forestdataset_torpa/
 logs/
 runs/
 arrhenius_runs/

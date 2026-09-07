@@ -15,9 +15,9 @@ class ColmapPairDataset(Dataset):
         transform=None,
     ):
         """
-        dataset_dir ska innehålla:
+        dataset_dir ska normalt innehålla:
             images/
-            relative_poses.json
+            relative_poses.json  (valfri)
 
         Args:
             dataset_dir: sökväg till datasetet
@@ -32,9 +32,38 @@ class ColmapPairDataset(Dataset):
         """
         self.dataset_dir = Path(dataset_dir)
         self.image_dir = self.dataset_dir / "images"
+        if not self.image_dir.is_dir():
+            raise FileNotFoundError(
+                f"Kunde inte hitta bildmappen: {self.image_dir}"
+            )
 
-        with open(self.dataset_dir / "relative_poses.json", "r") as f:
-            self.pairs = json.load(f)
+        pose_file = self.dataset_dir / "relative_poses.json"
+        if pose_file.exists():
+            with open(pose_file, "r", encoding="utf-8") as f:
+                self.pairs = json.load(f)
+        else:
+            # Utan posefil används konsekutiva bildpar. T_ab är bara en
+            # platshållare; forest-träningen använder inte COLMAP-posen.
+            image_paths = sorted(
+                path for path in self.image_dir.iterdir()
+                if path.is_file()
+                and path.suffix.lower() in {".jpg", ".jpeg", ".png", ".bmp"}
+            )
+            if len(image_paths) < 2:
+                raise ValueError(
+                    f"Minst två bilder krävs i {self.image_dir} "
+                    "när relative_poses.json saknas."
+                )
+
+            identity = torch.eye(4, dtype=torch.float32).tolist()
+            self.pairs = [
+                {
+                    "from_image": image_paths[i].name,
+                    "to_image": image_paths[i + 1].name,
+                    "T_ab": identity,
+                }
+                for i in range(len(image_paths) - 1)
+            ]
 
         if transform is None:
             self.transform = transforms.Compose([
