@@ -8,6 +8,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from dataset import SceneTwoPairsDataset
+from augmentations import build_train_transform, build_eval_transform
 from model import PairImageCylinderModel
 from losses import (
     supervised_loss,
@@ -277,6 +278,7 @@ def main():
         image_size=args.img_size,
         debug=False,
         return_two_pairs=True,
+        transform=build_train_transform(args.img_size),
     )
 
     val_dataset = SceneTwoPairsDataset(
@@ -284,6 +286,7 @@ def main():
         image_size=args.img_size,
         debug=False,
         return_two_pairs=False,
+        transform=build_eval_transform(args.img_size),
     )
 
     train_loader = DataLoader(

@@ -39,18 +39,22 @@ class SceneTwoPairsDataset(Dataset):
         debug: bool = False,
         shuffle_pairs: bool = False,
         return_two_pairs: bool = False,
+        transform=None,
     ) -> None:
         self.root_dir = Path(root_dir)
         self.debug = debug
         self.shuffle_pairs = shuffle_pairs
         self.return_two_pairs = return_two_pairs
 
-        self.transform = transforms.Compose(
-            [
-                transforms.Resize((image_size, image_size)),
-                transforms.ToTensor(),
-            ]
-        )
+        if transform is None:
+            self.transform = transforms.Compose(
+                [
+                    transforms.Resize((image_size, image_size)),
+                    transforms.ToTensor(),
+                ]
+            )
+        else:
+            self.transform = transform
 
         self.samples: List[_Sample] = []
         for scene_dir in sorted(self.root_dir.glob("scene_*")):
