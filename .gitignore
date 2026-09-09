@@ -6,6 +6,7 @@ data/
 dataset/
 dataset_no_background/
 dataset_normal/
+slask_data/
 testdataset/
 valdataset/
 forestdataset/
