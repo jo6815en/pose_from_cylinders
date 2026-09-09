@@ -1,15 +1,13 @@
 import argparse
 import json
 import os
-import random
 
-import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
 from dataset import SceneTwoPairsDataset
 from augmentations import build_train_transform, build_eval_transform
-from model import PairImageCylinderModel
+from model_v2 import PairImageCylinderModelV2
 from losses import (
     supervised_loss,
     matched_radius_consistency_loss,
@@ -243,13 +241,13 @@ def main():
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--val-interval", type=int, default=10)
 
-    parser.add_argument("--img-size", type=int, default=128)
-    parser.add_argument("--patch-size", type=int, default=8)
-    parser.add_argument("--embed-dim", type=int, default=384)
-    parser.add_argument("--depth", type=int, default=6)
-    parser.add_argument("--num-heads", type=int, default=6)
+    parser.add_argument("--img-size", type=int, default=256)
+    parser.add_argument("--patch-size", type=int, default=16)
+    parser.add_argument("--embed-dim", type=int, default=512)
+    parser.add_argument("--depth", type=int, default=12)
+    parser.add_argument("--num-heads", type=int, default=8)
     parser.add_argument("--num-bins", type=int, default=128)
-    parser.add_argument("--dropout", type=float, default=0.1)
+    parser.add_argument("--dropout", type=float, default=0.0)
 
     parser.add_argument("--lambda-occ", type=float, default=10.0)
     parser.add_argument("--lambda-radius", type=float, default=10.0)
@@ -310,7 +308,7 @@ def main():
     print("Train batches:", len(train_loader))
     print("Validation batches:", len(val_loader))
 
-    model = PairImageCylinderModel(
+    model = PairImageCylinderModelV2(
         img_size=args.img_size,
         patch_size=args.patch_size,
         in_chans=3,
@@ -318,8 +316,22 @@ def main():
         depth=args.depth,
         num_heads=args.num_heads,
         num_bins=args.num_bins,
+
+        mlp_ratio=4.0,
+        num_register_tokens=4,
+        cylinder_decoder_depth=2,
+
         dropout=args.dropout,
     ).to(device)
+
+    n_params = sum(
+        p.numel()
+        for p in model.parameters()
+    )
+
+    print(
+        f"Model parameters: {n_params / 1e6:.2f} M"
+    )
 
     optimizer = torch.optim.AdamW(
         model.parameters(),
