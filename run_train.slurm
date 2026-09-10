@@ -7,7 +7,7 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --gpus=1
 #SBATCH -t 12:00:00
-#SBATCH -J with_warm_up
+#SBATCH -J larger_model_lre3
 
 #SBATCH -o logs/%x-%j.out
 #SBATCH -e logs/%x-%j.err
@@ -23,6 +23,7 @@ conda activate pose_cylinders
 
 echo "Host: $(hostname)"
 echo "Job ID: $SLURM_JOB_ID"
+echo "Job name: $SLURM_JOB_Name"
 echo "GPU:"
 nvidia-smi --query-gpu=name,memory.total --format=csv
 
