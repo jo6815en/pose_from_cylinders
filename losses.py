@@ -2,24 +2,6 @@ import torch
 import torch.nn.functional as F
 
 
-def add_sup_losses(
-        total_vis,
-        total_radius,
-        total_pose,
-        total_depth,
-        total_t,
-        total_r,
-        loss_out
-):
-    total_vis += loss_out["vision_a"].item()
-    total_radius += loss_out["vision_a_radius"].item()
-    total_pose += loss_out["pose"].item()
-    total_depth += loss_out["vision_a_depth"].item()
-    total_t += loss_out["translation"].item()
-    total_r += loss_out["rotation"].item()
-
-    return total_vis, total_radius, total_pose, total_depth, total_t, total_r
-
 def match_sinkhorn_between_views(
     vision_a,
     vision_b,
@@ -599,100 +581,132 @@ def supervised_loss(
     }
 
 
-def consistency_loss(
-    pred_vision_1,
-    pred_vision_2,
-    occ_thresh=0.5,
-    match_thresh=0.25,
-    lambda_occ=1.0,
-    lambda_radius=1.0,
-    lambda_depth=1.0,
+def compute_supervised_pair_losses(
+    pred_vision_a1,
+    vision_a1,
+    pred_vision_b1,
+    vision_b1,
+    pred_pose1,
+    pose_ab1,
+    pred_vision_a2,
+    vision_a2,
+    pred_vision_b2,
+    vision_b2,
+    pred_pose2,
+    pose_ab2,
+    occ_thresh,
+    lambda_occ,
+    lambda_radius,
 ):
-    total_loss = pred_vision_1.new_tensor(0.0)
-    total_occ = pred_vision_1.new_tensor(0.0)
-    total_rad = pred_vision_1.new_tensor(0.0)
-    total_dep = pred_vision_1.new_tensor(0.0)
+    loss_out1 = supervised_loss(
+        pred_vision_a1,
+        vision_a1,
+        pred_vision_b1,
+        vision_b1,
+        pred_pose1,
+        pose_ab1,
+        occ_thresh=occ_thresh,
+        lambda_occ=lambda_occ,
+        lambda_radius=lambda_radius,
+    )
+    loss_out2 = supervised_loss(
+        pred_vision_a2,
+        vision_a2,
+        pred_vision_b2,
+        vision_b2,
+        pred_pose2,
+        pose_ab2,
+        occ_thresh=occ_thresh,
+        lambda_occ=lambda_occ,
+        lambda_radius=lambda_radius,
+    )
 
-    batch_size = pred_vision_1.shape[0]
-    valid_batches = 0
+    radius_cons1 = matched_radius_consistency_loss(
+        pred_vision_a1,
+        vision_a1,
+        pred_vision_b1,
+        vision_b1,
+        relative_pose_pred=pred_pose1,
+        matching_mode="gt",
+        occ_thresh=occ_thresh,
+    )
+    radius_cons2 = matched_radius_consistency_loss(
+        pred_vision_a2,
+        vision_a2,
+        pred_vision_b2,
+        vision_b2,
+        relative_pose_pred=pred_pose2,
+        matching_mode="gt",
+        occ_thresh=occ_thresh,
+    )
 
-    for b in range(batch_size):
-        v1 = pred_vision_1[b]
-        v2 = pred_vision_2[b]
+    reproj1 = matched_reprojection_loss_2d(
+        pred_vision_a1,
+        vision_a1,
+        pred_vision_b1,
+        vision_b1,
+        pred_pose1,
+        matching_mode="gt",
+        occ_thresh=occ_thresh,
+        fov_degrees=90.0,
+    )
+    reproj2 = matched_reprojection_loss_2d(
+        pred_vision_a2,
+        vision_a2,
+        pred_vision_b2,
+        vision_b2,
+        pred_pose2, 
+        matching_mode="gt",
+        occ_thresh=occ_thresh,
+        fov_degrees=90.0,
+    )
 
-        occ1 = v1[:, 0]
-        rad1 = v1[:, 1]
-        dep1 = v1[:, 2]
+    return (
+        loss_out1,
+        loss_out2,
+        (radius_cons1 + radius_cons2) / 2.0,
+        (reproj1 + reproj2) / 2.0,
+    )
 
-        occ2 = v2[:, 0]
-        rad2 = v2[:, 1]
-        dep2 = v2[:, 2]
 
-        m1 = occ1 > occ_thresh
-        m2 = occ2 > occ_thresh
+def compute_forest_loss(
+    pred_vision_a,
+    pred_vision_b,
+    pred_pose,
+    occ_thresh,
+    lambda_radius,
+    lambda_reproj,
+    lambda_sparsity,
+):
+    forest_radius_cons = matched_radius_consistency_loss(
+        pred_vision_a,
+        pred_vision_b=pred_vision_b,
+        relative_pose_pred=pred_pose,
+        matching_mode="sinkhorn",
+        occ_thresh=occ_thresh,
+    )
+    forest_reproj = matched_reprojection_loss_2d(
+        pred_vision_a,
+        pred_vision_b=pred_vision_b,
+        relative_pose_pred=pred_pose,
+        matching_mode="sinkhorn",
+        occ_thresh=occ_thresh,
+        fov_degrees=90.0,
+    )
+    forest_sparsity = (
+        pred_vision_a[..., 0].mean()
+        + pred_vision_b[..., 0].mean()
+    ) / 2.0
 
-        if m1.sum() == 0 or m2.sum() == 0:
-            continue
-
-        f1 = torch.stack([rad1[m1], dep1[m1]], dim=-1)
-        f2 = torch.stack([rad2[m2], dep2[m2]], dim=-1)
-
-        o1 = occ1[m1]
-        o2 = occ2[m2]
-
-        cost = torch.cdist(f1, f2, p=1)
-
-        nn12 = cost.argmin(dim=1)
-        nn21 = cost.argmin(dim=0)
-
-        matched_i = []
-        matched_j = []
-
-        for i in range(cost.shape[0]):
-            j = nn12[i].item()
-            if nn21[j].item() == i and cost[i, j] < match_thresh:
-                matched_i.append(i)
-                matched_j.append(j)
-
-        if len(matched_i) == 0:
-            continue
-
-        idx1 = torch.tensor(matched_i, device=pred_vision_1.device)
-        idx2 = torch.tensor(matched_j, device=pred_vision_1.device)
-
-        loss_occ = F.mse_loss(o1[idx1], o2[idx2])
-        loss_rad = F.l1_loss(f1[idx1, 0], f2[idx2, 0])
-        loss_dep = F.l1_loss(f1[idx1, 1], f2[idx2, 1])
-
-        loss = (
-            lambda_occ * loss_occ +
-            lambda_radius * loss_rad +
-            lambda_depth * loss_dep
-        )
-
-        total_loss = total_loss + loss
-        total_occ = total_occ + loss_occ
-        total_rad = total_rad + loss_rad
-        total_dep = total_dep + loss_dep
-        valid_batches += 1
-
-    if valid_batches == 0:
-        zero = pred_vision_1.new_tensor(0.0)
-        return {
-            "total": zero,
-            "occ": zero,
-            "radius": zero,
-            "depth": zero,
-        }
-
-    total_loss = total_loss / valid_batches
-    total_occ = total_occ / valid_batches
-    total_rad = total_rad / valid_batches
-    total_dep = total_dep / valid_batches
+    forest_loss = (
+        lambda_radius * forest_radius_cons
+        + lambda_reproj * forest_reproj
+        + lambda_sparsity * forest_sparsity
+    )
 
     return {
-        "total": total_loss,
-        "occ": total_occ,
-        "radius": total_rad,
-        "depth": total_dep,
+        "total": forest_loss,
+        "radius_consistency": forest_radius_cons,
+        "reprojection": forest_reproj,
+        "sparsity": forest_sparsity,
     }

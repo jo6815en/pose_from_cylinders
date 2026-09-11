@@ -8,7 +8,9 @@ from torch.utils.data import DataLoader
 from dataset import SceneTwoPairsDataset
 from augmentations import build_train_transform, build_eval_transform
 from model_v2 import PairImageCylinderModelV2
+from metrics import pose_errors
 from losses import (
+    compute_supervised_pair_losses,
     supervised_loss,
     matched_radius_consistency_loss,
     matched_reprojection_loss_2d,
@@ -17,47 +19,6 @@ from losses import (
 
 def move_batch_to_device(batch, device):
     return tuple(x.to(device, non_blocking=True) for x in batch)
-
-
-@torch.no_grad()
-def pose_errors(pred_pose, gt_pose):
-    pred_t = pred_pose[:, :2]
-    gt_t = gt_pose[:, :2]
-
-    # Total XY translation error.
-    translation_error = torch.linalg.vector_norm(
-        pred_t - gt_t,
-        dim=-1,
-    )
-
-    # Error in translation magnitude.
-    pred_mag = torch.linalg.vector_norm(pred_t, dim=-1)
-    gt_mag = torch.linalg.vector_norm(gt_t, dim=-1)
-    translation_magnitude_error = (pred_mag - gt_mag).abs()
-
-    # Error in translation direction.
-    pred_angle = torch.atan2(pred_t[:, 1], pred_t[:, 0])
-    gt_angle = torch.atan2(gt_t[:, 1], gt_t[:, 0])
-    direction_error = torch.atan2(
-        torch.sin(pred_angle - gt_angle),
-        torch.cos(pred_angle - gt_angle),
-    ).abs()
-    translation_direction_error = torch.rad2deg(direction_error)
-
-    # Yaw error, converted to degrees.
-    pred_yaw = torch.atan2(pred_pose[:, 2], pred_pose[:, 3])
-    gt_yaw = torch.atan2(gt_pose[:, 2], gt_pose[:, 3])
-    yaw_error = torch.atan2(
-        torch.sin(pred_yaw - gt_yaw),
-        torch.cos(pred_yaw - gt_yaw),
-    ).abs()
-
-    return (
-        translation_error.mean(),
-        translation_magnitude_error.mean(),
-        translation_direction_error.mean(),
-        torch.rad2deg(yaw_error).mean(),
-    )
 
 
 def train_one_epoch(
@@ -120,19 +81,13 @@ def train_one_epoch(
         ).item()
         totals["yaw_error_deg"] += ((yaw_err1 + yaw_err2) / 2.0).item()
 
-        loss_out1 = supervised_loss(
+        loss_out1, loss_out2, radius_cons, reproj = compute_supervised_pair_losses(
             pred_vision_a1,
             vision_a1,
             pred_vision_b1,
             vision_b1,
             pred_pose1,
             pose_ab1,
-            occ_thresh=occ_thresh,
-            lambda_occ=lambda_occ,
-            lambda_radius=lambda_radius,
-        )
-
-        loss_out2 = supervised_loss(
             pred_vision_a2,
             vision_a2,
             pred_vision_b2,
@@ -144,51 +99,7 @@ def train_one_epoch(
             lambda_radius=lambda_radius,
         )
 
-        radius_cons1 = matched_radius_consistency_loss(
-            pred_vision_a1,
-            vision_a1,
-            pred_vision_b1,
-            vision_b1,
-            relative_pose_pred=pred_pose1,
-            matching_mode="gt",
-            occ_thresh=occ_thresh,
-        )
-
-        radius_cons2 = matched_radius_consistency_loss(
-            pred_vision_a2,
-            vision_a2,
-            pred_vision_b2,
-            vision_b2,
-            relative_pose_pred=pred_pose2,
-            matching_mode="gt",
-            occ_thresh=occ_thresh,
-        )
-
-        reproj1 = matched_reprojection_loss_2d(
-            pred_vision_a1,
-            vision_a1,
-            pred_vision_b1,
-            vision_b1,
-            pred_pose1,
-            matching_mode="gt",
-            occ_thresh=occ_thresh,
-            fov_degrees=90.0,
-        )
-
-        reproj2 = matched_reprojection_loss_2d(
-            pred_vision_a2,
-            vision_a2,
-            pred_vision_b2,
-            vision_b2,
-            pred_pose2,
-            matching_mode="gt",
-            occ_thresh=occ_thresh,
-            fov_degrees=90.0,
-        )
-
         sup_loss = (loss_out1["total"] + loss_out2["total"]) / 2.0
-        radius_cons = (radius_cons1 + radius_cons2) / 2.0
-        reproj = (reproj1 + reproj2) / 2.0
 
         loss = sup_loss + radius_cons_weight * radius_cons + reproj_weight * reproj
 
