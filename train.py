@@ -21,13 +21,30 @@ def move_batch_to_device(batch, device):
 
 @torch.no_grad()
 def pose_errors(pred_pose, gt_pose):
-    # Translation error in the xy-plane.
+    pred_t = pred_pose[:, :2]
+    gt_t = gt_pose[:, :2]
+
+    # Total XY translation error.
     translation_error = torch.linalg.vector_norm(
-        pred_pose[:, :2] - gt_pose[:, :2],
+        pred_t - gt_t,
         dim=-1,
     )
 
-    # Convert sin/cos representation to yaw and take the smallest angle.
+    # Error in translation magnitude.
+    pred_mag = torch.linalg.vector_norm(pred_t, dim=-1)
+    gt_mag = torch.linalg.vector_norm(gt_t, dim=-1)
+    translation_magnitude_error = (pred_mag - gt_mag).abs()
+
+    # Error in translation direction.
+    pred_angle = torch.atan2(pred_t[:, 1], pred_t[:, 0])
+    gt_angle = torch.atan2(gt_t[:, 1], gt_t[:, 0])
+    direction_error = torch.atan2(
+        torch.sin(pred_angle - gt_angle),
+        torch.cos(pred_angle - gt_angle),
+    ).abs()
+    translation_direction_error = torch.rad2deg(direction_error)
+
+    # Yaw error, converted to degrees.
     pred_yaw = torch.atan2(pred_pose[:, 2], pred_pose[:, 3])
     gt_yaw = torch.atan2(gt_pose[:, 2], gt_pose[:, 3])
     yaw_error = torch.atan2(
@@ -35,7 +52,12 @@ def pose_errors(pred_pose, gt_pose):
         torch.cos(pred_yaw - gt_yaw),
     ).abs()
 
-    return translation_error.mean(), torch.rad2deg(yaw_error).mean()
+    return (
+        translation_error.mean(),
+        translation_magnitude_error.mean(),
+        translation_direction_error.mean(),
+        torch.rad2deg(yaw_error).mean(),
+    )
 
 
 def train_one_epoch(
@@ -57,6 +79,8 @@ def train_one_epoch(
         "vision": 0.0,
         "pose": 0.0,
         "translation_error": 0.0,
+        "translation_magnitude_error": 0.0,
+        "translation_direction_error": 0.0,
         "yaw_error_deg": 0.0,
         "radius_consistency": 0.0,
         "reprojection": 0.0,
@@ -81,9 +105,19 @@ def train_one_epoch(
         pred_vision_a1, pred_vision_b1, pred_pose1 = model(img_a1, img_b1)
         pred_vision_a2, pred_vision_b2, pred_pose2 = model(img_a2, img_b2)
 
-        trans_err1, yaw_err1 = pose_errors(pred_pose1, pose_ab1)
-        trans_err2, yaw_err2 = pose_errors(pred_pose2, pose_ab2)
+        trans_err1, trans_mag_err1, trans_dir_err1, yaw_err1 = pose_errors(
+            pred_pose1, pose_ab1
+        )
+        trans_err2, trans_mag_err2, trans_dir_err2, yaw_err2 = pose_errors(
+            pred_pose2, pose_ab2
+        )
         totals["translation_error"] += ((trans_err1 + trans_err2) / 2.0).item()
+        totals["translation_magnitude_error"] += (
+            (trans_mag_err1 + trans_mag_err2) / 2.0
+        ).item()
+        totals["translation_direction_error"] += (
+            (trans_dir_err1 + trans_dir_err2) / 2.0
+        ).item()
         totals["yaw_error_deg"] += ((yaw_err1 + yaw_err2) / 2.0).item()
 
         loss_out1 = supervised_loss(
@@ -195,6 +229,8 @@ def validate(
         "vision": 0.0,
         "pose": 0.0,
         "translation_error": 0.0,
+        "translation_magnitude_error": 0.0,
+        "translation_direction_error": 0.0,
         "yaw_error_deg": 0.0,
         "radius_consistency": 0.0,
         "reprojection": 0.0,
@@ -211,8 +247,12 @@ def validate(
 
         pred_vision_a, pred_vision_b, pred_pose = model(img_a, img_b)
 
-        trans_err, yaw_err = pose_errors(pred_pose, pose_ab)
+        trans_err, trans_mag_err, trans_dir_err, yaw_err = pose_errors(
+            pred_pose, pose_ab
+        )
         totals["translation_error"] += trans_err.item()
+        totals["translation_magnitude_error"] += trans_mag_err.item()
+        totals["translation_direction_error"] += trans_dir_err.item()
         totals["yaw_error_deg"] += yaw_err.item()
 
         loss_out = supervised_loss(
@@ -407,8 +447,10 @@ def main():
             f"sup={train_metrics['supervised']:.4f} | "
             f"vis={train_metrics['vision']:.4f} | "
             f"pose={train_metrics['pose']:.4f} | "
-            f"trans_err={train_metrics['translation_error']:.4f} | "
-            f"yaw_err={train_metrics['yaw_error_deg']:.2f}deg | "
+            f"trans={train_metrics['translation_error']:.4f} | "
+            f"trans_mag={train_metrics['translation_magnitude_error']:.4f} | "
+            f"trans_dir={train_metrics['translation_direction_error']:.2f}deg | "
+            f"yaw={train_metrics['yaw_error_deg']:.2f}deg | "
             f"radius_cons={train_metrics['radius_consistency']:.4f} | "
             f"reproj={train_metrics['reprojection']:.4f}"
         )
@@ -430,8 +472,10 @@ def main():
                 f"val_sup={val_metrics['supervised']:.4f} | "
                 f"val_vis={val_metrics['vision']:.4f} | "
                 f"val_pose={val_metrics['pose']:.4f} | "
-                f"val_trans_err={val_metrics['translation_error']:.4f} | "
-                f"val_yaw_err={val_metrics['yaw_error_deg']:.2f}deg | "
+                f"val_trans={val_metrics['translation_error']:.4f} | "
+                f"val_trans_mag={val_metrics['translation_magnitude_error']:.4f} | "
+                f"val_trans_dir={val_metrics['translation_direction_error']:.2f}deg | "
+                f"val_yaw={val_metrics['yaw_error_deg']:.2f}deg | "
                 f"val_radius_cons={val_metrics['radius_consistency']:.4f} | "
                 f"val_reproj={val_metrics['reprojection']:.4f}"
             )
