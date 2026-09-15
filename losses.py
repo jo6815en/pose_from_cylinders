@@ -510,13 +510,16 @@ def relative_pose_loss_2d(
     t_weight=1.0,
     r_weight=1.0,
 ):
-    pred_t = pred_pose[:, :2]
-    tgt_t = target_pose[:, :2]
+    pred_t = F.normalize(pred_pose[:, :2], dim=-1)
+    tgt_t = F.normalize(target_pose[:, :2], dim=-1)
 
     pred_r = F.normalize(pred_pose[:, 2:], dim=-1)
     tgt_r = F.normalize(target_pose[:, 2:], dim=-1)
 
-    t_loss = F.smooth_l1_loss(pred_t, tgt_t)
+    t_loss = (
+        1.0 - F.cosine_similarity(pred_t, tgt_t, dim=-1)
+    ).mean()
+
     r_loss = F.mse_loss(pred_r, tgt_r)
 
     total = t_weight * t_loss + r_weight * r_loss
@@ -710,3 +713,59 @@ def compute_forest_loss(
         "reprojection": forest_reproj,
         "sparsity": forest_sparsity,
     }
+
+def patch_correspondence_loss(corr_a, target_a, corr_b, target_b,
+                              occ_thresh=0.5, fov_degrees=90.0,
+                              temperature=0.1, flip_x=True):
+    B, P, D = corr_a.shape
+    grid = int(P ** 0.5)
+
+    if grid * grid != P:
+        raise ValueError("Antalet patch tokens måste bilda ett kvadratiskt grid.")
+
+    # 8x8 patches -> 8 column features. Cylindrarna är vertikala.
+    feat_a = corr_a.reshape(B, grid, grid, D).mean(dim=1)
+    feat_b = corr_b.reshape(B, grid, grid, D).mean(dim=1)
+
+    feat_a = F.normalize(feat_a, dim=-1)
+    feat_b = F.normalize(feat_b, dim=-1)
+
+    fov = torch.tensor(fov_degrees * torch.pi / 180.0, device=corr_a.device)
+    sign = -1.0 if flip_x else 1.0
+
+    def bin_to_col(bin_idx, num_bins):
+        theta = -0.5 * fov + bin_idx.float() / (num_bins - 1) * fov
+        x = 0.5 + sign * 0.5 * torch.tan(theta) / torch.tan(0.5 * fov)
+        return torch.clamp((x * grid).long(), 0, grid - 1)
+
+    losses = []
+
+    for b in range(B):
+        idx_a = torch.where(target_a[b, :, 0] > occ_thresh)[0]
+        idx_b = torch.where(target_b[b, :, 0] > occ_thresh)[0]
+
+        ids_a = target_a[b, idx_a, 3].round().long()
+        ids_b = target_b[b, idx_b, 3].round().long()
+
+        sim_ab = feat_a[b] @ feat_b[b].T / temperature
+        sim_ba = sim_ab.T
+
+        for cid in ids_a.unique():
+            match_a = idx_a[ids_a == cid]
+            match_b = idx_b[ids_b == cid]
+
+            if match_a.numel() != 1 or match_b.numel() != 1:
+                continue
+
+            col_a = bin_to_col(match_a[0], target_a.shape[1])
+            col_b = bin_to_col(match_b[0], target_b.shape[1])
+
+            loss_ab = F.cross_entropy(sim_ab[col_a].unsqueeze(0), col_b.view(1))
+            loss_ba = F.cross_entropy(sim_ba[col_b].unsqueeze(0), col_a.view(1))
+
+            losses.append(0.5 * (loss_ab + loss_ba))
+
+    if not losses:
+        return (corr_a.sum() + corr_b.sum()) * 0.0
+
+    return torch.stack(losses).mean()

@@ -16,3 +16,4 @@ runs/
 arrhenius_runs/
 papers/
 best_model.pt
+latest_model.pt
