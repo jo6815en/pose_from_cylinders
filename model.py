@@ -19,10 +19,7 @@ class MLP(nn.Module):
     def __init__(self, dim, mlp_ratio=3.0, dropout=0.0):
         super().__init__()
         hidden = int(dim * mlp_ratio)
-        self.net = nn.Sequential(
-            nn.Linear(dim, hidden), nn.GELU(), nn.Dropout(dropout),
-            nn.Linear(hidden, dim), nn.Dropout(dropout),
-        )
+        self.net = nn.Sequential(nn.Linear(dim, hidden), nn.GELU(), nn.Dropout(dropout), nn.Linear(hidden, dim), nn.Dropout(dropout),)
 
     def forward(self, x):
         return self.net(x)
@@ -43,35 +40,17 @@ class PairBlock(nn.Module):
     def forward(self, a, b, return_attention=False):
         an, bn = self.norm_self(a), self.norm_self(b)
 
-        da, _ = self.self_attn(
-            an, an, an,
-            need_weights=False,
-        )
-        db, _ = self.self_attn(
-            bn, bn, bn,
-            need_weights=False,
-        )
+        da, _ = self.self_attn(an, an, an, need_weights=False,)
+        db, _ = self.self_attn(bn, bn, bn, need_weights=False,)
 
         a, b = a + da, b + db
 
         aq, bq = self.norm_cross_q(a), self.norm_cross_q(b)
         akv, bkv = self.norm_cross_kv(a), self.norm_cross_kv(b)
 
-        da, attn_ab = self.cross_attn(
-            aq,
-            bkv,
-            bkv,
-            need_weights=return_attention,
-            average_attn_weights=False,
-        )
+        da, attn_ab = self.cross_attn(aq, bkv, bkv, need_weights=return_attention, average_attn_weights=False,)
 
-        db, attn_ba = self.cross_attn(
-            bq,
-            akv,
-            akv,
-            need_weights=return_attention,
-            average_attn_weights=False,
-        )
+        db, attn_ba = self.cross_attn(bq, akv, akv, need_weights=return_attention, average_attn_weights=False,)
 
         a, b = a + da, b + db
 
@@ -95,9 +74,7 @@ class PairViTBackbone(nn.Module):
         self.patch_pos_embed = nn.Parameter(torch.zeros(1, n, embed_dim))
         self.view_embed = nn.Parameter(torch.zeros(1, 2, embed_dim))
         self.pos_drop = nn.Dropout(dropout)
-        self.blocks = nn.ModuleList([
-            PairBlock(embed_dim, num_heads, mlp_ratio, dropout) for _ in range(depth)
-        ])
+        self.blocks = nn.ModuleList([PairBlock(embed_dim, num_heads, mlp_ratio, dropout) for _ in range(depth)])
         self.norm = nn.LayerNorm(embed_dim)
         for p in (self.camera_token, self.register_tokens, self.patch_pos_embed, self.view_embed):
             nn.init.trunc_normal_(p, std=0.02)
@@ -158,20 +135,11 @@ class CylinderDecoder(nn.Module):
         q = q + dq
         q = q + self.mlp(self.norm_mlp(q))
         y = self.output(self.norm_out(q))
-        return torch.stack([
-            torch.sigmoid(y[..., 0]),
-            F.softplus(y[..., 1]),
-            F.softplus(y[..., 2]),
-        ], dim=-1)
+        return torch.stack([torch.sigmoid(y[..., 0]), F.softplus(y[..., 1]), F.softplus(y[..., 2]),], dim=-1)
 
 
 class PoseHead(nn.Module):
-    def __init__(
-        self,
-        embed_dim=192,
-        num_heads=4,
-        dropout=0.0,
-    ):
+    def __init__(self, embed_dim=192, num_heads=4, dropout=0.0,):
         super().__init__()
 
         # Normalize patch tokens before cross-attention
@@ -179,12 +147,7 @@ class PoseHead(nn.Module):
         self.norm_b = nn.LayerNorm(embed_dim)
 
         # Explicit cross-view feature matching
-        self.cross_attn = nn.MultiheadAttention(
-            embed_dim=embed_dim,
-            num_heads=num_heads,
-            dropout=dropout,
-            batch_first=True,
-        )
+        self.cross_attn = nn.MultiheadAttention(embed_dim=embed_dim, num_heads=num_heads, dropout=dropout, batch_first=True,)
 
         # Camera tokens + pooled cross-view information
         self.mlp = nn.Sequential(
@@ -200,35 +163,17 @@ class PoseHead(nn.Module):
         b = self.norm_b(patches_b)
 
         # A asks: where are my features in B?
-        a_to_b, _ = self.cross_attn(
-            query=a,
-            key=b,
-            value=b,
-            need_weights=False,
-        )
+        a_to_b, _ = self.cross_attn(query=a, key=b, value=b, need_weights=False,)
 
         # B asks: where are my features in A?
-        b_to_a, _ = self.cross_attn(
-            query=b,
-            key=a,
-            value=a,
-            need_weights=False,
-        )
+        b_to_a, _ = self.cross_attn(query=b, key=a, value=a, need_weights=False,)
 
         # Explicit change between views
         delta_a = (a_to_b - a).mean(dim=1)
         delta_b = (b_to_a - b).mean(dim=1)
 
         # Keep the global camera-token information
-        pair_feat = torch.cat(
-            [
-                cam_a,
-                cam_b,
-                delta_a,
-                delta_b,
-            ],
-            dim=-1,
-        )
+        pair_feat = torch.cat([cam_a, cam_b, delta_a, delta_b,], dim=-1,)
 
         y = self.mlp(pair_feat)
 
@@ -236,15 +181,9 @@ class PoseHead(nn.Module):
         translation = y[:, :2]
 
         # Yaw remains a unit vector
-        yaw = F.normalize(
-            y[:, 2:],
-            dim=-1,
-        )
+        yaw = F.normalize(y[:, 2:], dim=-1,)
 
-        return torch.cat(
-            [translation, yaw],
-            dim=-1,
-        )
+        return torch.cat([translation, yaw], dim=-1,)
 
 
 class PairImageCylinderModel(nn.Module):
@@ -259,16 +198,11 @@ class PairImageCylinderModel(nn.Module):
         )
         self.vision_head = CylinderDecoder(embed_dim, num_heads, num_bins, mlp_ratio, dropout)
         self.pose_head = PoseHead(embed_dim)
-        self.corr_head = nn.Sequential(
-            nn.LayerNorm(embed_dim),
-            nn.Linear(embed_dim, 64),
-        )
+        self.corr_head = nn.Sequential(nn.LayerNorm(embed_dim), nn.Linear(embed_dim, 64),)
 
     def forward(self, img_a, img_b, return_attention=False, return_corr=False):
         if return_attention:
-            cam_a, cam_b, patches_a, patches_b, attn_ab_all, attn_ba_all = self.backbone(
-                img_a, img_b, return_attention=True
-            )
+            cam_a, cam_b, patches_a, patches_b, attn_ab_all, attn_ba_all = self.backbone(img_a, img_b, return_attention=True)
         else:
             cam_a, cam_b, patches_a, patches_b = self.backbone(img_a, img_b)
 
