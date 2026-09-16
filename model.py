@@ -139,51 +139,69 @@ class CylinderDecoder(nn.Module):
 
 
 class PoseHead(nn.Module):
-    def __init__(self, embed_dim=192, num_heads=4, dropout=0.0,):
+    def __init__(self, embed_dim=192, corr_dim=64, grid_size=8, hidden_dim=192, temperature=0.1):
         super().__init__()
 
-        # Normalize patch tokens before cross-attention
-        self.norm_a = nn.LayerNorm(embed_dim)
-        self.norm_b = nn.LayerNorm(embed_dim)
+        self.grid_size = grid_size
+        self.temperature = temperature
 
-        # Explicit cross-view feature matching
-        self.cross_attn = nn.MultiheadAttention(embed_dim=embed_dim, num_heads=num_heads, dropout=dropout, batch_first=True,)
+        # cam_a + cam_b + displacement A->B + B->A + confidence A->B + B->A
+        input_dim = 2 * embed_dim + 4 * grid_size
 
-        # Camera tokens + pooled cross-view information
         self.mlp = nn.Sequential(
-            nn.Linear(embed_dim * 4, embed_dim),
+            nn.Linear(input_dim, hidden_dim),
             nn.GELU(),
-            nn.Linear(embed_dim, embed_dim),
+            nn.Linear(hidden_dim, hidden_dim),
             nn.GELU(),
-            nn.Linear(embed_dim, 4),
+            nn.Linear(hidden_dim, 4),
         )
 
-    def forward(self, cam_a, cam_b, patches_a, patches_b):
-        a = self.norm_a(patches_a)
-        b = self.norm_b(patches_b)
+    def forward(self, cam_a, cam_b, corr_a, corr_b):
+        B, P, D = corr_a.shape
+        g = self.grid_size
 
-        # A asks: where are my features in B?
-        a_to_b, _ = self.cross_attn(query=a, key=b, value=b, need_weights=False,)
+        # 8x8 patches -> 8 horizontal column features
+        a = corr_a.reshape(B, g, g, D).mean(dim=1)
+        b = corr_b.reshape(B, g, g, D).mean(dim=1)
 
-        # B asks: where are my features in A?
-        b_to_a, _ = self.cross_attn(query=b, key=a, value=a, need_weights=False,)
+        a = F.normalize(a, dim=-1)
+        b = F.normalize(b, dim=-1)
 
-        # Explicit change between views
-        delta_a = (a_to_b - a).mean(dim=1)
-        delta_b = (b_to_a - b).mean(dim=1)
+        # Correspondence probabilities
+        sim = torch.matmul(a, b.transpose(1, 2)) / self.temperature
 
-        # Keep the global camera-token information
-        pair_feat = torch.cat([cam_a, cam_b, delta_a, delta_b,], dim=-1,)
+        prob_ab = F.softmax(sim, dim=-1)
+        prob_ba = F.softmax(sim.transpose(1, 2), dim=-1)
+
+        coords = torch.linspace(-1.0, 1.0, g, device=corr_a.device)
+
+        # Expected matched position
+        expected_b = torch.matmul(prob_ab, coords)
+        expected_a = torch.matmul(prob_ba, coords)
+
+        # Spatial displacement for every image column
+        disp_ab = expected_b - coords
+        disp_ba = expected_a - coords
+
+        # Confidence of each correspondence
+        conf_ab = prob_ab.max(dim=-1).values
+        conf_ba = prob_ba.max(dim=-1).values
+
+        pair_feat = torch.cat([
+            cam_a,
+            cam_b,
+            disp_ab,
+            disp_ba,
+            conf_ab,
+            conf_ba,
+        ], dim=-1)
 
         y = self.mlp(pair_feat)
 
-        # Translation: cosine-direction loss handles normalization
         translation = y[:, :2]
+        yaw = F.normalize(y[:, 2:], dim=-1)
 
-        # Yaw remains a unit vector
-        yaw = F.normalize(y[:, 2:], dim=-1,)
-
-        return torch.cat([translation, yaw], dim=-1,)
+        return torch.cat([translation, yaw], dim=-1)
 
 
 class PairImageCylinderModel(nn.Module):
@@ -197,8 +215,9 @@ class PairImageCylinderModel(nn.Module):
             dropout, num_register_tokens, mlp_ratio,
         )
         self.vision_head = CylinderDecoder(embed_dim, num_heads, num_bins, mlp_ratio, dropout)
-        self.pose_head = PoseHead(embed_dim)
-        self.corr_head = nn.Sequential(nn.LayerNorm(embed_dim), nn.Linear(embed_dim, 64),)
+        self.corr_head = nn.Sequential(nn.LayerNorm(embed_dim), nn.Linear(embed_dim, 64))
+        grid_size = img_size // patch_size
+        self.pose_head = PoseHead(embed_dim=embed_dim, corr_dim=64, grid_size=grid_size)
 
     def forward(self, img_a, img_b, return_attention=False, return_corr=False):
         if return_attention:
@@ -208,12 +227,16 @@ class PairImageCylinderModel(nn.Module):
 
         vision_a = self.vision_head(patches_a)
         vision_b = self.vision_head(patches_b)
-        pose_ab = self.pose_head(cam_a, cam_b, patches_a, patches_b)
+
+        corr_a = self.corr_head(patches_a)
+        corr_b = self.corr_head(patches_b)
+
+        pose_ab = self.pose_head(cam_a, cam_b, corr_a, corr_b)
 
         outputs = (vision_a, vision_b, pose_ab)
 
         if return_corr:
-            outputs += (self.corr_head(patches_a), self.corr_head(patches_b))
+            outputs += (corr_a, corr_b)
 
         if return_attention:
             outputs += (attn_ab_all, attn_ba_all)
