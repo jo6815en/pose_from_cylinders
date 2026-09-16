@@ -139,67 +139,73 @@ class CylinderDecoder(nn.Module):
 
 
 class PoseHead(nn.Module):
-    def __init__(self, embed_dim=192, corr_dim=64, grid_size=8, hidden_dim=192, temperature=0.1):
+    def __init__(self, embed_dim=192, grid_size=8, hidden_dim=192, temperature=0.1):
         super().__init__()
 
         self.grid_size = grid_size
         self.temperature = temperature
 
-        # cam_a + cam_b + displacement A->B + B->A + confidence A->B + B->A
-        input_dim = 2 * embed_dim + 4 * grid_size
+        # Translation uses only correspondence geometry
+        trans_input_dim = 4 * grid_size
 
-        self.mlp = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
+        self.translation_head = nn.Sequential(
+            nn.Linear(trans_input_dim, hidden_dim),
             nn.GELU(),
             nn.Linear(hidden_dim, hidden_dim),
             nn.GELU(),
-            nn.Linear(hidden_dim, 4),
+            nn.Linear(hidden_dim, 2),
+        )
+
+        # Yaw uses only global camera tokens
+        self.yaw_head = nn.Sequential(
+            nn.Linear(embed_dim * 2, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, 2),
         )
 
     def forward(self, cam_a, cam_b, corr_a, corr_b):
         B, P, D = corr_a.shape
         g = self.grid_size
 
-        # 8x8 patches -> 8 horizontal column features
+        # 8x8 patch features -> 8 horizontal column features
         a = corr_a.reshape(B, g, g, D).mean(dim=1)
         b = corr_b.reshape(B, g, g, D).mean(dim=1)
 
         a = F.normalize(a, dim=-1)
         b = F.normalize(b, dim=-1)
 
-        # Correspondence probabilities
+        # A <-> B correspondence probabilities
         sim = torch.matmul(a, b.transpose(1, 2)) / self.temperature
-
         prob_ab = F.softmax(sim, dim=-1)
         prob_ba = F.softmax(sim.transpose(1, 2), dim=-1)
 
         coords = torch.linspace(-1.0, 1.0, g, device=corr_a.device)
 
-        # Expected matched position
+        # Expected matching position
         expected_b = torch.matmul(prob_ab, coords)
         expected_a = torch.matmul(prob_ba, coords)
 
-        # Spatial displacement for every image column
+        # Per-column displacement
         disp_ab = expected_b - coords
         disp_ba = expected_a - coords
 
-        # Confidence of each correspondence
+        # Matching confidence
         conf_ab = prob_ab.max(dim=-1).values
         conf_ba = prob_ba.max(dim=-1).values
 
-        pair_feat = torch.cat([
-            cam_a,
-            cam_b,
+        trans_feat = torch.cat([
             disp_ab,
             disp_ba,
             conf_ab,
             conf_ba,
         ], dim=-1)
 
-        y = self.mlp(pair_feat)
+        translation = self.translation_head(trans_feat)
 
-        translation = y[:, :2]
-        yaw = F.normalize(y[:, 2:], dim=-1)
+        yaw_feat = torch.cat([cam_a, cam_b], dim=-1)
+        yaw = F.normalize(self.yaw_head(yaw_feat), dim=-1)
 
         return torch.cat([translation, yaw], dim=-1)
 
@@ -217,7 +223,10 @@ class PairImageCylinderModel(nn.Module):
         self.vision_head = CylinderDecoder(embed_dim, num_heads, num_bins, mlp_ratio, dropout)
         self.corr_head = nn.Sequential(nn.LayerNorm(embed_dim), nn.Linear(embed_dim, 64))
         grid_size = img_size // patch_size
-        self.pose_head = PoseHead(embed_dim=embed_dim, corr_dim=64, grid_size=grid_size)
+        self.pose_head = PoseHead(
+            embed_dim=embed_dim,
+            grid_size=grid_size,
+        )
 
     def forward(self, img_a, img_b, return_attention=False, return_corr=False):
         if return_attention:
