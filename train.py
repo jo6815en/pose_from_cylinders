@@ -32,6 +32,7 @@ def train_one_epoch(
     lambda_radius,
     radius_cons_weight,
     reproj_weight,
+    scaler,
 ):
     model.train()
 
@@ -64,16 +65,42 @@ def train_one_epoch(
 
         optimizer.zero_grad(set_to_none=True)
 
-        pred_vision_a1, pred_vision_b1, pred_pose1, corr_a1, corr_b1 = model(
-            img_a1, img_b1, return_corr=True
-        )
-        pred_vision_a2, pred_vision_b2, pred_pose2, corr_a2, corr_b2 = model(
-            img_a2, img_b2, return_corr=True
-        )
+        with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=(device.type == "cuda")):
+            pred_vision_a1, pred_vision_b1, pred_pose1, corr_a1, corr_b1 = model(
+                img_a1, img_b1, return_corr=True
+            )
+            pred_vision_a2, pred_vision_b2, pred_pose2, corr_a2, corr_b2 = model(
+                img_a2, img_b2, return_corr=True
+            )
 
-        corr1 = patch_correspondence_loss(corr_a1, vision_a1, corr_b1, vision_b1)
-        corr2 = patch_correspondence_loss(corr_a2, vision_a2, corr_b2, vision_b2)
-        corr_loss = 0.5 * (corr1 + corr2)
+            corr1 = patch_correspondence_loss(corr_a1, vision_a1, corr_b1, vision_b1)
+            corr2 = patch_correspondence_loss(corr_a2, vision_a2, corr_b2, vision_b2)
+            corr_loss = 0.5 * (corr1 + corr2)
+
+            loss_out1, loss_out2, radius_cons, reproj = compute_supervised_pair_losses(
+                pred_vision_a1,
+                vision_a1,
+                pred_vision_b1,
+                vision_b1,
+                pred_pose1,
+                pose_ab1,
+                pred_vision_a2,
+                vision_a2,
+                pred_vision_b2,
+                vision_b2,
+                pred_pose2,
+                pose_ab2,
+                occ_thresh=occ_thresh,
+                lambda_occ=lambda_occ,
+                lambda_radius=lambda_radius,
+            )
+
+            sup_loss = (loss_out1["total"] + loss_out2["total"]) / 2.0
+
+            LAMBDA_CORR = 0.2
+            loss = sup_loss + LAMBDA_CORR * corr_loss
+
+            # loss = sup_loss + radius_cons_weight * radius_cons + reproj_weight * reproj
 
         trans_err1, trans_mag_err1, trans_dir_err1, yaw_err1 = pose_errors(
             pred_pose1, pose_ab1
@@ -90,33 +117,9 @@ def train_one_epoch(
         ).item()
         totals["yaw_error_deg"] += ((yaw_err1 + yaw_err2) / 2.0).item()
 
-        loss_out1, loss_out2, radius_cons, reproj = compute_supervised_pair_losses(
-            pred_vision_a1,
-            vision_a1,
-            pred_vision_b1,
-            vision_b1,
-            pred_pose1,
-            pose_ab1,
-            pred_vision_a2,
-            vision_a2,
-            pred_vision_b2,
-            vision_b2,
-            pred_pose2,
-            pose_ab2,
-            occ_thresh=occ_thresh,
-            lambda_occ=lambda_occ,
-            lambda_radius=lambda_radius,
-        )
-
-        sup_loss = (loss_out1["total"] + loss_out2["total"]) / 2.0
-
-        LAMBDA_CORR = 0.2
-        loss = sup_loss + LAMBDA_CORR * corr_loss
-
-        # loss = sup_loss + radius_cons_weight * radius_cons + reproj_weight * reproj
-
-        loss.backward()
-        optimizer.step()
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
 
         totals["total"] += loss.item()
         totals["supervised"] += sup_loss.item()
@@ -168,7 +171,41 @@ def validate(
             pose_ab,
         ) = move_batch_to_device(batch, device)
 
-        pred_vision_a, pred_vision_b, pred_pose = model(img_a, img_b)
+        with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=(device.type == "cuda")):
+            pred_vision_a, pred_vision_b, pred_pose = model(img_a, img_b)
+
+            loss_out = supervised_loss(
+                pred_vision_a,
+                vision_a,
+                pred_vision_b,
+                vision_b,
+                pred_pose,
+                pose_ab,
+                occ_thresh=occ_thresh,
+                lambda_occ=lambda_occ,
+                lambda_radius=lambda_radius,
+            )
+
+            radius_cons = matched_radius_consistency_loss(
+                pred_vision_a,
+                vision_a,
+                pred_vision_b,
+                vision_b,
+                relative_pose_pred=pred_pose,
+                matching_mode="gt",
+                occ_thresh=occ_thresh,
+            )
+
+            reproj = matched_reprojection_loss_2d(
+                pred_vision_a,
+                vision_a,
+                pred_vision_b,
+                vision_b,
+                pred_pose,
+                matching_mode="gt",
+                occ_thresh=occ_thresh,
+                fov_degrees=90.0,
+            )
 
         trans_err, trans_mag_err, trans_dir_err, yaw_err = pose_errors(
             pred_pose, pose_ab
@@ -177,39 +214,6 @@ def validate(
         totals["translation_magnitude_error"] += trans_mag_err.item()
         totals["translation_direction_error"] += trans_dir_err.item()
         totals["yaw_error_deg"] += yaw_err.item()
-
-        loss_out = supervised_loss(
-            pred_vision_a,
-            vision_a,
-            pred_vision_b,
-            vision_b,
-            pred_pose,
-            pose_ab,
-            occ_thresh=occ_thresh,
-            lambda_occ=lambda_occ,
-            lambda_radius=lambda_radius,
-        )
-
-        radius_cons = matched_radius_consistency_loss(
-            pred_vision_a,
-            vision_a,
-            pred_vision_b,
-            vision_b,
-            relative_pose_pred=pred_pose,
-            matching_mode="gt",
-            occ_thresh=occ_thresh,
-        )
-
-        reproj = matched_reprojection_loss_2d(
-            pred_vision_a,
-            vision_a,
-            pred_vision_b,
-            vision_b,
-            pred_pose,
-            matching_mode="gt",
-            occ_thresh=occ_thresh,
-            fov_degrees=90.0,
-        )
 
         totals["total"] += loss_out["total"].item()
         totals["supervised"] += loss_out["total"].item()
@@ -235,6 +239,7 @@ def main():
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--val-interval", type=int, default=10)
+    parser.add_argument("--num-workers", type=int, default=4)
 
     parser.add_argument("--img-size", type=int, default=128)
     parser.add_argument("--patch-size", type=int, default=16)
@@ -256,6 +261,7 @@ def main():
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    torch.set_float32_matmul_precision("high")
 
     os.makedirs(args.output_dir, exist_ok=True)
     os.makedirs(os.path.join(args.output_dir, "checkpoints"), exist_ok=True)
@@ -286,16 +292,18 @@ def main():
         train_dataset,
         batch_size=args.batch_size,
         shuffle=True,
-        num_workers=0,
+        num_workers=args.num_workers,
         pin_memory=(device.type == "cuda"),
+        persistent_workers=(args.num_workers > 0),
     )
 
     val_loader = DataLoader(
         val_dataset,
         batch_size=args.batch_size,
         shuffle=False,
-        num_workers=0,
+        num_workers=args.num_workers,
         pin_memory=(device.type == "cuda"),
+        persistent_workers=(args.num_workers > 0),
     )
 
     print("Train samples:", len(train_dataset))
@@ -331,6 +339,7 @@ def main():
         lr=args.lr,
         weight_decay=0.05,
     )
+    scaler = torch.amp.GradScaler("cuda", enabled=(device.type == "cuda"))
 
     history = []
     best_val_loss = float("inf")
@@ -356,6 +365,7 @@ def main():
             args.lambda_radius,
             warmup_factor * radius_cons_final_weight,
             warmup_factor * reproj_final_weight,
+            scaler,
         )
 
         row = {
