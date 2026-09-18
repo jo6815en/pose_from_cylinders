@@ -370,9 +370,6 @@ def main():
             f"vis={train_metrics['vision']:.4f} | "
             f"pose={train_metrics['pose']:.4f} | "
             f"trans={train_metrics['translation_error']:.4f} | "
-            f"trans_mag={train_metrics['translation_magnitude_error']:.4f} | "
-            f"trans_dir={train_metrics['translation_direction_error']:.2f}deg | "
-            f"yaw={train_metrics['yaw_error_deg']:.2f}deg | "
             f"radius_cons={train_metrics['radius_consistency']:.4f} | "
             f"reproj={train_metrics['reprojection']:.4f}"
         )
@@ -395,9 +392,6 @@ def main():
                 f"val_vis={val_metrics['vision']:.4f} | "
                 f"val_pose={val_metrics['pose']:.4f} | "
                 f"val_trans={val_metrics['translation_error']:.4f} | "
-                f"val_trans_mag={val_metrics['translation_magnitude_error']:.4f} | "
-                f"val_trans_dir={val_metrics['translation_direction_error']:.2f}deg | "
-                f"val_yaw={val_metrics['yaw_error_deg']:.2f}deg | "
                 f"val_radius_cons={val_metrics['radius_consistency']:.4f} | "
                 f"val_reproj={val_metrics['reprojection']:.4f}"
             )
