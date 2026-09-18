@@ -239,7 +239,7 @@ def main():
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--val-interval", type=int, default=10)
-    parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument("--num-workers", type=int, default=1)
 
     parser.add_argument("--img-size", type=int, default=128)
     parser.add_argument("--patch-size", type=int, default=16)
