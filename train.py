@@ -7,7 +7,7 @@ from torch.utils.data import DataLoader
 
 from dataset import SceneTwoPairsDataset
 from augmentations import build_train_transform, build_eval_transform
-from model_v2 import PairImageCylinderModelV2
+from model_small import PairImageCylinderModel
 from metrics import pose_errors
 from losses import (
     compute_supervised_pair_losses,
@@ -224,11 +224,11 @@ def main():
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--val-interval", type=int, default=10)
 
-    parser.add_argument("--img-size", type=int, default=256)
+    parser.add_argument("--img-size", type=int, default=128)
     parser.add_argument("--patch-size", type=int, default=16)
-    parser.add_argument("--embed-dim", type=int, default=512)
-    parser.add_argument("--depth", type=int, default=12)
-    parser.add_argument("--num-heads", type=int, default=8)
+    parser.add_argument("--embed-dim", type=int, default=128)
+    parser.add_argument("--depth", type=int, default=3)
+    parser.add_argument("--num-heads", type=int, default=4)
     parser.add_argument("--num-bins", type=int, default=128)
     parser.add_argument("--dropout", type=float, default=0.0)
 
@@ -291,7 +291,7 @@ def main():
     print("Train batches:", len(train_loader))
     print("Validation batches:", len(val_loader))
 
-    model = PairImageCylinderModelV2(
+    model = PairImageCylinderModel(
         img_size=args.img_size,
         patch_size=args.patch_size,
         in_chans=3,
@@ -299,12 +299,10 @@ def main():
         depth=args.depth,
         num_heads=args.num_heads,
         num_bins=args.num_bins,
-
-        mlp_ratio=4.0,
-        num_register_tokens=4,
-        cylinder_decoder_depth=2,
-
         dropout=args.dropout,
+        mlp_ratio=2.0,
+        num_register_tokens=1,
+        corr_dim=32,
     ).to(device)
 
     n_params = sum(
