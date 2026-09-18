@@ -146,7 +146,7 @@ class PoseHead(nn.Module):
         self.temperature = temperature
 
         # Translation uses only correspondence geometry
-        trans_input_dim = 4 * grid_size
+        trans_input_dim = 4 * grid_size + 2
 
         self.translation_head = nn.Sequential(
             nn.Linear(trans_input_dim, hidden_dim),
@@ -195,17 +195,18 @@ class PoseHead(nn.Module):
         conf_ab = prob_ab.max(dim=-1).values
         conf_ba = prob_ba.max(dim=-1).values
 
+        yaw_feat = torch.cat([cam_a, cam_b], dim=-1)
+        yaw = F.normalize(self.yaw_head(yaw_feat), dim=-1)
+
         trans_feat = torch.cat([
             disp_ab,
             disp_ba,
             conf_ab,
             conf_ba,
+            yaw,
         ], dim=-1)
 
         translation = self.translation_head(trans_feat)
-
-        yaw_feat = torch.cat([cam_a, cam_b], dim=-1)
-        yaw = F.normalize(self.yaw_head(yaw_feat), dim=-1)
 
         return torch.cat([translation, yaw], dim=-1)
 
@@ -240,8 +241,7 @@ class PairImageCylinderModel(nn.Module):
         corr_a = self.corr_head(patches_a)
         corr_b = self.corr_head(patches_b)
 
-        pose_ab = self.pose_head(cam_a, cam_b, corr_a, corr_b)
-
+        pose_ab = self.pose_head(cam_a, cam_b, corr_a, corr_b)        
         outputs = (vision_a, vision_b, pose_ab)
 
         if return_corr:
