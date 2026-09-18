@@ -14,6 +14,7 @@ from losses import (
     supervised_loss,
     matched_radius_consistency_loss,
     matched_reprojection_loss_2d,
+    patch_correspondence_loss,
 )
 
 
@@ -63,8 +64,16 @@ def train_one_epoch(
 
         optimizer.zero_grad(set_to_none=True)
 
-        pred_vision_a1, pred_vision_b1, pred_pose1 = model(img_a1, img_b1)
-        pred_vision_a2, pred_vision_b2, pred_pose2 = model(img_a2, img_b2)
+        pred_vision_a1, pred_vision_b1, pred_pose1, corr_a1, corr_b1 = model(
+            img_a1, img_b1, return_corr=True
+        )
+        pred_vision_a2, pred_vision_b2, pred_pose2, corr_a2, corr_b2 = model(
+            img_a2, img_b2, return_corr=True
+        )
+
+        corr1 = patch_correspondence_loss(corr_a1, vision_a1, corr_b1, vision_b1)
+        corr2 = patch_correspondence_loss(corr_a2, vision_a2, corr_b2, vision_b2)
+        corr_loss = 0.5 * (corr1 + corr2)
 
         trans_err1, trans_mag_err1, trans_dir_err1, yaw_err1 = pose_errors(
             pred_pose1, pose_ab1
@@ -101,7 +110,10 @@ def train_one_epoch(
 
         sup_loss = (loss_out1["total"] + loss_out2["total"]) / 2.0
 
-        loss = sup_loss + radius_cons_weight * radius_cons + reproj_weight * reproj
+        LAMBDA_CORR = 0.2
+        loss = sup_loss + LAMBDA_CORR * corr_loss
+
+        # loss = sup_loss + radius_cons_weight * radius_cons + reproj_weight * reproj
 
         loss.backward()
         optimizer.step()
@@ -317,6 +329,7 @@ def main():
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=args.lr,
+        weight_decay=0.05,
     )
 
     history = []
