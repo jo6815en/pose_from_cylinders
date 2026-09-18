@@ -444,7 +444,13 @@ def vision_loss(pred_vision, target_vision, occ_thresh=0.5, lambda_occ=1.0, lamb
     tgt_rad = target_vision[..., 1]
     tgt_dep = target_vision[..., 2]
 
-    occ_loss = F.binary_cross_entropy(pred_occ.clamp(1e-6, 1.0 - 1e-6), tgt_occ)
+    # BCE on sigmoid probabilities is unsafe under autocast/float16.
+    # Keep the current probability-based output, but compute this loss in float32.
+    with torch.autocast(device_type=pred_occ.device.type, enabled=False):
+        occ_loss = F.binary_cross_entropy(
+            pred_occ.float().clamp(1e-6, 1.0 - 1e-6),
+            tgt_occ.float(),
+        )
 
     mask = (tgt_occ > occ_thresh).float()
 
