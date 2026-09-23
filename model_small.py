@@ -171,7 +171,7 @@ class PoseHead(nn.Module):
 
         yaw = F.normalize(self.yaw_head(torch.cat([cam_a, cam_b], dim=-1)), dim=-1)
         trans_feat = torch.cat([disp_ab, disp_ba, conf_ab, conf_ba, yaw], dim=-1)
-        translation = self.translation_head(trans_feat)
+        translation = F.normalize(self.translation_head(trans_feat), dim=-1)
 
         return torch.cat([translation, yaw], dim=-1)
 

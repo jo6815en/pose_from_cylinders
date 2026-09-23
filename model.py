@@ -139,42 +139,60 @@ class CylinderDecoder(nn.Module):
 
 
 class PoseHead(nn.Module):
-    def __init__(self, embed_dim=192, grid_size=8, hidden_dim=192, temperature=0.1):
+    def __init__(self, embed_dim=192, grid_size=8, hidden_dim=192, temperature=0.1, depth_scale=20.0):
         super().__init__()
-
         self.grid_size = grid_size
         self.temperature = temperature
+        self.depth_scale = depth_scale
 
-        # Translation uses only correspondence geometry
-        trans_input_dim = 4 * grid_size + 2
+        # 4 correspondence features + 6 depth/matched-depth features + yaw
+        trans_input_dim = 10 * grid_size + 2
 
         self.translation_head = nn.Sequential(
-            nn.Linear(trans_input_dim, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.GELU(),
+            nn.Linear(trans_input_dim, hidden_dim), nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim), nn.GELU(),
             nn.Linear(hidden_dim, 2),
         )
 
-        # Yaw uses only global camera tokens
         self.yaw_head = nn.Sequential(
-            nn.Linear(embed_dim * 2, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.GELU(),
+            nn.Linear(embed_dim * 2, hidden_dim), nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim), nn.GELU(),
             nn.Linear(hidden_dim, 2),
         )
 
-    def forward(self, cam_a, cam_b, corr_a, corr_b):
+    def _column_depth(self, vision):
+        B, N, _ = vision.shape
+        g = self.grid_size
+        assert N % g == 0, "num_bins must be divisible by grid_size"
+        bins_per_col = N // g
+
+        occ = vision[..., 0].reshape(B, g, bins_per_col)
+        depth = vision[..., 2].reshape(B, g, bins_per_col)
+
+        # Only genuinely occupied bins contribute depth
+        weights = occ * (occ > 0.5).float()
+        mass = weights.sum(dim=-1)
+
+        column_depth = (weights * depth).sum(dim=-1) / (mass + 1e-6)
+        valid = (mass > 1e-6).float()
+
+        # Cylinder angle order -> image x order
+        column_depth = torch.flip(column_depth, dims=[1])
+        valid = torch.flip(valid, dims=[1])
+
+        # Preserve absolute scale, but keep values numerically moderate
+        column_depth = column_depth / self.depth_scale
+
+        return column_depth, valid
+
+    def forward(self, cam_a, cam_b, corr_a, corr_b, vision_a, vision_b):
         B, P, D = corr_a.shape
         g = self.grid_size
 
-        # 8x8 patch features -> 8 horizontal column features
+        # 8x8 patches -> 8 horizontal correspondence columns
         a = corr_a.reshape(B, g, g, D).mean(dim=1)
         b = corr_b.reshape(B, g, g, D).mean(dim=1)
-
-        a = F.normalize(a, dim=-1)
-        b = F.normalize(b, dim=-1)
+        a, b = F.normalize(a, dim=-1), F.normalize(b, dim=-1)
 
         # A <-> B correspondence probabilities
         sim = torch.matmul(a, b.transpose(1, 2)) / self.temperature
@@ -182,32 +200,51 @@ class PoseHead(nn.Module):
         prob_ba = F.softmax(sim.transpose(1, 2), dim=-1)
 
         coords = torch.linspace(-1.0, 1.0, g, device=corr_a.device)
-
-        # Expected matching position
         expected_b = torch.matmul(prob_ab, coords)
         expected_a = torch.matmul(prob_ba, coords)
 
-        # Per-column displacement
         disp_ab = expected_b - coords
         disp_ba = expected_a - coords
-
-        # Matching confidence
         conf_ab = prob_ab.max(dim=-1).values
         conf_ba = prob_ba.max(dim=-1).values
 
+        # Yaw from global camera tokens
         yaw_feat = torch.cat([cam_a, cam_b], dim=-1)
         yaw = F.normalize(self.yaw_head(yaw_feat), dim=-1)
 
+        # Depth per image column
+        depth_a, valid_a = self._column_depth(vision_a)
+        depth_b, valid_b = self._column_depth(vision_b)
+
+        # Use correspondence probabilities to ask:
+        # "What depth in B corresponds to this column in A?"
+        weights_ab = prob_ab * valid_b.unsqueeze(1)
+        weights_ba = prob_ba * valid_a.unsqueeze(1)
+
+        denom_ab = weights_ab.sum(dim=-1)
+        denom_ba = weights_ba.sum(dim=-1)
+
+        matched_depth_b = torch.matmul(weights_ab, depth_b.unsqueeze(-1)).squeeze(-1) / (denom_ab + 1e-6)
+        matched_depth_a = torch.matmul(weights_ba, depth_a.unsqueeze(-1)).squeeze(-1) / (denom_ba + 1e-6)
+
+        match_valid_ab = valid_a * (denom_ab > 1e-6).float()
+        match_valid_ba = valid_b * (denom_ba > 1e-6).float()
+
+        matched_depth_b = matched_depth_b * match_valid_ab
+        matched_depth_a = matched_depth_a * match_valid_ba
+
+        depth_diff_ab = (matched_depth_b - depth_a) * match_valid_ab
+        depth_diff_ba = (matched_depth_a - depth_b) * match_valid_ba
+
         trans_feat = torch.cat([
-            disp_ab,
-            disp_ba,
-            conf_ab,
-            conf_ba,
+            disp_ab, disp_ba,
+            conf_ab, conf_ba,
+            depth_a, matched_depth_b, depth_diff_ab,
+            depth_b, matched_depth_a, depth_diff_ba,
             yaw,
         ], dim=-1)
 
         translation = F.normalize(self.translation_head(trans_feat), dim=-1)
-        
         return torch.cat([translation, yaw], dim=-1)
 
 
@@ -229,7 +266,7 @@ class PairImageCylinderModel(nn.Module):
             grid_size=grid_size,
         )
 
-    def forward(self, img_a, img_b, return_attention=False, return_corr=False):
+    def forward(self, img_a, img_b, return_attention=False, return_corr=False, pose_vision_a=None, pose_vision_b=None):
         if return_attention:
             cam_a, cam_b, patches_a, patches_b, attn_ab_all, attn_ba_all = self.backbone(img_a, img_b, return_attention=True)
         else:
@@ -241,7 +278,17 @@ class PairImageCylinderModel(nn.Module):
         corr_a = self.corr_head(patches_a)
         corr_b = self.corr_head(patches_b)
 
-        pose_ab = self.pose_head(cam_a, cam_b, corr_a, corr_b)        
+        pose_input_a = vision_a.detach() if pose_vision_a is None else pose_vision_a
+        pose_input_b = vision_b.detach() if pose_vision_b is None else pose_vision_b
+
+        pose_ab = self.pose_head(
+            cam_a,
+            cam_b,
+            corr_a,
+            corr_b,
+            pose_input_a,
+            pose_input_b,
+        )       
         outputs = (vision_a, vision_b, pose_ab)
 
         if return_corr:
