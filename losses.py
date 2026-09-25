@@ -455,10 +455,13 @@ def vision_loss(pred_vision, target_vision, occ_thresh=0.5, lambda_occ=1.0, lamb
     mask = (tgt_occ > occ_thresh).float()
 
     rad_l1 = F.l1_loss(pred_rad, tgt_rad, reduction="none")
-    dep_l1 = F.l1_loss(pred_dep, tgt_dep, reduction="none")
+    pred_log = torch.log1p(pred_dep)
+    tgt_log = torch.log1p(tgt_dep)
+    dep_l1 = F.smooth_l1_loss(pred_log, tgt_log, reduction="none")
 
     rad_loss = (rad_l1 * mask).sum() / mask.sum().clamp_min(1.0)
     dep_loss = (dep_l1 * mask).sum() / mask.sum().clamp_min(1.0)
+    
 
     total = (lambda_occ * occ_loss + lambda_radius * rad_loss + lambda_depth * dep_loss)
 
@@ -546,28 +549,25 @@ def compute_supervised_pair_losses(
     occ_thresh,
     lambda_occ,
     lambda_radius,
+    lambda_pose=1.0
 ):
     loss_out1 = supervised_loss(
-        pred_vision_a1,
-        vision_a1,
-        pred_vision_b1,
-        vision_b1,
-        pred_pose1,
-        pose_ab1,
+        pred_vision_a1, vision_a1,
+        pred_vision_b1, vision_b1,
+        pred_pose1, pose_ab1,
         occ_thresh=occ_thresh,
         lambda_occ=lambda_occ,
         lambda_radius=lambda_radius,
+        lambda_pose=lambda_pose,
     )
     loss_out2 = supervised_loss(
-        pred_vision_a2,
-        vision_a2,
-        pred_vision_b2,
-        vision_b2,
-        pred_pose2,
-        pose_ab2,
+        pred_vision_a2, vision_a2,
+        pred_vision_b2, vision_b2,
+        pred_pose2, pose_ab2,
         occ_thresh=occ_thresh,
         lambda_occ=lambda_occ,
         lambda_radius=lambda_radius,
+        lambda_pose=lambda_pose
     )
 
     radius_cons1 = matched_radius_consistency_loss(
@@ -635,27 +635,44 @@ def compute_forest_loss(pred_vision_a, pred_vision_b, pred_pose, occ_thresh, lam
 
     return {"total": forest_loss, "radius_consistency": forest_radius_cons, "reprojection": forest_reproj, "sparsity": forest_sparsity,}
 
-def patch_correspondence_loss(corr_a, target_a, corr_b, target_b, occ_thresh=0.5, fov_degrees=90.0, temperature=0.1, flip_x=True):
+def patch_correspondence_loss(
+    corr_a,
+    target_a,
+    corr_b,
+    target_b,
+    occ_thresh=0.5,
+    fov_degrees=90.0,
+    temperature=0.1,
+    flip_x=True,
+    grid_h=8,
+    grid_w=16,
+):
     B, P, D = corr_a.shape
-    grid = int(P ** 0.5)
 
-    if grid * grid != P:
-        raise ValueError("Antalet patch tokens måste bilda ett kvadratiskt grid.")
+    if P != grid_h * grid_w:
+        raise ValueError(
+            f"Expected {grid_h}x{grid_w} = {grid_h * grid_w} patch tokens, got {P}."
+        )
 
-    # 8x8 patches -> 8 column features. Cylindrarna är vertikala.
-    feat_a = corr_a.reshape(B, grid, grid, D).mean(dim=1)
-    feat_b = corr_b.reshape(B, grid, grid, D).mean(dim=1)
+    # Rectangular 8x16 patch grid -> 16 horizontal column features.
+    # Cylinders are vertical, so average only over patch rows.
+    feat_a = corr_a.reshape(B, grid_h, grid_w, D).mean(dim=1)
+    feat_b = corr_b.reshape(B, grid_h, grid_w, D).mean(dim=1)
 
     feat_a = F.normalize(feat_a, dim=-1)
     feat_b = F.normalize(feat_b, dim=-1)
 
-    fov = torch.tensor(fov_degrees * torch.pi / 180.0, device=corr_a.device)
+    fov = torch.tensor(
+        fov_degrees * torch.pi / 180.0,
+        device=corr_a.device,
+        dtype=corr_a.dtype,
+    )
     sign = -1.0 if flip_x else 1.0
 
     def bin_to_col(bin_idx, num_bins):
-        theta = -0.5 * fov + bin_idx.float() / (num_bins - 1) * fov
+        theta = -0.5 * fov + bin_idx.to(corr_a.dtype) / (num_bins - 1) * fov
         x = 0.5 + sign * 0.5 * torch.tan(theta) / torch.tan(0.5 * fov)
-        return torch.clamp((x * grid).long(), 0, grid - 1)
+        return torch.clamp((x * grid_w).long(), 0, grid_w - 1)
 
     losses = []
 
@@ -666,6 +683,7 @@ def patch_correspondence_loss(corr_a, target_a, corr_b, target_b, occ_thresh=0.5
         ids_a = target_a[b, idx_a, 3].round().long()
         ids_b = target_b[b, idx_b, 3].round().long()
 
+        # 16x16 horizontal correspondence logits.
         sim_ab = feat_a[b] @ feat_b[b].T / temperature
         sim_ba = sim_ab.T
 

@@ -4,12 +4,29 @@ import torch.nn.functional as F
 
 
 class PatchEmbed(nn.Module):
-    def __init__(self, img_size=128, patch_size=16, in_chans=3, embed_dim=192):
+    def __init__(self, img_size=128, patch_size=(16, 8), in_chans=3, embed_dim=192):
         super().__init__()
-        assert img_size % patch_size == 0, "img_size must be divisible by patch_size"
-        self.grid_size = img_size // patch_size
-        self.num_patches = self.grid_size ** 2
-        self.proj = nn.Conv2d(in_chans, embed_dim, kernel_size=patch_size, stride=patch_size)
+
+        if isinstance(patch_size, int):
+            patch_h = patch_w = patch_size
+        else:
+            patch_h, patch_w = patch_size
+
+        assert img_size % patch_h == 0
+        assert img_size % patch_w == 0
+
+        self.patch_h = patch_h
+        self.patch_w = patch_w
+        self.grid_h = img_size // patch_h
+        self.grid_w = img_size // patch_w
+        self.num_patches = self.grid_h * self.grid_w
+
+        self.proj = nn.Conv2d(
+            in_chans,
+            embed_dim,
+            kernel_size=(patch_h, patch_w),
+            stride=(patch_h, patch_w),
+        )
 
     def forward(self, x):
         return self.proj(x).flatten(2).transpose(1, 2)
@@ -63,7 +80,7 @@ class PairBlock(nn.Module):
         return a, b
 
 class PairViTBackbone(nn.Module):
-    def __init__(self, img_size=128, patch_size=16, in_chans=3, embed_dim=192,
+    def __init__(self, img_size=128, patch_size=(16,8), in_chans=3, embed_dim=192,
                  depth=4, num_heads=4, dropout=0.0, num_register_tokens=2, mlp_ratio=3.0):
         super().__init__()
         self.num_register_tokens = num_register_tokens
@@ -139,14 +156,17 @@ class CylinderDecoder(nn.Module):
 
 
 class PoseHead(nn.Module):
-    def __init__(self, embed_dim=192, grid_size=8, hidden_dim=192, temperature=0.1, depth_scale=20.0):
+    def __init__(self, embed_dim=192, grid_h=8, grid_w=16, hidden_dim=192,
+                 temperature=0.1, depth_scale=20.0):
         super().__init__()
-        self.grid_size = grid_size
+
+        self.grid_h = grid_h
+        self.grid_w = grid_w
         self.temperature = temperature
         self.depth_scale = depth_scale
 
         # 4 correspondence features + 6 depth/matched-depth features + yaw
-        trans_input_dim = 10 * grid_size + 2
+        trans_input_dim = 10 * grid_w + 2
 
         self.translation_head = nn.Sequential(
             nn.Linear(trans_input_dim, hidden_dim), nn.GELU(),
@@ -162,49 +182,59 @@ class PoseHead(nn.Module):
 
     def _column_depth(self, vision):
         B, N, _ = vision.shape
-        g = self.grid_size
-        assert N % g == 0, "num_bins must be divisible by grid_size"
-        bins_per_col = N // g
+        gw = self.grid_w
 
-        occ = vision[..., 0].reshape(B, g, bins_per_col)
-        depth = vision[..., 2].reshape(B, g, bins_per_col)
+        assert N % gw == 0, "num_bins must be divisible by grid_w"
+        bins_per_col = N // gw
 
-        # Only genuinely occupied bins contribute depth
+        occ = vision[..., 0].reshape(B, gw, bins_per_col)
+        depth = vision[..., 2].reshape(B, gw, bins_per_col)
+
         weights = occ * (occ > 0.5).float()
         mass = weights.sum(dim=-1)
 
-        column_depth = (weights * depth).sum(dim=-1) / (mass + 1e-6)
-        valid = (mass > 1e-6).float()
+        depth_col = (weights * depth).sum(dim=-1) / (mass + 1e-6)
+        valid_col = (mass > 1e-6).float()
 
-        # Cylinder angle order -> image x order
-        column_depth = torch.flip(column_depth, dims=[1])
-        valid = torch.flip(valid, dims=[1])
+        # Cylinder-angle order is opposite to image x / patch-column order
+        depth_col = torch.flip(depth_col, dims=[1])
+        valid_col = torch.flip(valid_col, dims=[1])
 
-        # Preserve absolute scale, but keep values numerically moderate
-        column_depth = column_depth / self.depth_scale
+        # Keep absolute depth information, only rescale numerically
+        depth_col = depth_col / self.depth_scale
 
-        return column_depth, valid
+        return depth_col, valid_col
 
     def forward(self, cam_a, cam_b, corr_a, corr_b, vision_a, vision_b):
         B, P, D = corr_a.shape
-        g = self.grid_size
+        gh, gw = self.grid_h, self.grid_w
 
-        # 8x8 patches -> 8 horizontal correspondence columns
-        a = corr_a.reshape(B, g, g, D).mean(dim=1)
-        b = corr_b.reshape(B, g, g, D).mean(dim=1)
-        a, b = F.normalize(a, dim=-1), F.normalize(b, dim=-1)
+        assert P == gh * gw, f"Expected {gh * gw} patches, got {P}"
 
-        # A <-> B correspondence probabilities
+        # 8x16 patch features -> 16 horizontal column features
+        a = corr_a.reshape(B, gh, gw, D).mean(dim=1)
+        b = corr_b.reshape(B, gh, gw, D).mean(dim=1)
+
+        a = F.normalize(a, dim=-1)
+        b = F.normalize(b, dim=-1)
+
+        # A <-> B correspondence probabilities over 16 horizontal columns
         sim = torch.matmul(a, b.transpose(1, 2)) / self.temperature
         prob_ab = F.softmax(sim, dim=-1)
         prob_ba = F.softmax(sim.transpose(1, 2), dim=-1)
 
-        coords = torch.linspace(-1.0, 1.0, g, device=corr_a.device)
+        coords = torch.linspace(
+            -1.0, 1.0, gw,
+            device=corr_a.device,
+            dtype=prob_ab.dtype,
+        )
+
         expected_b = torch.matmul(prob_ab, coords)
         expected_a = torch.matmul(prob_ba, coords)
 
         disp_ab = expected_b - coords
         disp_ba = expected_a - coords
+
         conf_ab = prob_ab.max(dim=-1).values
         conf_ba = prob_ba.max(dim=-1).values
 
@@ -212,23 +242,32 @@ class PoseHead(nn.Module):
         yaw_feat = torch.cat([cam_a, cam_b], dim=-1)
         yaw = F.normalize(self.yaw_head(yaw_feat), dim=-1)
 
-        # Depth per image column
+        # One depth value per horizontal column
         depth_a, valid_a = self._column_depth(vision_a)
         depth_b, valid_b = self._column_depth(vision_b)
 
-        # Use correspondence probabilities to ask:
-        # "What depth in B corresponds to this column in A?"
+        depth_a = depth_a.to(prob_ab.dtype)
+        depth_b = depth_b.to(prob_ab.dtype)
+        valid_a = valid_a.to(prob_ab.dtype)
+        valid_b = valid_b.to(prob_ab.dtype)
+
+        # Couple depth explicitly to the learned A <-> B correspondence
         weights_ab = prob_ab * valid_b.unsqueeze(1)
         weights_ba = prob_ba * valid_a.unsqueeze(1)
 
         denom_ab = weights_ab.sum(dim=-1)
         denom_ba = weights_ba.sum(dim=-1)
 
-        matched_depth_b = torch.matmul(weights_ab, depth_b.unsqueeze(-1)).squeeze(-1) / (denom_ab + 1e-6)
-        matched_depth_a = torch.matmul(weights_ba, depth_a.unsqueeze(-1)).squeeze(-1) / (denom_ba + 1e-6)
+        matched_depth_b = torch.matmul(
+            weights_ab, depth_b.unsqueeze(-1)
+        ).squeeze(-1) / (denom_ab + 1e-6)
 
-        match_valid_ab = valid_a * (denom_ab > 1e-6).float()
-        match_valid_ba = valid_b * (denom_ba > 1e-6).float()
+        matched_depth_a = torch.matmul(
+            weights_ba, depth_a.unsqueeze(-1)
+        ).squeeze(-1) / (denom_ba + 1e-6)
+
+        match_valid_ab = valid_a * (denom_ab > 1e-6).to(valid_a.dtype)
+        match_valid_ba = valid_b * (denom_ba > 1e-6).to(valid_b.dtype)
 
         matched_depth_b = matched_depth_b * match_valid_ab
         matched_depth_a = matched_depth_a * match_valid_ba
@@ -237,10 +276,16 @@ class PoseHead(nn.Module):
         depth_diff_ba = (matched_depth_a - depth_b) * match_valid_ba
 
         trans_feat = torch.cat([
-            disp_ab, disp_ba,
-            conf_ab, conf_ba,
-            depth_a, matched_depth_b, depth_diff_ab,
-            depth_b, matched_depth_a, depth_diff_ba,
+            disp_ab,
+            disp_ba,
+            conf_ab,
+            conf_ba,
+            depth_a,
+            matched_depth_b,
+            depth_diff_ab,
+            depth_b,
+            matched_depth_a,
+            depth_diff_ba,
             yaw,
         ], dim=-1)
 
@@ -250,7 +295,7 @@ class PoseHead(nn.Module):
 
 class PairImageCylinderModel(nn.Module):
     """Laptop-sized counterpart of model_v2 with the same public class/output interface as the old model.py."""
-    def __init__(self, img_size=128, patch_size=16, in_chans=3, embed_dim=192,
+    def __init__(self, img_size=128, patch_size=(16,8), in_chans=3, embed_dim=192,
                  depth=4, num_heads=4, num_bins=128, dropout=0.0,
                  mlp_ratio=3.0, num_register_tokens=2):
         super().__init__()
@@ -260,10 +305,10 @@ class PairImageCylinderModel(nn.Module):
         )
         self.vision_head = CylinderDecoder(embed_dim, num_heads, num_bins, mlp_ratio, dropout)
         self.corr_head = nn.Sequential(nn.LayerNorm(embed_dim), nn.Linear(embed_dim, 64))
-        grid_size = img_size // patch_size
         self.pose_head = PoseHead(
             embed_dim=embed_dim,
-            grid_size=grid_size,
+            grid_h=self.backbone.patch_embed.grid_h,
+            grid_w=self.backbone.patch_embed.grid_w,
         )
 
     def forward(self, img_a, img_b, return_attention=False, return_corr=False, pose_vision_a=None, pose_vision_b=None):
