@@ -1,6 +1,16 @@
 import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.patches import Rectangle
+import torch
+
+def save_checkpoint(path, model, optimizer, history, epoch, val_metrics):
+    torch.save({
+        "epoch": epoch,
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "val_metrics": val_metrics,
+        "history": history,
+    }, path)
 
 def pose_to_xy_yaw(pose):
     """
