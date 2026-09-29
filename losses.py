@@ -638,40 +638,22 @@ def patch_correspondence_loss(
     corr_b,
     target_b,
     occ_thresh=0.5,
-    fov_degrees=90.0,
     temperature=0.1,
-    flip_x=True,
-    grid_h=8,
-    grid_w=16,
+    sigma=2.0,
+    **kwargs,
 ):
-    B, P, D = corr_a.shape
-
-    if P != grid_h * grid_w:
-        raise ValueError(
-            f"Expected {grid_h}x{grid_w} = {grid_h * grid_w} patch tokens, got {P}."
-        )
-
-    # Rectangular 8x16 patch grid -> 16 horizontal column features.
-    # Cylinders are vertical, so average only over patch rows.
-    feat_a = corr_a.reshape(B, grid_h, grid_w, D).mean(dim=1)
-    feat_b = corr_b.reshape(B, grid_h, grid_w, D).mean(dim=1)
-
-    feat_a = F.normalize(feat_a, dim=-1)
-    feat_b = F.normalize(feat_b, dim=-1)
-
-    fov = torch.tensor(
-        fov_degrees * torch.pi / 180.0,
-        device=corr_a.device,
-        dtype=corr_a.dtype,
-    )
-    sign = -1.0 if flip_x else 1.0
-
-    def bin_to_col(bin_idx, num_bins):
-        theta = -0.5 * fov + bin_idx.to(corr_a.dtype) / (num_bins - 1) * fov
-        x = 0.5 + sign * 0.5 * torch.tan(theta) / torch.tan(0.5 * fov)
-        return torch.clamp((x * grid_w).long(), 0, grid_w - 1)
-
+    B, N, D = corr_a.shape
     losses = []
+
+    corr_a = F.normalize(corr_a, dim=-1)
+    corr_b = F.normalize(corr_b, dim=-1)
+
+    bin_indices = torch.arange(N, device=corr_a.device, dtype=corr_a.dtype)
+
+    def soft_target(target_idx):
+        dist = bin_indices - target_idx.to(corr_a.dtype)
+        target = torch.exp(-0.5 * (dist / sigma) ** 2)
+        return target / target.sum()
 
     for b in range(B):
         idx_a = torch.where(target_a[b, :, 0] > occ_thresh)[0]
@@ -680,9 +662,11 @@ def patch_correspondence_loss(
         ids_a = target_a[b, idx_a, 3].round().long()
         ids_b = target_b[b, idx_b, 3].round().long()
 
-        # 16x16 horizontal correspondence logits.
-        sim_ab = feat_a[b] @ feat_b[b].T / temperature
+        sim_ab = corr_a[b] @ corr_b[b].T / temperature
         sim_ba = sim_ab.T
+
+        log_prob_ab = F.log_softmax(sim_ab, dim=-1)
+        log_prob_ba = F.log_softmax(sim_ba, dim=-1)
 
         for cid in ids_a.unique():
             match_a = idx_a[ids_a == cid]
@@ -691,11 +675,14 @@ def patch_correspondence_loss(
             if match_a.numel() != 1 or match_b.numel() != 1:
                 continue
 
-            col_a = bin_to_col(match_a[0], target_a.shape[1])
-            col_b = bin_to_col(match_b[0], target_b.shape[1])
+            ia = match_a[0]
+            ib = match_b[0]
 
-            loss_ab = F.cross_entropy(sim_ab[col_a].unsqueeze(0), col_b.view(1))
-            loss_ba = F.cross_entropy(sim_ba[col_b].unsqueeze(0), col_a.view(1))
+            target_b_soft = soft_target(ib)
+            target_a_soft = soft_target(ia)
+
+            loss_ab = -(target_b_soft * log_prob_ab[ia]).sum()
+            loss_ba = -(target_a_soft * log_prob_ba[ib]).sum()
 
             losses.append(0.5 * (loss_ab + loss_ba))
 
@@ -703,3 +690,30 @@ def patch_correspondence_loss(
         return (corr_a.sum() + corr_b.sum()) * 0.0
 
     return torch.stack(losses).mean()
+
+def gt_correspondence_probs(target_a, target_b, occ_thresh=0.5):
+    B, N, _ = target_a.shape
+    device = target_a.device
+    dtype = target_a.dtype
+
+    prob_ab = torch.zeros(B, N, N, device=device, dtype=dtype)
+    prob_ba = torch.zeros(B, N, N, device=device, dtype=dtype)
+
+    for b in range(B):
+        occ_a = target_a[b, :, 0] > occ_thresh
+        occ_b = target_b[b, :, 0] > occ_thresh
+
+        ids_a = target_a[b, :, 3].round().long()
+        ids_b = target_b[b, :, 3].round().long()
+
+        for cid in torch.unique(ids_a[occ_a]):
+            ia = torch.where(occ_a & (ids_a == cid))[0]
+            ib = torch.where(occ_b & (ids_b == cid))[0]
+
+            if ia.numel() != 1 or ib.numel() != 1:
+                continue
+
+            prob_ab[b, ia[0], ib[0]] = 1.0
+            prob_ba[b, ib[0], ia[0]] = 1.0
+
+    return prob_ab, prob_ba
