@@ -1,7 +1,6 @@
 import torch
 import torch.nn.functional as F
 
-
 def match_sinkhorn_between_views(
     vision_a,
     vision_b,
@@ -81,7 +80,7 @@ def match_sinkhorn_between_views(
         s = sin_yaw[b]
         c = cos_yaw[b]
 
-        R = torch.stack([torch.stack([c, -s]), torch.stack([s,  c]),])
+        R = torch.stack([torch.stack([c, -s]), torch.stack([s, c])])
 
         xa_in_b = xa @ R.T + t[b]
 
@@ -95,7 +94,7 @@ def match_sinkhorn_between_views(
 
         n_a, n_b = cost.shape
 
-        cost_ext = torch.full((n_a + 1, n_b + 1), dustbin_cost, device=device, dtype=dtype,)
+        cost_ext = torch.full((n_a + 1, n_b + 1), dustbin_cost, device=device, dtype=dtype)
 
         cost_ext[:n_a, :n_b] = cost
 
@@ -142,8 +141,10 @@ def match_sinkhorn_between_views(
 
     return out[0] if squeeze_batch else out
 
-
-def match_vision_to_target_cylinders(pred_vision, target_vision, fov_degrees=90.0, occ_thresh=0.5, lambda_pos=1.0, lambda_radius=1.0,):
+def match_vision_to_target_cylinders(
+    pred_vision, target_vision, fov_degrees=90.0, occ_thresh=0.5,
+    lambda_pos=1.0, lambda_radius=1.0,
+):
     squeeze_batch = False
     if pred_vision.dim() == 2:
         pred_vision = pred_vision.unsqueeze(0)
@@ -213,7 +214,6 @@ def match_vision_to_target_cylinders(pred_vision, target_vision, fov_degrees=90.
 
     return out[0] if squeeze_batch else out
 
-
 def _get_pair_matches(
     pred_vision_a,
     target_vision_a=None,
@@ -228,9 +228,13 @@ def _get_pair_matches(
         if target_vision_a is None or target_vision_b is None:
             raise ValueError("target_vision_a och target_vision_b krävs när matching_mode='gt'")
 
-        match_a = match_vision_to_target_cylinders(pred_vision_a, target_vision_a, occ_thresh=occ_thresh, fov_degrees=fov_degrees,)
+        match_a = match_vision_to_target_cylinders(
+            pred_vision_a, target_vision_a, occ_thresh=occ_thresh, fov_degrees=fov_degrees
+        )
 
-        match_b = match_vision_to_target_cylinders(pred_vision_b, target_vision_b, occ_thresh=occ_thresh, fov_degrees=fov_degrees,)
+        match_b = match_vision_to_target_cylinders(
+            pred_vision_b, target_vision_b, occ_thresh=occ_thresh, fov_degrees=fov_degrees
+        )
 
         return match_a, match_b
 
@@ -419,7 +423,7 @@ def matched_reprojection_loss_2d(
         s = sin_yaw[batch_i]
         c = cos_yaw[batch_i]
 
-        R = torch.stack([torch.stack([c, -s]), torch.stack([s,  c]),])
+        R = torch.stack([torch.stack([c, -s]), torch.stack([s, c])])
 
         for ia, ib in pairs:
             x_a = pts_a[batch_i, ia]
@@ -431,11 +435,13 @@ def matched_reprojection_loss_2d(
 
     if len(losses) == 0:
         return pred_vision_a.sum() * 0.0
-    
 
     return torch.stack(losses).mean()
 
-def vision_loss(pred_vision, target_vision, occ_thresh=0.5, lambda_occ=1.0, lambda_radius=1.0, lambda_depth=1.0,):
+def vision_loss(
+    pred_vision, target_vision, occ_thresh=0.5, lambda_occ=1.0,
+    lambda_radius=1.0, lambda_depth=1.0,
+):
     pred_occ = pred_vision[..., 0]
     pred_rad = pred_vision[..., 1]
     pred_dep = pred_vision[..., 2]
@@ -455,17 +461,20 @@ def vision_loss(pred_vision, target_vision, occ_thresh=0.5, lambda_occ=1.0, lamb
     mask = (tgt_occ > occ_thresh).float()
 
     rad_l1 = F.l1_loss(pred_rad, tgt_rad, reduction="none")
-    dep_l1 = F.l1_loss(pred_dep, tgt_dep, reduction="none")
+
+    pred_log_depth = torch.log(pred_dep.clamp_min(1e-4))
+    tgt_log_depth = torch.log(tgt_dep.clamp_min(1e-4))
+
+    dep_l1 = F.l1_loss(pred_log_depth, tgt_log_depth, reduction="none")
 
     rad_loss = (rad_l1 * mask).sum() / mask.sum().clamp_min(1.0)
     dep_loss = (dep_l1 * mask).sum() / mask.sum().clamp_min(1.0)
 
-    total = (lambda_occ * occ_loss + lambda_radius * rad_loss + lambda_depth * dep_loss)
+    total = lambda_occ * occ_loss + lambda_radius * rad_loss + lambda_depth * dep_loss
 
     return total, occ_loss, rad_loss, dep_loss
 
-
-def relative_pose_loss_2d(pred_pose, target_pose, t_weight=1.0, r_weight=1.0,):
+def relative_pose_loss_2d(pred_pose, target_pose, t_weight=1.0, r_weight=1.0):
     pred_t = F.normalize(pred_pose[:, :2], dim=-1)
     tgt_t = F.normalize(target_pose[:, :2], dim=-1)
 
@@ -478,7 +487,6 @@ def relative_pose_loss_2d(pred_pose, target_pose, t_weight=1.0, r_weight=1.0,):
 
     total = t_weight * t_loss + r_weight * r_loss
     return total, t_loss, r_loss
-
 
 def supervised_loss(
     pred_vision_a,
@@ -514,7 +522,9 @@ def supervised_loss(
         lambda_depth=lambda_depth,
     )
 
-    pose_total, t_loss, r_loss = relative_pose_loss_2d(pred_pose, target_pose, t_weight=t_weight, r_weight=r_weight,)
+    pose_total, t_loss, r_loss = relative_pose_loss_2d(
+        pred_pose, target_pose, t_weight=t_weight, r_weight=r_weight
+    )
 
     total = (lambda_vis * vis_a_total + lambda_vis * vis_b_total) / 2.0 + lambda_pose * pose_total
 
@@ -524,11 +534,14 @@ def supervised_loss(
         "vision_a_occ": vis_a_occ,
         "vision_a_radius": vis_a_rad,
         "vision_a_depth": vis_a_dep,
+        "vision_b": vis_b_total,
+        "vision_b_occ": vis_b_occ,
+        "vision_b_radius": vis_b_rad,
+        "vision_b_depth": vis_b_dep,
         "pose": pose_total,
         "translation": t_loss,
         "rotation": r_loss,
     }
-
 
 def compute_supervised_pair_losses(
     pred_vision_a1,
@@ -601,7 +614,7 @@ def compute_supervised_pair_losses(
         vision_a2,
         pred_vision_b2,
         vision_b2,
-        pred_pose2, 
+        pred_pose2,
         matching_mode="gt",
         occ_thresh=occ_thresh,
         fov_degrees=90.0,
@@ -609,8 +622,44 @@ def compute_supervised_pair_losses(
 
     return (loss_out1, loss_out2, (radius_cons1 + radius_cons2) / 2.0, (reproj1 + reproj2) / 2.0,)
 
+def relative_depth_structure_loss(pred_vision, target_vision, occ_thresh=0.5):
+    losses = []
 
-def compute_forest_loss(pred_vision_a, pred_vision_b, pred_pose, occ_thresh, lambda_radius, lambda_reproj, lambda_sparsity,):
+    for b in range(pred_vision.shape[0]):
+        mask = target_vision[b, :, 0] > occ_thresh
+
+        pred_depth = pred_vision[b, mask, 2]
+        gt_depth = target_vision[b, mask, 2]
+
+        if pred_depth.numel() < 2:
+            continue
+
+        pred_rel = pred_depth[:, None] - pred_depth[None, :]
+        gt_rel = gt_depth[:, None] - gt_depth[None, :]
+
+        # Bara varje par en gång, och inte diagonalen
+        pair_mask = torch.triu(
+            torch.ones_like(pred_rel, dtype=torch.bool),
+            diagonal=1,
+        )
+
+        losses.append(
+            F.smooth_l1_loss(
+                pred_rel[pair_mask],
+                gt_rel[pair_mask],
+            )
+        )
+
+    if not losses:
+        return pred_vision[..., 2].sum() * 0.0
+
+    return torch.stack(losses).mean()
+
+
+def compute_forest_loss(
+    pred_vision_a, pred_vision_b, pred_pose, occ_thresh,
+    lambda_radius, lambda_reproj, lambda_sparsity,
+):
     forest_radius_cons = matched_radius_consistency_loss(
         pred_vision_a,
         pred_vision_b=pred_vision_b,
@@ -628,9 +677,18 @@ def compute_forest_loss(pred_vision_a, pred_vision_b, pred_pose, occ_thresh, lam
     )
     forest_sparsity = (pred_vision_a[..., 0].mean() + pred_vision_b[..., 0].mean()) / 2.0
 
-    forest_loss = (lambda_radius * forest_radius_cons + lambda_reproj * forest_reproj + lambda_sparsity * forest_sparsity)
+    forest_loss = (
+        lambda_radius * forest_radius_cons
+        + lambda_reproj * forest_reproj
+        + lambda_sparsity * forest_sparsity
+    )
 
-    return {"total": forest_loss, "radius_consistency": forest_radius_cons, "reprojection": forest_reproj, "sparsity": forest_sparsity,}
+    return {
+        "total": forest_loss,
+        "radius_consistency": forest_radius_cons,
+        "reprojection": forest_reproj,
+        "sparsity": forest_sparsity,
+    }
 
 def patch_correspondence_loss(
     corr_a,
@@ -638,22 +696,31 @@ def patch_correspondence_loss(
     corr_b,
     target_b,
     occ_thresh=0.5,
+    fov_degrees=90.0,
     temperature=0.1,
-    sigma=2.0,
+    flip_x=True,
     **kwargs,
 ):
     B, N, D = corr_a.shape
+    assert N == 16
+
+    fov = torch.tensor(
+        fov_degrees * torch.pi / 180.0,
+        device=corr_a.device,
+        dtype=corr_a.dtype,
+    )
+
+    sign = -1.0 if flip_x else 1.0
+
+    def bin_to_col(bin_idx, num_bins):
+        theta = -0.5 * fov + bin_idx.to(corr_a.dtype) / (num_bins - 1) * fov
+        x = 0.5 + sign * 0.5 * torch.tan(theta) / torch.tan(0.5 * fov)
+        return torch.clamp((x * 16).long(), 0, 15)
+
     losses = []
 
     corr_a = F.normalize(corr_a, dim=-1)
     corr_b = F.normalize(corr_b, dim=-1)
-
-    bin_indices = torch.arange(N, device=corr_a.device, dtype=corr_a.dtype)
-
-    def soft_target(target_idx):
-        dist = bin_indices - target_idx.to(corr_a.dtype)
-        target = torch.exp(-0.5 * (dist / sigma) ** 2)
-        return target / target.sum()
 
     for b in range(B):
         idx_a = torch.where(target_a[b, :, 0] > occ_thresh)[0]
@@ -665,9 +732,6 @@ def patch_correspondence_loss(
         sim_ab = corr_a[b] @ corr_b[b].T / temperature
         sim_ba = sim_ab.T
 
-        log_prob_ab = F.log_softmax(sim_ab, dim=-1)
-        log_prob_ba = F.log_softmax(sim_ba, dim=-1)
-
         for cid in ids_a.unique():
             match_a = idx_a[ids_a == cid]
             match_b = idx_b[ids_b == cid]
@@ -675,14 +739,11 @@ def patch_correspondence_loss(
             if match_a.numel() != 1 or match_b.numel() != 1:
                 continue
 
-            ia = match_a[0]
-            ib = match_b[0]
+            col_a = bin_to_col(match_a[0], target_a.shape[1])
+            col_b = bin_to_col(match_b[0], target_b.shape[1])
 
-            target_b_soft = soft_target(ib)
-            target_a_soft = soft_target(ia)
-
-            loss_ab = -(target_b_soft * log_prob_ab[ia]).sum()
-            loss_ba = -(target_a_soft * log_prob_ba[ib]).sum()
+            loss_ab = F.cross_entropy(sim_ab[col_a].unsqueeze(0), col_b.view(1))
+            loss_ba = F.cross_entropy(sim_ba[col_b].unsqueeze(0), col_a.view(1))
 
             losses.append(0.5 * (loss_ab + loss_ba))
 
