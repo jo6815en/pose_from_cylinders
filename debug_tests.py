@@ -2,6 +2,8 @@ import torch
 import torch.nn.functional as F
 import numpy as np
 
+
+
 def test_matched_depth_consistency(model, loader, device, occ_thresh=0.5):
     model.eval()
     err_a, err_b, pred_delta, gt_delta = [], [], [], []
@@ -60,6 +62,89 @@ def test_matched_depth_consistency(model, loader, device, occ_thresh=0.5):
         "pred_delta": pred_delta,
         "gt_delta": gt_delta,
     }
+
+
+def test_new_gt_pose_geometry(loader, device, fov_degrees=90.0):
+    errors = []
+
+    with torch.no_grad():
+        for batch in loader:
+            batch = [x.to(device) for x in batch]
+
+            pairs = [(batch[1], batch[3], batch[4])] if len(batch) == 5 else [
+                (batch[1], batch[3], batch[4]),
+                (batch[6], batch[8], batch[9]),
+            ]
+
+            for va, vb, pose in pairs:
+                B, N, _ = va.shape
+                fov = np.deg2rad(fov_degrees)
+
+                theta = torch.linspace(
+                    -0.5 * fov, 0.5 * fov, N,
+                    device=device, dtype=va.dtype,
+                )
+
+                # A-punkter i Cam1-frame
+                pa = torch.stack([
+                    va[..., 2] * torch.cos(theta),
+                    va[..., 2] * torch.sin(theta),
+                ], dim=-1)
+
+                # B-punkter i Cam2-frame
+                pb = torch.stack([
+                    vb[..., 2] * torch.cos(theta),
+                    vb[..., 2] * torch.sin(theta),
+                ], dim=-1)
+
+                for b in range(B):
+                    occ_a = va[b, :, 0] > 0.5
+                    occ_b = vb[b, :, 0] > 0.5
+                    ids_a = va[b, :, 3].round().long()
+                    ids_b = vb[b, :, 3].round().long()
+
+                    t = pose[b, :2]
+
+                    yaw = F.normalize(pose[b, 2:], dim=0)
+                    s, c = yaw[0], yaw[1]
+
+                    # Cam1/world -> Cam2 orientation
+                    R_inv = torch.stack([
+                        torch.stack([ c,  s]),
+                        torch.stack([-s,  c]),
+                    ])
+
+                    for cid in torch.unique(ids_a[occ_a]):
+                        ia = torch.where(occ_a & (ids_a == cid))[0]
+                        ib = torch.where(occ_b & (ids_b == cid))[0]
+
+                        if ia.numel() != 1 or ib.numel() != 1:
+                            continue
+
+                        A = pa[b, ia[0]]
+                        B_gt = pb[b, ib[0]]
+
+                        # Cam2 ligger vid t i Cam1-frame:
+                        # flytta först origo till Cam2, rotera sedan.
+                        B_pred = R_inv @ (A - t)
+
+                        errors.append(
+                            torch.linalg.vector_norm(
+                                B_pred - B_gt
+                            ).item()
+                        )
+
+    errors = np.asarray(errors)
+
+    print("NEW GT POSE GEOMETRY TEST")
+    print("-" * 45)
+    print(f"Matches: {len(errors)}")
+    print(f"Mean:    {errors.mean():.4f} m")
+    print(f"Median:  {np.median(errors):.4f} m")
+    print(f"P90:     {np.percentile(errors, 90):.4f} m")
+    print(f"Max:     {errors.max():.4f} m")
+
+    return errors
 
 def evaluate_train_geometry(model, loader, device, occ_thresh=0.5):
     model.eval()
@@ -159,6 +244,60 @@ def evaluate_train_geometry(model, loader, device, occ_thresh=0.5):
     print(f"GT std across bins:       {np.mean(depth_gt_std):.4f}")
     print(f"Mean per-sample corr:     {np.mean(depth_sample_corr):.3f}")
     print(f"Median per-sample corr:   {np.median(depth_sample_corr):.3f}")
+
+
+def test_depth_by_distance(model, loader, device, bins=(0, 5, 10, 15, 20, 30, float("inf"))):
+    model.eval()
+    data = {i: {"pred": [], "gt": []} for i in range(len(bins) - 1)}
+
+    with torch.no_grad():
+        for batch in loader:
+            batch = [x.to(device, non_blocking=True) for x in batch]
+            pairs = [(batch[0], batch[1], batch[2], batch[3])] if len(batch) == 5 else [
+                (batch[0], batch[1], batch[2], batch[3]),
+                (batch[5], batch[6], batch[7], batch[8]),
+            ]
+
+            for img_a, gt_a, img_b, gt_b in pairs:
+                pred_a, pred_b, _ = model(img_a, img_b)
+
+                for pred, gt in [(pred_a, gt_a), (pred_b, gt_b)]:
+                    mask = gt[..., 0] > 0.5
+                    p = pred[..., 2][mask].cpu().numpy()
+                    g = gt[..., 2][mask].cpu().numpy()
+
+                    for i, (lo, hi) in enumerate(zip(bins[:-1], bins[1:])):
+                        m = (g >= lo) & (g < hi)
+                        data[i]["pred"].extend(p[m])
+                        data[i]["gt"].extend(g[m])
+
+    print("DEPTH ERROR BY GT DISTANCE")
+    print("-" * 82)
+    print(
+        f"{'Range':>10} {'N':>7} {'MAE':>8} {'Rel MAE':>9} "
+        f"{'Corr':>8} {'Pred mean':>10} {'GT mean':>9} "
+        f"{'Pred std':>10} {'GT std':>9}"
+    )
+    for i, (lo, hi) in enumerate(zip(bins[:-1], bins[1:])):
+        p = np.asarray(data[i]["pred"])
+        g = np.asarray(data[i]["gt"])
+
+        if len(g) == 0:
+            continue
+
+        mae = np.mean(np.abs(p - g))
+        rel = np.mean(np.abs(p - g) / np.maximum(g, 1e-6))
+        corr = np.corrcoef(p, g)[0, 1] if len(g) > 1 and p.std() > 1e-8 and g.std() > 1e-8 else np.nan
+
+        label = f"{lo:g}-{hi:g}" if np.isfinite(hi) else f"{lo:g}+"
+
+        print(
+            f"{label:>10} {len(g):7d} {mae:8.3f} {rel:9.3f} "
+            f"{corr:8.3f} {p.mean():10.3f} {g.mean():9.3f} "
+            f"{p.std():10.3f} {g.std():9.3f}"
+        )
+
+    return data
 
 
 def evaluate_16_correspondences(model, loader, device, occ_thresh=0.5, temperature=0.1, fov_degrees=90.0):
@@ -287,553 +426,501 @@ def evaluate_16_soft_shift(model, loader, device, occ_thresh=0.5, temperature=0.
     print(f"Median shift error:       {np.median(np.abs(pred_shifts - gt_shifts)):.2f} columns")
     print(f"Correlation pred vs GT:   {np.corrcoef(pred_shifts, gt_shifts)[0,1]:.3f}")
 
-def test_corr_descriptor_diversity(model, loader, device):
-    model.eval()
-
-    adjacent_sims = []
-    random_sims = []
-    descriptor_stds = []
-
-    with torch.no_grad():
-        for batch in loader:
-            img_a, vision_a, img_b, vision_b, _ = (x.to(device, non_blocking=True) for x in batch)
-
-            _, _, _, corr_a, corr_b = model(img_a, img_b, return_corr=True)
-
-            for corr in [corr_a, corr_b]:
-                corr = F.normalize(corr, dim=-1)
-
-                # Likhet mellan intilliggande bins
-                adjacent = F.cosine_similarity(corr[:, :-1], corr[:, 1:], dim=-1)
-                adjacent_sims.extend(adjacent.flatten().cpu().tolist())
-
-                # Likhet mellan bins långt ifrån varandra
-                random = F.cosine_similarity(corr[:, :64], corr[:, 64:], dim=-1)
-                random_sims.extend(random.flatten().cpu().tolist())
-
-                # Hur mycket descriptorerna varierar inom varje sample
-                descriptor_stds.extend(corr.std(dim=1).mean(dim=-1).cpu().tolist())
-
-    print("CORRESPONDENCE DESCRIPTOR DIVERSITY")
-    print("----------------------------------------")
-    print(f"Adjacent-bin cosine similarity: {np.mean(adjacent_sims):.4f}")
-    print(f"Distant-bin cosine similarity:  {np.mean(random_sims):.4f}")
-    print(f"Descriptor std across bins:     {np.mean(descriptor_stds):.4f}")
-
-def test_correspondence_position_bias(model, loader, device, occ_thresh=0.5, temperature=0.1):
-    model.eval()
-
-    pred_shifts = []
-    gt_shifts = []
-    shift_errors = []
-    same_bin = 0
-    near_same_bin = 0
-    total = 0
-
-    with torch.no_grad():
-        for batch in loader:
-            batch = [x.to(device, non_blocking=True) for x in batch]
-
-            if len(batch) == 5:
-                pairs = [(batch[0], batch[1], batch[2], batch[3])]
-            elif len(batch) == 10:
-                pairs = [
-                    (batch[0], batch[1], batch[2], batch[3]),
-                    (batch[5], batch[6], batch[7], batch[8]),
-                ]
-            else:
-                raise ValueError(f"Unexpected batch length: {len(batch)}")
-
-            for img_a, vision_a, img_b, vision_b in pairs:
-                _, _, _, corr_a, corr_b = model(img_a, img_b, return_corr=True)
-
-                corr_a = F.normalize(corr_a, dim=-1)
-                corr_b = F.normalize(corr_b, dim=-1)
-
-                for b in range(img_a.shape[0]):
-                    idx_a = torch.where(vision_a[b, :, 0] > occ_thresh)[0]
-                    idx_b = torch.where(vision_b[b, :, 0] > occ_thresh)[0]
-
-                    ids_a = vision_a[b, idx_a, 3].round().long()
-                    ids_b = vision_b[b, idx_b, 3].round().long()
-
-                    sim = corr_a[b] @ corr_b[b].T / temperature
-                    pred_b = sim.argmax(dim=-1)
-
-                    for cid in ids_a.unique():
-                        match_a = idx_a[ids_a == cid]
-                        match_b = idx_b[ids_b == cid]
-
-                        if match_a.numel() != 1 or match_b.numel() != 1:
-                            continue
-
-                        ia = match_a[0].item()
-                        ib_gt = match_b[0].item()
-                        ib_pred = pred_b[ia].item()
-
-                        pred_shift = ib_pred - ia
-                        gt_shift = ib_gt - ia
-
-                        pred_shifts.append(pred_shift)
-                        gt_shifts.append(gt_shift)
-                        shift_errors.append(abs(pred_shift - gt_shift))
-
-                        same_bin += abs(pred_shift) == 0
-                        near_same_bin += abs(pred_shift) <= 2
-                        total += 1
-
-    pred_shifts = np.array(pred_shifts)
-    gt_shifts = np.array(gt_shifts)
-    shift_errors = np.array(shift_errors)
-
-    print("CORRESPONDENCE POSITION BIAS")
-    print("----------------------------------------")
-    print(f"Matches:                     {total}")
-    print(f"Predicted same bin:          {100 * same_bin / total:.1f}%")
-    print(f"Predicted within ±2 of A:    {100 * near_same_bin / total:.1f}%")
-    print(f"Mean |predicted shift|:      {np.mean(np.abs(pred_shifts)):.2f} bins")
-    print(f"Mean |GT shift|:             {np.mean(np.abs(gt_shifts)):.2f} bins")
-    print(f"Mean shift error:            {np.mean(shift_errors):.2f} bins")
-    print(f"Correlation pred vs GT shift:{np.corrcoef(pred_shifts, gt_shifts)[0,1]:.3f}")
-
-    return pred_shifts, gt_shifts
 
 
-def geometric_translation_error(target_a, target_b, pose_gt, pose_pred, fov_degrees=90.0):
-    B, N, _ = target_a.shape
-    device, dtype = target_a.device, target_a.dtype
+def test_ransac_all_gt_new_pose(
+    loader,
+    device,
+    fov_degrees=90.0,
+    inlier_threshold=0.4,
+    num_iters=200,
+):
+    t_errors, yaw_errors = [], []
+    residuals_all = []
+    match_counts, inlier_counts = [], []
 
-    fov = torch.tensor(float(fov_degrees) * torch.pi / 180.0, device=device, dtype=dtype)
-    theta = torch.linspace(-0.5 * fov, 0.5 * fov, N, device=device, dtype=dtype)
+    def rigid_transform(A, B):
+        ca, cb = A.mean(0), B.mean(0)
+        Ac, Bc = A - ca, B - cb
 
-    def points(vision):
-        depth = vision[..., 2]
-        return torch.stack([depth * torch.cos(theta), depth * torch.sin(theta)], dim=-1)
+        dot = (Ac[:, 0] * Bc[:, 0] + Ac[:, 1] * Bc[:, 1]).sum()
+        cross = (Ac[:, 0] * Bc[:, 1] - Ac[:, 1] * Bc[:, 0]).sum()
 
-    pts_a, pts_b = points(target_a), points(target_b)
-    errors, pred_directions, gt_directions = [], [], []
+        norm = torch.sqrt(dot.square() + cross.square() + 1e-8)
+        c, s = dot / norm, cross / norm
 
-    for b in range(B):
-        occ_a = target_a[b, :, 0] > 0.5
-        occ_b = target_b[b, :, 0] > 0.5
-        ids_a = target_a[b, :, 3].round().long()
-        ids_b = target_b[b, :, 3].round().long()
+        R = torch.stack([
+            torch.stack([c, -s]),
+            torch.stack([s,  c]),
+        ])
 
-        yaw = F.normalize(pose_pred[b, 2:], dim=0)
-        s, c = yaw[0], yaw[1]
-        R = torch.stack([torch.stack([c, -s]), torch.stack([s, c])])
+        t = cb - R @ ca
+        return R, t, s, c
 
-        translations = []
-        for cid in torch.unique(ids_a[occ_a]):
-            ia = torch.where(occ_a & (ids_a == cid))[0]
-            ib = torch.where(occ_b & (ids_b == cid))[0]
+    def ransac(A, B):
+        n = len(A)
+        if n < 2:
+            return None
 
-            if ia.numel() != 1 or ib.numel() != 1:
+        best = None
+        best_count = 0
+        best_error = float("inf")
+
+        for _ in range(num_iters):
+            idx = torch.randperm(n, device=A.device)[:2]
+            R, t, _, _ = rigid_transform(A[idx], B[idx])
+
+            pred = A @ R.T + t
+            res = torch.linalg.vector_norm(pred - B, dim=-1)
+            mask = res < inlier_threshold
+            count = mask.sum().item()
+
+            if count < 2:
                 continue
 
-            pa, pb = pts_a[b, ia[0]], pts_b[b, ib[0]]
-            translations.append(pb - R @ pa)
+            error = res[mask].mean().item()
 
-        if not translations:
-            continue
+            if count > best_count or (
+                count == best_count and error < best_error
+            ):
+                best = mask
+                best_count = count
+                best_error = error
 
-        t_pred = F.normalize(torch.stack(translations).median(dim=0).values, dim=0)
-        t_gt = F.normalize(pose_gt[b, :2], dim=0)
+        if best is None:
+            return None
 
-        cos_sim = torch.clamp(torch.dot(t_pred, t_gt), -1.0, 1.0)
-        angle = torch.rad2deg(torch.acos(cos_sim))
-
-        errors.append(angle.item())
-        pred_directions.append(t_pred.cpu())
-        gt_directions.append(t_gt.cpu())
-
-    return errors, pred_directions, gt_directions
-
-
-def test_1(model, val_loader, device):
-    model.eval()
-    all_errors = []
+        R, t, s, c = rigid_transform(A[best], B[best])
+        return R, t, s, c, best
 
     with torch.no_grad():
-        for batch in val_loader:
-            img_a, vision_a, img_b, vision_b, pose_ab = (x.to(device, non_blocking=True) for x in batch)
+        for batch in loader:
+            batch = [x.to(device) for x in batch]
 
-            _, _, pose_pred = model(
-                img_a, img_b,
-                pose_vision_a=vision_a[..., :3],
-                pose_vision_b=vision_b[..., :3],
+            pairs = (
+                [(batch[1], batch[3], batch[4])]
+                if len(batch) == 5
+                else [
+                    (batch[1], batch[3], batch[4]),
+                    (batch[6], batch[8], batch[9]),
+                ]
             )
 
-            errors, _, _ = geometric_translation_error(vision_a, vision_b, pose_ab, pose_pred)
-            all_errors.extend(errors)
+            for va, vb, pose_gt in pairs:
+                Bsz, N, _ = va.shape
+                fov = torch.tensor(
+                    np.deg2rad(fov_degrees),
+                    device=device,
+                    dtype=va.dtype,
+                )
 
-    print(f"Samples evaluated: {len(all_errors)}")
-    print(f"Mean error:   {np.mean(all_errors):.2f}°")
-    print(f"Median error: {np.median(all_errors):.2f}°")
+                theta = torch.linspace(
+                    -0.5 * fov,
+                    0.5 * fov,
+                    N,
+                    device=device,
+                    dtype=va.dtype,
+                )
 
-    return all_errors
+                pts_a = torch.stack([
+                    va[..., 2] * torch.cos(theta),
+                    va[..., 2] * torch.sin(theta),
+                ], -1)
 
+                pts_b = torch.stack([
+                    vb[..., 2] * torch.cos(theta),
+                    vb[..., 2] * torch.sin(theta),
+                ], -1)
 
-def test_pred_corr_gt_yaw(model, val_loader, device):
-    model.eval()
-    all_errors = []
+                for b in range(Bsz):
+                    occ_a = va[b, :, 0] > 0.5
+                    occ_b = vb[b, :, 0] > 0.5
 
-    with torch.no_grad():
-        for batch in val_loader:
-            img_a, vision_a, img_b, vision_b, pose_ab = (x.to(device, non_blocking=True) for x in batch)
+                    ids_a = va[b, :, 3].round().long()
+                    ids_b = vb[b, :, 3].round().long()
 
-            cam_a, cam_b, patches_a, patches_b = model.backbone(img_a, img_b)
-            corr_a = model.corr_head(patches_a)
-            corr_b = model.corr_head(patches_b)
+                    A, Bpts = [], []
 
-            B, P, D = corr_a.shape
-            gh = model.pose_head.grid_h
-            gw = model.pose_head.grid_w
+                    for cid in torch.unique(ids_a[occ_a]):
+                        ia = torch.where(
+                            occ_a & (ids_a == cid)
+                        )[0]
+                        ib = torch.where(
+                            occ_b & (ids_b == cid)
+                        )[0]
 
-            a = corr_a.reshape(B, gh, gw, D).mean(dim=1)
-            b = corr_b.reshape(B, gh, gw, D).mean(dim=1)
-            a = F.normalize(a, dim=-1)
-            b = F.normalize(b, dim=-1)
+                        if ia.numel() != 1 or ib.numel() != 1:
+                            continue
 
-            sim = torch.matmul(a, b.transpose(1, 2)) / model.pose_head.temperature
-            prob_ab = F.softmax(sim, dim=-1)
+                        A.append(pts_a[b, ia[0]])
+                        Bpts.append(pts_b[b, ib[0]])
 
-            # GT depth
-            depth_a, valid_a = model.pose_head._column_depth(vision_a[..., :3])
-            depth_b, valid_b = model.pose_head._column_depth(vision_b[..., :3])
-            depth_a = depth_a.to(prob_ab.dtype)
-            depth_b = depth_b.to(prob_ab.dtype)
-            valid_a = valid_a.to(prob_ab.dtype)
-            valid_b = valid_b.to(prob_ab.dtype)
-
-            theta = model.pose_head._column_angles(prob_ab.device, prob_ab.dtype)
-            cos_theta = torch.cos(theta).unsqueeze(0)
-            sin_theta = torch.sin(theta).unsqueeze(0)
-
-            points_a = torch.stack([depth_a * cos_theta, depth_a * sin_theta], dim=-1)
-            points_b = torch.stack([depth_b * cos_theta, depth_b * sin_theta], dim=-1)
-
-            weights_ab = prob_ab * valid_b.unsqueeze(1)
-            weights_ab = weights_ab / (weights_ab.sum(dim=-1, keepdim=True) + 1e-6)
-            matched_points_b = torch.matmul(weights_ab, points_b)
-
-            # GT yaw
-            yaw = F.normalize(pose_ab[:, 2:], dim=-1)
-            sin_yaw = yaw[:, 0]
-            cos_yaw = yaw[:, 1]
-
-            ax = points_a[..., 0]
-            ay = points_a[..., 1]
-
-            rotated_a = torch.stack([
-                cos_yaw[:, None] * ax - sin_yaw[:, None] * ay,
-                sin_yaw[:, None] * ax + cos_yaw[:, None] * ay,
-            ], dim=-1)
-
-            translation_per_col = matched_points_b - rotated_a
-
-            match_mass = (prob_ab * valid_b.unsqueeze(1)).sum(dim=-1)
-            confidence = prob_ab.max(dim=-1).values
-            weights = valid_a * match_mass * confidence
-
-            t_pred = (translation_per_col * weights.unsqueeze(-1)).sum(dim=1)
-            t_pred = t_pred / (weights.sum(dim=1, keepdim=True) + 1e-6)
-            t_pred = F.normalize(t_pred, dim=-1)
-
-            t_gt = F.normalize(pose_ab[:, :2], dim=-1)
-            cos_sim = torch.clamp((t_pred * t_gt).sum(dim=-1), -1.0, 1.0)
-            errors = torch.rad2deg(torch.acos(cos_sim))
-
-            valid = weights.sum(dim=1) > 1e-6
-            all_errors.extend(errors[valid].cpu().tolist())
-
-    print("TEST 2: GT depth + predicted correspondence + GT yaw")
-    print(f"Samples evaluated: {len(all_errors)}")
-    print(f"Mean error:   {np.mean(all_errors):.2f}°")
-    print(f"Median error: {np.median(all_errors):.2f}°")
-
-    return all_errors
-
-
-
-def test_pred_depth_gt_corr_gt_yaw(model, val_loader, device):
-    model.eval()
-    all_errors = []
-
-    with torch.no_grad():
-        for batch in val_loader:
-            img_a, vision_a, img_b, vision_b, pose_ab = (x.to(device, non_blocking=True) for x in batch)
-
-            pred_vision_a, pred_vision_b, _ = model(
-                img_a, img_b,
-                pose_vision_a=vision_a[..., :3],
-                pose_vision_b=vision_b[..., :3],
-            )
-
-            B, N, _ = vision_a.shape
-            fov = torch.tensor(90.0 * torch.pi / 180.0, device=device, dtype=vision_a.dtype)
-            theta = torch.linspace(-0.5 * fov, 0.5 * fov, N, device=device, dtype=vision_a.dtype)
-
-            pred_pts_a = torch.stack([
-                pred_vision_a[..., 2] * torch.cos(theta),
-                pred_vision_a[..., 2] * torch.sin(theta),
-            ], dim=-1)
-
-            pred_pts_b = torch.stack([
-                pred_vision_b[..., 2] * torch.cos(theta),
-                pred_vision_b[..., 2] * torch.sin(theta),
-            ], dim=-1)
-
-            for b in range(B):
-                occ_a = vision_a[b, :, 0] > 0.5
-                occ_b = vision_b[b, :, 0] > 0.5
-                ids_a = vision_a[b, :, 3].round().long()
-                ids_b = vision_b[b, :, 3].round().long()
-
-                yaw = F.normalize(pose_ab[b, 2:], dim=0)
-                s, c = yaw[0], yaw[1]
-                R = torch.stack([torch.stack([c, -s]), torch.stack([s, c])])
-
-                translations = []
-
-                for cid in torch.unique(ids_a[occ_a]):
-                    ia = torch.where(occ_a & (ids_a == cid))[0]
-                    ib = torch.where(occ_b & (ids_b == cid))[0]
-
-                    if ia.numel() != 1 or ib.numel() != 1:
+                    if len(A) < 2:
                         continue
 
-                    pa = pred_pts_a[b, ia[0]]
-                    pb = pred_pts_b[b, ib[0]]
-                    translations.append(pb - R @ pa)
+                    A = torch.stack(A)
+                    Bpts = torch.stack(Bpts)
 
-                if not translations:
-                    continue
+                    result = ransac(A, Bpts)
+                    if result is None:
+                        continue
 
-                t_pred = F.normalize(torch.stack(translations).median(dim=0).values, dim=0)
-                t_gt = F.normalize(pose_ab[b, :2], dim=0)
+                    R, t_ext, s_ext, c_ext, inliers = result
 
-                cos_sim = torch.clamp(torch.dot(t_pred, t_gt), -1.0, 1.0)
-                error = torch.rad2deg(torch.acos(cos_sim))
-                all_errors.append(error.item())
+                    # RANSAC:
+                    #     p_B = R @ p_A + t_ext
+                    #
+                    # GT pose:
+                    #     Camera2 position/orientation in Camera1 frame
+                    #
+                    # Extrinsic -> camera pose:
+                    t_pose = -R.T @ t_ext
+                    s_pose = -s_ext
+                    c_pose = c_ext
 
-    print("TEST 3: predicted depth + GT correspondence + GT yaw")
-    print(f"Samples evaluated: {len(all_errors)}")
-    print(f"Mean error:   {np.mean(all_errors):.2f}°")
-    print(f"Median error: {np.median(all_errors):.2f}°")
+                    # Translation direction error
+                    t_pred = F.normalize(t_pose, dim=0)
+                    t_gt = F.normalize(pose_gt[b, :2], dim=0)
 
-    return all_errors
+                    cos_t = torch.clamp(
+                        torch.dot(t_pred, t_gt), -1.0, 1.0
+                    )
+                    t_err = torch.rad2deg(torch.acos(cos_t))
 
-def _debug_rigid_transform_2d(A, B):
-    ca = A.mean(dim=0)
-    cb = B.mean(dim=0)
-    Ac = A - ca
-    Bc = B - cb
-    dot = (Ac[:, 0] * Bc[:, 0] + Ac[:, 1] * Bc[:, 1]).sum()
-    cross = (Ac[:, 0] * Bc[:, 1] - Ac[:, 1] * Bc[:, 0]).sum()
-    norm = torch.sqrt(dot.square() + cross.square() + 1e-8)
-    c = dot / norm
-    s = cross / norm
-    R = torch.stack([
-        torch.stack([c, -s]),
-        torch.stack([s, c]),
-    ])
-    t = cb - R @ ca
-    return R, t, s, c
+                    # Yaw error
+                    yaw_gt = F.normalize(
+                        pose_gt[b, 2:], dim=0
+                    )
 
+                    yaw_pred_angle = torch.atan2(
+                        s_pose, c_pose
+                    )
+                    yaw_gt_angle = torch.atan2(
+                        yaw_gt[0], yaw_gt[1]
+                    )
 
-def _debug_ransac_rigid_2d(A, B, num_iters=200, inlier_threshold=0.4):
-    n = A.shape[0]
-    if n < 2:
-        return None
+                    dyaw = torch.atan2(
+                        torch.sin(yaw_pred_angle - yaw_gt_angle),
+                        torch.cos(yaw_pred_angle - yaw_gt_angle),
+                    )
 
-    best_inliers = None
-    best_count = 0
-    best_error = float("inf")
+                    yaw_err = torch.abs(
+                        torch.rad2deg(dyaw)
+                    )
 
-    for _ in range(num_iters):
-        idx = torch.randperm(n, device=A.device)[:2]
-        R, t, _, _ = _debug_rigid_transform_2d(A[idx], B[idx])
-        pred_B = A @ R.T + t
-        residuals = torch.linalg.vector_norm(pred_B - B, dim=-1)
-        inliers = residuals < inlier_threshold
-        count = inliers.sum().item()
-        if count < 2:
-            continue
-        mean_error = residuals[inliers].mean().item()
-        if count > best_count or (count == best_count and mean_error < best_error):
-            best_count = count
-            best_error = mean_error
-            best_inliers = inliers
+                    # Final geometric residual
+                    pred_B = A @ R.T + t_ext
+                    residual = torch.linalg.vector_norm(
+                        pred_B - Bpts, dim=-1
+                    )
 
-    if best_inliers is None or best_inliers.sum() < 2:
-        return None
+                    t_errors.append(t_err.item())
+                    yaw_errors.append(yaw_err.item())
+                    residuals_all.extend(residual.cpu().tolist())
+                    match_counts.append(len(A))
+                    inlier_counts.append(inliers.sum().item())
 
-    R, t, s, c = _debug_rigid_transform_2d(A[best_inliers], B[best_inliers])
-    return R, t, s, c, best_inliers
+    print("ALL-GT RANSAC — NEW POSE DEFINITION")
+    print("-" * 55)
+    print(f"Samples:              {len(t_errors)}")
+    print(f"Mean matches/sample:  {np.mean(match_counts):.1f}")
+    print(f"Mean inliers/sample:  {np.mean(inlier_counts):.1f}")
+    print(f"Translation mean:     {np.mean(t_errors):.2f}°")
+    print(f"Translation median:   {np.median(t_errors):.2f}°")
+    print(f"Yaw mean:             {np.mean(yaw_errors):.2f}°")
+    print(f"Yaw median:           {np.median(yaw_errors):.2f}°")
+    print(f"Point residual mean:  {np.mean(residuals_all):.4f} m")
+    print(f"Point residual median:{np.median(residuals_all):.4f} m")
 
+    return {
+        "translation_errors": t_errors,
+        "yaw_errors": yaw_errors,
+        "residuals": residuals_all,
+    }
 
 def test_ransac_geometry_ablation_gt_coarse(
     model,
     loader,
     device,
-    search_radius=16,
-    num_iters=200,
+    occ_thresh=0.5,
     inlier_threshold=0.4,
-    gt_occ_thresh=0.5,
-    pred_occ_thresh=0.05,
+    num_iters=200,
     fov_degrees=90.0,
 ):
-    """
-    Isolerar den predikterade cylindergeometrin med perfekt coarse correspondence.
-
-    GT cylinder-ID används ENDAST för att ange korrekt coarse center i B.
-    Fine matching använder radius från vald konfiguration och RANSAC använder
-    punktgeometri från vald depth-konfiguration.
-
-    Konfigurationer:
-      - All GT
-      - Pred depth only
-      - Pred radius only
-      - Pred occupancy only
-      - All predicted
-    """
     model.eval()
 
-    configs = {
-        "All GT": (True, True, True),
-        "Pred depth only": (True, True, False),
-        "Pred radius only": (True, False, True),
-        "Pred occupancy only": (False, True, True),
-        "All predicted": (False, False, False),
-    }
+    configs = [
+        ("All GT",              False, False, False),
+        ("Pred depth only",     True,  False, False),
+        ("Pred radius only",    False, True,  False),
+        ("Pred occupancy only", False, False, True),
+        ("All predicted",       True,  True,  True),
+    ]
 
-    results = {
-        name: {"t": [], "yaw": [], "matches": [], "inliers": [], "zeros": 0}
-        for name in configs
-    }
+    results = {}
 
-    with torch.no_grad():
-        for batch in loader:
-            img_a, gt_a, img_b, gt_b, pose_gt = (
-                x.to(device, non_blocking=True) for x in batch
-            )
+    # --------------------------------------------------
+    # Rigid transform: p_B = R @ p_A + t_ext
+    # --------------------------------------------------
+    def rigid_transform(A, B):
+        ca, cb = A.mean(0), B.mean(0)
+        Ac, Bc = A - ca, B - cb
 
-            _, _, patches_a, patches_b = model.backbone(img_a, img_b)
-            pred_a = model.vision_head(patches_a)
-            pred_b = model.vision_head(patches_b)
+        dot = (Ac[:, 0] * Bc[:, 0] + Ac[:, 1] * Bc[:, 1]).sum()
+        cross = (Ac[:, 0] * Bc[:, 1] - Ac[:, 1] * Bc[:, 0]).sum()
 
-            B, N, _ = gt_a.shape
-            dtype = pred_a.dtype
-            dev = pred_a.device
+        norm = torch.sqrt(dot.square() + cross.square() + 1e-8)
+        c, s = dot / norm, cross / norm
 
-            fov = torch.tensor(
-                float(fov_degrees) * torch.pi / 180.0,
-                device=dev,
-                dtype=dtype,
-            )
-            theta = torch.linspace(
-                -0.5 * fov,
-                0.5 * fov,
-                N,
-                device=dev,
-                dtype=dtype,
-            )
-            cos_theta = torch.cos(theta)
-            sin_theta = torch.sin(theta)
+        R = torch.stack([
+            torch.stack([c, -s]),
+            torch.stack([s,  c]),
+        ])
 
-            for name, (use_gt_occ, use_gt_radius, use_gt_depth) in configs.items():
-                occ_a_values = gt_a[..., 0] if use_gt_occ else pred_a[..., 0]
-                occ_b_values = gt_b[..., 0] if use_gt_occ else pred_b[..., 0]
-                occ_threshold = gt_occ_thresh if use_gt_occ else pred_occ_thresh
+        t_ext = cb - R @ ca
+        return R, t_ext, s, c
 
-                radius_a_values = gt_a[..., 1] if use_gt_radius else pred_a[..., 1]
-                radius_b_values = gt_b[..., 1] if use_gt_radius else pred_b[..., 1]
-                depth_a_values = gt_a[..., 2] if use_gt_depth else pred_a[..., 2]
-                depth_b_values = gt_b[..., 2] if use_gt_depth else pred_b[..., 2]
+    def ransac(A, B):
+        n = A.shape[0]
+        if n < 2:
+            return None
 
-                pts_a = torch.stack([
-                    depth_a_values * cos_theta,
-                    depth_a_values * sin_theta,
-                ], dim=-1)
-                pts_b = torch.stack([
-                    depth_b_values * cos_theta,
-                    depth_b_values * sin_theta,
-                ], dim=-1)
+        best_mask = None
+        best_count = 0
+        best_error = float("inf")
 
-                for b in range(B):
-                    gt_occ_a = gt_a[b, :, 0] > gt_occ_thresh
-                    gt_occ_b = gt_b[b, :, 0] > gt_occ_thresh
-                    active_a = occ_a_values[b] > occ_threshold
-                    active_b = occ_b_values[b] > occ_threshold
-                    ids_a = gt_a[b, :, 3].round().long()
-                    ids_b = gt_b[b, :, 3].round().long()
+        for _ in range(num_iters):
+            idx = torch.randperm(n, device=A.device)[:2]
+            R, t, _, _ = rigid_transform(A[idx], B[idx])
 
-                    matched_a = []
-                    matched_b = []
+            pred = A @ R.T + t
+            residuals = torch.linalg.vector_norm(pred - B, dim=-1)
 
-                    for ia_gt in torch.where(gt_occ_a)[0]:
-                        same_id_b = torch.where(gt_occ_b & (ids_b == ids_a[ia_gt]))[0]
-                        if same_id_b.numel() != 1:
-                            continue
+            mask = residuals < inlier_threshold
+            count = mask.sum().item()
 
-                        # Perfect coarse correspondence: true B bin is only the search center.
-                        ib_gt = same_id_b[0]
+            if count < 2:
+                continue
 
-                        # If occupancy is predicted, it decides whether the A cylinder is active.
-                        if not active_a[ia_gt]:
-                            continue
+            error = residuals[mask].mean().item()
 
-                        center = ib_gt.item()
-                        lo = max(0, center - search_radius)
-                        hi = min(N, center + search_radius + 1)
-                        candidates = torch.arange(lo, hi, device=dev)
-                        candidates = candidates[active_b[candidates]]
-                        if candidates.numel() == 0:
-                            continue
+            if count > best_count or (
+                count == best_count and error < best_error
+            ):
+                best_mask = mask
+                best_count = count
+                best_error = error
 
-                        # Fine matching uses GT or predicted radius according to config.
-                        radius_a = radius_a_values[b, ia_gt]
-                        radius_diff = torch.abs(radius_b_values[b, candidates] - radius_a)
-                        ib = candidates[radius_diff.argmin()]
+        if best_mask is None:
+            return None
 
-                        matched_a.append(pts_a[b, ia_gt])
-                        matched_b.append(pts_b[b, ib])
+        R, t, s, c = rigid_transform(
+            A[best_mask],
+            B[best_mask],
+        )
 
-                    if len(matched_a) < 2:
-                        results[name]["zeros"] += 1
-                        continue
+        return R, t, s, c, best_mask
 
-                    A = torch.stack(matched_a)
-                    Bpts = torch.stack(matched_b)
-                    ransac = _debug_ransac_rigid_2d(
-                        A,
-                        Bpts,
-                        num_iters=num_iters,
-                        inlier_threshold=inlier_threshold,
+    # --------------------------------------------------
+    # Evaluate one configuration
+    # --------------------------------------------------
+    def evaluate(use_pred_depth, use_pred_radius, use_pred_occ):
+        t_errors, yaw_errors = [], []
+        matches_all, inliers_all = [], []
+        zeros = 0
+
+        with torch.no_grad():
+            for batch in loader:
+                batch = [
+                    x.to(device, non_blocking=True)
+                    for x in batch
+                ]
+
+                pairs = (
+                    [(batch[0], batch[1], batch[2], batch[3], batch[4])]
+                    if len(batch) == 5
+                    else [
+                        (batch[0], batch[1], batch[2], batch[3], batch[4]),
+                        (batch[5], batch[6], batch[7], batch[8], batch[9]),
+                    ]
+                )
+
+                for img_a, gt_a, img_b, gt_b, pose_gt in pairs:
+                    pred_a, pred_b, _ = model(img_a, img_b)
+
+                    Bsz, N, _ = gt_a.shape
+                    dtype = gt_a.dtype
+
+                    fov = torch.tensor(
+                        np.deg2rad(fov_degrees),
+                        device=device,
+                        dtype=dtype,
                     )
-                    if ransac is None:
-                        results[name]["zeros"] += 1
-                        continue
 
-                    R, t, s, c, inliers = ransac
-                    t_pred = F.normalize(t, dim=0)
-                    t_gt = F.normalize(pose_gt[b, :2], dim=0)
-                    t_cos = torch.clamp(torch.dot(t_pred, t_gt), -1.0, 1.0)
-                    t_error = torch.rad2deg(torch.acos(t_cos)).item()
+                    theta = torch.linspace(
+                        -0.5 * fov,
+                        0.5 * fov,
+                        N,
+                        device=device,
+                        dtype=dtype,
+                    )
 
-                    yaw_pred = torch.stack([s, c])
-                    yaw_gt = F.normalize(pose_gt[b, 2:], dim=0)
-                    yaw_cos = torch.clamp(torch.dot(yaw_pred, yaw_gt), -1.0, 1.0)
-                    yaw_error = torch.rad2deg(torch.acos(yaw_cos)).item()
+                    # Geometry source
+                    depth_a = pred_a[..., 2] if use_pred_depth else gt_a[..., 2]
+                    depth_b = pred_b[..., 2] if use_pred_depth else gt_b[..., 2]
 
-                    results[name]["t"].append(t_error)
-                    results[name]["yaw"].append(yaw_error)
-                    results[name]["matches"].append(A.shape[0])
-                    results[name]["inliers"].append(inliers.sum().item())
+                    radius_a = pred_a[..., 1] if use_pred_radius else gt_a[..., 1]
+                    radius_b = pred_b[..., 1] if use_pred_radius else gt_b[..., 1]
 
-    print("RANSAC GEOMETRY ABLATION - GT COARSE")
+                    occ_a = pred_a[..., 0] if use_pred_occ else gt_a[..., 0]
+                    occ_b = pred_b[..., 0] if use_pred_occ else gt_b[..., 0]
+
+                    pts_a = torch.stack([
+                        depth_a * torch.cos(theta),
+                        depth_a * torch.sin(theta),
+                    ], dim=-1)
+
+                    pts_b = torch.stack([
+                        depth_b * torch.cos(theta),
+                        depth_b * torch.sin(theta),
+                    ], dim=-1)
+
+                    for b in range(Bsz):
+                        # GT cylinder IDs define correspondence.
+                        # "GT coarse" means we are isolating geometry,
+                        # not testing learned correspondence here.
+                        ids_a = gt_a[b, :, 3].round().long()
+                        ids_b = gt_b[b, :, 3].round().long()
+
+                        if use_pred_occ:
+                            mask_a = occ_a[b] > 0.05
+                            mask_b = occ_b[b] > 0.05
+                        else:
+                            mask_a = occ_a[b] > occ_thresh
+                            mask_b = occ_b[b] > occ_thresh
+
+                        A, Bpts = [], []
+
+                        for cid in torch.unique(ids_a[gt_a[b, :, 0] > occ_thresh]):
+                            ia = torch.where(
+                                mask_a & (ids_a == cid)
+                            )[0]
+
+                            ib = torch.where(
+                                mask_b & (ids_b == cid)
+                            )[0]
+
+                            if ia.numel() != 1 or ib.numel() != 1:
+                                continue
+
+                            # Radius ablation:
+                            # with predicted radius, only keep matches whose
+                            # predicted radii are reasonably compatible.
+                            if use_pred_radius:
+                                ra = radius_a[b, ia[0]]
+                                rb = radius_b[b, ib[0]]
+
+                                rel_diff = torch.abs(ra - rb) / (
+                                    torch.maximum(ra, rb) + 1e-6
+                                )
+
+                                if rel_diff > 0.5:
+                                    continue
+
+                            A.append(pts_a[b, ia[0]])
+                            Bpts.append(pts_b[b, ib[0]])
+
+                        matches_all.append(len(A))
+
+                        if len(A) < 2:
+                            zeros += 1
+                            continue
+
+                        A = torch.stack(A)
+                        Bpts = torch.stack(Bpts)
+
+                        result = ransac(A, Bpts)
+
+                        if result is None:
+                            zeros += 1
+                            continue
+
+                        R, t_ext, s_ext, c_ext, inliers = result
+                        inliers_all.append(inliers.sum().item())
+
+                        # ------------------------------------------
+                        # Extrinsic A->B -> Camera2 pose in A
+                        # ------------------------------------------
+                        t_pose = -R.T @ t_ext
+                        t_pose = F.normalize(t_pose, dim=0)
+
+                        s_pose = -s_ext
+                        c_pose = c_ext
+
+                        # Translation direction error
+                        t_gt = F.normalize(
+                            pose_gt[b, :2],
+                            dim=0,
+                        )
+
+                        cos_t = torch.clamp(
+                            torch.dot(t_pose, t_gt),
+                            -1.0,
+                            1.0,
+                        )
+
+                        t_err = torch.rad2deg(
+                            torch.acos(cos_t)
+                        )
+
+                        # Yaw error
+                        yaw_gt = F.normalize(
+                            pose_gt[b, 2:],
+                            dim=0,
+                        )
+
+                        yaw_pred_angle = torch.atan2(
+                            s_pose,
+                            c_pose,
+                        )
+
+                        yaw_gt_angle = torch.atan2(
+                            yaw_gt[0],
+                            yaw_gt[1],
+                        )
+
+                        dyaw = torch.atan2(
+                            torch.sin(yaw_pred_angle - yaw_gt_angle),
+                            torch.cos(yaw_pred_angle - yaw_gt_angle),
+                        )
+
+                        yaw_err = torch.abs(
+                            torch.rad2deg(dyaw)
+                        )
+
+                        t_errors.append(t_err.item())
+                        yaw_errors.append(yaw_err.item())
+
+        return {
+            "t_mean": np.mean(t_errors) if t_errors else np.nan,
+            "t_median": np.median(t_errors) if t_errors else np.nan,
+            "t_p90": np.percentile(t_errors, 90) if t_errors else np.nan,
+            "yaw_mean": np.mean(yaw_errors) if yaw_errors else np.nan,
+            "yaw_median": np.median(yaw_errors) if yaw_errors else np.nan,
+            "matches": np.mean(matches_all) if matches_all else 0,
+            "inliers": np.mean(inliers_all) if inliers_all else 0,
+            "zeros": zeros,
+        }
+
+    # --------------------------------------------------
+    # Run all ablations
+    # --------------------------------------------------
+    for name, pd, pr, po in configs:
+        results[name] = evaluate(pd, pr, po)
+
+    print("RANSAC GEOMETRY ABLATION - GT COARSE — NEW POSE")
     print("-" * 112)
+
     print(
         f"{'Configuration':<24}"
         f"{'T mean':>9}"
@@ -846,21 +933,189 @@ def test_ransac_geometry_ablation_gt_coarse(
         f"{'Zeros':>8}"
     )
 
-    for name in configs:
+    for name, *_ in configs:
         r = results[name]
-        if len(r["t"]) == 0:
-            print(f"{name:<24}{'NO VALID SAMPLES':>40}{r['zeros']:>8}")
-            continue
+
         print(
             f"{name:<24}"
-            f"{np.mean(r['t']):>9.2f}"
-            f"{np.median(r['t']):>9.2f}"
-            f"{np.percentile(r['t'], 90):>9.2f}"
-            f"{np.mean(r['yaw']):>10.2f}"
-            f"{np.median(r['yaw']):>9.2f}"
-            f"{np.mean(r['matches']):>10.1f}"
-            f"{np.mean(r['inliers']):>10.1f}"
-            f"{r['zeros']:>8}"
+            f"{r['t_mean']:9.2f}"
+            f"{r['t_median']:9.2f}"
+            f"{r['t_p90']:9.2f}"
+            f"{r['yaw_mean']:10.2f}"
+            f"{r['yaw_median']:9.2f}"
+            f"{r['matches']:10.1f}"
+            f"{r['inliers']:10.1f}"
+            f"{r['zeros']:8d}"
         )
 
     return results
+
+def test_gt_coarse_corr_ransac(
+    model,
+    loader,
+    device,
+    occ_thresh=0.5,
+    fov_degrees=90.0,
+):
+    t_errors, yaw_errors = [], []
+
+    with torch.no_grad():
+        for batch in loader:
+            batch = [x.to(device) for x in batch]
+
+            pairs = [(batch[1], batch[3], batch[4])] if len(batch) == 5 else [
+                (batch[1], batch[3], batch[4]),
+                (batch[6], batch[8], batch[9]),
+            ]
+
+            for va, vb, pose_gt in pairs:
+                B, N, _ = va.shape
+                fov = torch.tensor(
+                    np.deg2rad(fov_degrees),
+                    device=device,
+                    dtype=va.dtype,
+                )
+
+                theta = torch.linspace(
+                    -0.5 * fov, 0.5 * fov, N,
+                    device=device, dtype=va.dtype,
+                )
+
+                pts_a = torch.stack([
+                    va[..., 2] * torch.cos(theta),
+                    va[..., 2] * torch.sin(theta),
+                ], -1)
+
+                pts_b = torch.stack([
+                    vb[..., 2] * torch.cos(theta),
+                    vb[..., 2] * torch.sin(theta),
+                ], -1)
+
+                for b in range(B):
+                    occ_a = va[b, :, 0] > occ_thresh
+                    occ_b = vb[b, :, 0] > occ_thresh
+                    ids_a = va[b, :, 3].round().long()
+                    ids_b = vb[b, :, 3].round().long()
+
+                    # Grupp: A image-column -> möjliga GT B-punkter
+                    matches = []
+
+                    for cid in torch.unique(ids_a[occ_a]):
+                        ia = torch.where(occ_a & (ids_a == cid))[0]
+                        ib = torch.where(occ_b & (ids_b == cid))[0]
+
+                        if ia.numel() != 1 or ib.numel() != 1:
+                            continue
+
+                        theta_a = theta[ia[0]]
+                        theta_b = theta[ib[0]]
+
+                        xa = (
+                            0.5
+                            - 0.5 * torch.tan(theta_a)
+                            / torch.tan(0.5 * fov)
+                        )
+                        xb = (
+                            0.5
+                            - 0.5 * torch.tan(theta_b)
+                            / torch.tan(0.5 * fov)
+                        )
+
+                        ca = torch.clamp((xa * 16).long(), 0, 15)
+                        cb = torch.clamp((xb * 16).long(), 0, 15)
+
+                        matches.append((
+                            ca.item(), cb.item(),
+                            pts_a[b, ia[0]],
+                            pts_b[b, ib[0]],
+                        ))
+
+                    # PoseHead har bara en match per A-column.
+                    # Efterlikna det: medelvärde om flera cylindrar
+                    # hamnar i samma coarse pair.
+                    grouped = {}
+
+                    for ca, cb, pa, pb in matches:
+                        grouped.setdefault((ca, cb), [[], []])
+                        grouped[(ca, cb)][0].append(pa)
+                        grouped[(ca, cb)][1].append(pb)
+
+                    if len(grouped) < 2:
+                        continue
+
+                    A, Bpts = [], []
+
+                    for _, (aa, bb) in grouped.items():
+                        A.append(torch.stack(aa).mean(0))
+                        Bpts.append(torch.stack(bb).mean(0))
+
+                    A = torch.stack(A)
+                    Bpts = torch.stack(Bpts)
+
+                    # Direct rigid alignment
+                    ca = A.mean(0)
+                    cb = Bpts.mean(0)
+                    Ac = A - ca
+                    Bc = Bpts - cb
+
+                    dot = (
+                        Ac[:, 0] * Bc[:, 0]
+                        + Ac[:, 1] * Bc[:, 1]
+                    ).sum()
+
+                    cross = (
+                        Ac[:, 0] * Bc[:, 1]
+                        - Ac[:, 1] * Bc[:, 0]
+                    ).sum()
+
+                    norm = torch.sqrt(
+                        dot.square() + cross.square() + 1e-8
+                    )
+
+                    c_ext = dot / norm
+                    s_ext = cross / norm
+
+                    R = torch.stack([
+                        torch.stack([c_ext, -s_ext]),
+                        torch.stack([s_ext,  c_ext]),
+                    ])
+
+                    t_ext = cb - R @ ca
+
+                    # Extrinsic -> Camera2 pose in Camera1
+                    t_pose = -R.T @ t_ext
+                    t_pose = F.normalize(t_pose, dim=0)
+
+                    yaw_pose = torch.stack([-s_ext, c_ext])
+
+                    gt_t = F.normalize(pose_gt[b, :2], dim=0)
+                    gt_yaw = F.normalize(pose_gt[b, 2:], dim=0)
+
+                    t_cos = torch.clamp(
+                        torch.dot(t_pose, gt_t), -1, 1
+                    )
+                    t_errors.append(
+                        torch.rad2deg(torch.acos(t_cos)).item()
+                    )
+
+                    yp = torch.atan2(yaw_pose[0], yaw_pose[1])
+                    yg = torch.atan2(gt_yaw[0], gt_yaw[1])
+
+                    dy = torch.atan2(
+                        torch.sin(yp - yg),
+                        torch.cos(yp - yg),
+                    )
+
+                    yaw_errors.append(
+                        torch.abs(torch.rad2deg(dy)).item()
+                    )
+
+    print("GT COARSE CORRESPONDENCE -> RIGID POSE")
+    print("-" * 55)
+    print(f"Samples:            {len(t_errors)}")
+    print(f"Translation mean:   {np.mean(t_errors):.2f}°")
+    print(f"Translation median: {np.median(t_errors):.2f}°")
+    print(f"Yaw mean:           {np.mean(yaw_errors):.2f}°")
+    print(f"Yaw median:         {np.median(yaw_errors):.2f}°")
+
+    return t_errors, yaw_errors
