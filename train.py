@@ -180,11 +180,11 @@ def validate(
     lambda_occ,
     lambda_radius,
     lambda_corr,
+    lambda_depth_structure,
 ):
-    """Validation mirrors the current train_v2.ipynb validation cell.
-
-    Note that train_v2.ipynb does NOT include relative_depth_structure_loss in
-    val_total, even though it is included in the training objective.
+    """Validation uses the same objective as training:
+    vision + lambda_corr * correspondence
+    + lambda_depth_structure * relative depth structure.
     """
     model.eval()
 
@@ -247,8 +247,21 @@ def validate(
                 corr_a, vision_a, corr_b, vision_b
             )
 
-            # Exactly the current notebook validation objective.
-            total_loss = vision_loss_total + lambda_corr * corr_loss
+            depth_structure_loss = 0.5 * (
+                relative_depth_structure_loss(
+                    pred_vision_a, vision_a, occ_thresh
+                )
+                + relative_depth_structure_loss(
+                    pred_vision_b, vision_b, occ_thresh
+                )
+            )
+
+            # Same objective and weights as training.
+            total_loss = (
+                vision_loss_total
+                + lambda_corr * corr_loss
+                + lambda_depth_structure * depth_structure_loss
+            )
 
         radius_a, position_a = relative_cylinder_errors(
             pred_vision_a, vision_a, occ_thresh
@@ -402,8 +415,7 @@ def main():
     parser.add_argument("--lambda-radius", type=float, default=10.0)
     parser.add_argument("--occ-thresh", type=float, default=0.5)
 
-    # Effective value in the current notebook training cell is 1.0:
-    # it overwrites the earlier configuration value 0.2 immediately before training.
+    # Effective training value is 1.0.
     parser.add_argument("--lambda-corr", type=float, default=1.0)
     parser.add_argument("--lambda-depth-structure", type=float, default=0.5)
 
@@ -522,6 +534,7 @@ def main():
                 lambda_occ=args.lambda_occ,
                 lambda_radius=args.lambda_radius,
                 lambda_corr=args.lambda_corr,
+                lambda_depth_structure=args.lambda_depth_structure,
             )
             append_val_history(history, epoch_num, val_metrics)
 
