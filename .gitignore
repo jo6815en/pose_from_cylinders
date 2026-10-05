@@ -2,6 +2,7 @@ __pycache__/
 .env
 .codex
 venv/
+.venv/
 data/
 dataset/
 dataset_no_background/
