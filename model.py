@@ -404,38 +404,94 @@ class PoseHead(nn.Module):
         self.temperature = temperature
         self.fov_degrees = fov_degrees
 
-    def _sample_geometry(self, vision, theta):
+    def _geometry_to_columns(self, vision):
         """
-        Sample depth + occupancy continuously from the 128 cylinder bins.
-        theta: [B, M] in radians
+        Sparse geometry bins -> coarse image columns.
+
+        vision: [B, N, 3]
+        returns:
+            points: [B, grid_w, 2]
+            occ:    [B, grid_w]
         """
         B, N, _ = vision.shape
-        fov = self.fov_degrees * torch.pi / 180.0
+        device, dtype = vision.device, vision.dtype
 
-        # theta -> continuous cylinder-bin coordinate
-        u = (theta + 0.5 * fov) / fov * (N - 1)
-        u = u.clamp(0, N - 1)
+        fov = torch.tensor(
+            self.fov_degrees * torch.pi / 180.0,
+            device=device,
+            dtype=dtype,
+        )
 
-        i0 = torch.floor(u).long()
-        i1 = torch.clamp(i0 + 1, max=N - 1)
-        alpha = u - i0.to(u.dtype)
+        # Geometry-bin angles
+        theta = torch.linspace(
+            -0.5 * fov,
+            0.5 * fov,
+            N,
+            device=device,
+            dtype=dtype,
+        )
 
-        depth = vision[..., 2]
+        # Same theta -> image-x mapping used elsewhere
+        x = (
+            0.5
+            - 0.5
+            * torch.tan(theta)
+            / torch.tan(0.5 * fov)
+        )
+
+        cols = torch.clamp(
+            (x * self.grid_w).long(),
+            0,
+            self.grid_w - 1,
+        )
+
         occ = vision[..., 0]
+        depth = vision[..., 2]
 
-        d0 = torch.gather(depth, 1, i0)
-        d1 = torch.gather(depth, 1, i1)
-        o0 = torch.gather(occ, 1, i0)
-        o1 = torch.gather(occ, 1, i1)
+        points = torch.zeros(
+            B, self.grid_w, 2,
+            device=device,
+            dtype=dtype,
+        )
 
-        sampled_depth = (1.0 - alpha) * d0 + alpha * d1
-        sampled_occ = (1.0 - alpha) * o0 + alpha * o1
+        col_occ = torch.zeros(
+            B, self.grid_w,
+            device=device,
+            dtype=dtype,
+        )
 
-        points = torch.stack([
-            sampled_depth * torch.cos(theta), sampled_depth * torch.sin(theta),
-        ], dim=-1)
+        # Only 16 iterations, so this is cheap.
+        for col in range(self.grid_w):
+            bin_mask = cols == col
 
-        return points, sampled_occ
+            if not bin_mask.any():
+                continue
+
+            bin_idx = torch.where(bin_mask)[0]
+
+            # [B, bins_in_column]
+            occ_here = occ[:, bin_idx]
+
+            # Strongest occupied geometry bin in this column
+            best_local = occ_here.argmax(dim=1)
+            best_idx = bin_idx[best_local]
+
+            batch_idx = torch.arange(B, device=device)
+
+            best_occ = occ[batch_idx, best_idx]
+            best_depth = depth[batch_idx, best_idx]
+            best_theta = theta[best_idx]
+
+            points[:, col, 0] = (
+                best_depth * torch.cos(best_theta)
+            )
+            points[:, col, 1] = (
+                best_depth * torch.sin(best_theta)
+            )
+
+            col_occ[:, col] = best_occ
+
+        return points, col_occ
 
     def forward(
         self,
@@ -448,94 +504,192 @@ class PoseHead(nn.Module):
         gt_prob_ab=None,
         gt_prob_ba=None,
     ):
-        B = corr_a.shape[0]
-        device = corr_a.device
-        dtype = corr_a.dtype
+        B = vision_a.shape[0]
+        device = vision_a.device
+        dtype = vision_a.dtype
 
-        # Do not let pose loss dominate correspondence learning
+        # --------------------------------------------------
+        # 1. Geometry bins -> 16 actual geometry columns
+        # --------------------------------------------------
+
+        points_a, occ_a = self._geometry_to_columns(vision_a)
+        points_b, occ_b = self._geometry_to_columns(vision_b)
+
+        # --------------------------------------------------
+        # 2. Coarse correspondence
+        # --------------------------------------------------
+
         corr_a = F.normalize(corr_a.detach(), dim=-1)
         corr_b = F.normalize(corr_b.detach(), dim=-1)
 
-        # 16x16 visual correspondence
-        sim = torch.matmul(corr_a, corr_b.transpose(1, 2)) / self.temperature
+        sim = torch.matmul(
+            corr_a,
+            corr_b.transpose(1, 2),
+        ) / self.temperature
+
         prob_ab = F.softmax(sim, dim=-1)
 
         if gt_prob_ab is not None:
-            prob_ab = gt_prob_ab.to(device=device, dtype=dtype)
+            prob_ab = gt_prob_ab.to(
+                device=device,
+                dtype=dtype,
+            )
 
-        # Image-column centres
-        x = (torch.arange(self.grid_w, device=device, dtype=dtype) + 0.5) / self.grid_w
+        # --------------------------------------------------
+        # 3. Match each A column to a B point
+        # --------------------------------------------------
 
-        fov = torch.tensor(
-            self.fov_degrees * torch.pi / 180.0,
-            device=device,
-            dtype=dtype,
+        # Do not allow correspondence mass to empty B columns.
+        valid_b = (occ_b > 0.25).to(dtype)
+
+        match_prob = prob_ab * valid_b.unsqueeze(1)
+
+        match_prob = match_prob / (
+            match_prob.sum(dim=-1, keepdim=True) + 1e-8
         )
 
-        # Image x -> cylinder angle
-        theta_a = torch.atan((1.0 - 2.0 * x) * torch.tan(0.5 * fov))
+        matched_b = torch.matmul(
+            match_prob,
+            points_b,
+        )
 
-        theta_a = theta_a.unsqueeze(0).expand(B, -1)
-
-        # Local soft expectation around the strongest match
-        peak = prob_ab.argmax(dim=-1)
-
-        coords = torch.arange(self.grid_w, device=device, dtype=dtype)
-
-        distance = torch.abs(coords.view(1, 1, self.grid_w) - peak.unsqueeze(-1))
-
-        mask = (distance <= 1).to(prob_ab.dtype)
-
-        local_prob = prob_ab * mask
-        local_prob = local_prob / (local_prob.sum(dim=-1, keepdim=True) + 1e-8)
-
-        # Continuous image coordinate [0, 1]
-        x_coords = (torch.arange(self.grid_w, device=device, dtype=dtype) + 0.5) / self.grid_w
-
-        x_b = torch.matmul(local_prob, x_coords)
-
-        # Continuous expected B angle
-        theta_b = torch.atan((1.0 - 2.0 * x_b) * torch.tan(0.5 * fov))
-
-        # Sample full 128-bin geometry at these continuous angles
-        points_a, occ_a = self._sample_geometry(vision_a, theta_a)
-        points_b, occ_b = self._sample_geometry(vision_b, theta_b)
+        # How much valid B mass existed for each A column?
+        match_mass = (
+            prob_ab * valid_b.unsqueeze(1)
+        ).sum(dim=-1)
 
         confidence = prob_ab.max(dim=-1).values
-        weights = occ_a * occ_b * confidence
-        weights = weights / (weights.sum(dim=1, keepdim=True) + 1e-6)
 
-        # Weighted centroids
-        centroid_a = (points_a * weights.unsqueeze(-1)).sum(dim=1)
-        centroid_b = (points_b * weights.unsqueeze(-1)).sum(dim=1)
+        # Only actual occupied A columns participate.
+        weights = (
+            occ_a
+            * match_mass
+            * confidence
+        )
 
-        ac = points_a - centroid_a.unsqueeze(1)
-        bc = points_b - centroid_b.unsqueeze(1)
+        weights = torch.where(
+            occ_a > 0.25,
+            weights,
+            torch.zeros_like(weights),
+        )
 
-        ax, ay = ac[..., 0], ac[..., 1]
-        bx, by = bc[..., 0], bc[..., 1]
+        weight_sum = weights.sum(
+            dim=1,
+            keepdim=True,
+        )
 
-        dot = (weights * (ax * bx + ay * by)).sum(dim=1)
-        cross = (weights * (ax * by - ay * bx)).sum(dim=1)
+        w = weights / (weight_sum + 1e-8)
 
-        norm = torch.sqrt(dot.square() + cross.square() + 1e-8)
+        # --------------------------------------------------
+        # 4. Weighted centroids
+        # --------------------------------------------------
 
-        cos_yaw = dot / norm
-        sin_yaw = cross / norm
+        centroid_a = (
+            points_a * w.unsqueeze(-1)
+        ).sum(dim=1)
 
-        yaw = torch.stack([sin_yaw, cos_yaw], dim=-1)
+        centroid_b = (
+            matched_b * w.unsqueeze(-1)
+        ).sum(dim=1)
 
-        ca_x = centroid_a[:, 0]
-        ca_y = centroid_a[:, 1]
+        Ac = points_a - centroid_a.unsqueeze(1)
+        Bc = matched_b - centroid_b.unsqueeze(1)
 
-        rotated_a = torch.stack([
-            cos_yaw * ca_x - sin_yaw * ca_y, sin_yaw * ca_x + cos_yaw * ca_y,
+        # --------------------------------------------------
+        # 5. Weighted rigid rotation A -> B
+        # --------------------------------------------------
+
+        ax, ay = Ac[..., 0], Ac[..., 1]
+        bx, by = Bc[..., 0], Bc[..., 1]
+
+        dot = (
+            w * (ax * bx + ay * by)
+        ).sum(dim=1)
+
+        cross = (
+            w * (ax * by - ay * bx)
+        ).sum(dim=1)
+
+        norm = torch.sqrt(
+            dot.square()
+            + cross.square()
+            + 1e-8
+        )
+
+        c_ext = dot / norm
+        s_ext = cross / norm
+
+        # --------------------------------------------------
+        # 6. Extrinsic translation
+        #
+        # B = R_ext @ A + t_ext
+        # --------------------------------------------------
+
+        rotated_ca = torch.stack([
+            c_ext * centroid_a[:, 0]
+            - s_ext * centroid_a[:, 1],
+
+            s_ext * centroid_a[:, 0]
+            + c_ext * centroid_a[:, 1],
         ], dim=-1)
 
-        translation = centroid_b - rotated_a
-        translation = F.normalize(translation, dim=-1)
+        t_ext = centroid_b - rotated_ca
 
-        return torch.cat([translation, yaw], dim=-1)
+        # --------------------------------------------------
+        # 7. Extrinsic -> Camera2 pose in Camera1
+        #
+        # C2_A = -R_ext.T @ t_ext
+        # --------------------------------------------------
+
+        tx = -(
+            c_ext * t_ext[:, 0]
+            + s_ext * t_ext[:, 1]
+        )
+
+        ty = -(
+            -s_ext * t_ext[:, 0]
+            + c_ext * t_ext[:, 1]
+        )
+
+        translation = torch.stack(
+            [tx, ty],
+            dim=-1,
+        )
+
+        translation = F.normalize(
+            translation,
+            dim=-1,
+            eps=1e-8,
+        )
+
+        # Camera2 orientation is inverse of A->B
+        pose_yaw = torch.stack([
+            -s_ext,
+            c_ext,
+        ], dim=-1)
+
+        pose_yaw = F.normalize(
+            pose_yaw,
+            dim=-1,
+            eps=1e-8,
+        )
+
+        pose = torch.cat(
+            [translation, pose_yaw],
+            dim=-1,
+        )
+
+        # Need at least two useful geometry columns
+        valid_count = (weights > 1e-6).sum(dim=1)
+        valid = valid_count >= 2
+
+        pose = torch.where(
+            valid[:, None],
+            pose,
+            torch.zeros_like(pose),
+        )
+
+        return pose
 
 class RansacPoseEstimator(nn.Module):
     def __init__(
@@ -705,19 +859,47 @@ class RansacPoseEstimator(nn.Module):
                 poses.append(torch.zeros(4, device=device, dtype=dtype))
                 continue
 
-            t, s, c = result
-            t = F.normalize(t, dim=0)
+            # RANSAC ger extrinsic transform A -> B:
+            #     p_B = R @ p_A + t_ext
+            t_ext, s_ext, c_ext = result
 
-            poses.append(torch.stack([t[0], t[1], s, c]))
+            R = torch.stack([
+                torch.stack([c_ext, -s_ext]),
+                torch.stack([s_ext,  c_ext]),
+            ])
+
+            # Konvertera extrinsic transform till Camera2:s pose
+            # uttryckt i Camera1-frame.
+            t_pose = -R.T @ t_ext
+            t_pose = F.normalize(t_pose, dim=0)
+
+            # A->B-koordinatrotationen har motsatt yaw mot
+            # Camera2:s orientation i Camera1-frame.
+            s_pose = -s_ext
+            c_pose = c_ext
+
+            poses.append(torch.stack([
+                t_pose[0],
+                t_pose[1],
+                s_pose,
+                c_pose,
+            ]))
 
         return torch.stack(poses)
 
 class PairImageCylinderModel(nn.Module):
     """Laptop-sized model with the same public interface as the old model."""
     def __init__(
-        self, img_size=128, patch_size=(16, 8), in_chans=3, embed_dim=192,
-        depth=4, num_heads=4, num_bins=128, dropout=0.0,
-        mlp_ratio=3.0, num_register_tokens=2,
+        self, img_size=128, 
+        patch_size=(16, 8), 
+        in_chans=3, 
+        embed_dim=192,
+        depth=4, 
+        num_heads=4, 
+        num_bins=128, 
+        dropout=0.0,
+        mlp_ratio=3.0, 
+        num_register_tokens=2,
     ):
         super().__init__()
         self.backbone = PairViTBackbone(
@@ -754,6 +936,7 @@ class PairImageCylinderModel(nn.Module):
     def forward(
         self, img_a, img_b, return_attention=False, return_corr=False,
         pose_vision_a=None, pose_vision_b=None, gt_prob_ab=None, gt_prob_ba=None,
+        compute_pose=True,
     ):
         if return_attention:
             cam_a, cam_b, patches_a, patches_b, attn_ab_all, attn_ba_all = self.backbone(
@@ -769,21 +952,25 @@ class PairImageCylinderModel(nn.Module):
             patches_a,
             patches_b,
         )
-        pose_input_a = vision_a.detach() if pose_vision_a is None else pose_vision_a
-        pose_input_b = vision_b.detach() if pose_vision_b is None else pose_vision_b
+        if compute_pose:
+            pose_input_a = vision_a.detach() if pose_vision_a is None else pose_vision_a
+            pose_input_b = vision_b.detach() if pose_vision_b is None else pose_vision_b
 
-        pose_ab = self.pose_head(
-            cam_a,
-            cam_b,
-            corr_a,
-            corr_b,
-            pose_input_a,
-            pose_input_b,
-            gt_prob_ab=gt_prob_ab,
-            gt_prob_ba=gt_prob_ba,
-        )
+            pose_ab = self.pose_head(
+                cam_a,
+                cam_b,
+                corr_a,
+                corr_b,
+                pose_input_a,
+                pose_input_b,
+                gt_prob_ab=gt_prob_ab,
+                gt_prob_ba=gt_prob_ba,
+            )
+        else:
+            pose_ab = None
+
         outputs = (vision_a, vision_b, pose_ab)
-
+        
         if return_corr:
             outputs += (corr_a, corr_b)
 

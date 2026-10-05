@@ -192,20 +192,45 @@ class SceneTwoPairsDataset(Dataset):
         return q
 
     def _relative_pose_2d(
-        self, camera1: Dict[str, Any], camera2: Dict[str, Any]
+        self,
+        camera1: Dict[str, Any],
+        camera2: Dict[str, Any],
     ) -> torch.Tensor:
-        T1 = self._camera_to_matrix(camera1)
-        T2 = self._camera_to_matrix(camera2)
-        T_rel = T2 @ torch.linalg.inv(T1)
 
-        t_xy = T_rel[:2, 3]
-        R = T_rel[:3, :3]
-        yaw = torch.atan2(R[1, 0], R[0, 0])
-
-        return torch.tensor(
-            [t_xy[0], t_xy[1], torch.sin(yaw), torch.cos(yaw)],
+        # Camera positions are already stored in the
+        # normalized cam1/world frame.
+        p1 = torch.as_tensor(
+            camera1["position"],
             dtype=torch.float32,
         )
+
+        p2 = torch.as_tensor(
+            camera2["position"],
+            dtype=torch.float32,
+        )
+
+        # Cam2 position relative to Cam1
+        t_xy = p2[:2] - p1[:2]
+
+        # Extract camera forward directions from world->camera R.
+        R1 = torch.as_tensor(camera1["R"], dtype=torch.float32)
+        R2 = torch.as_tensor(camera2["R"], dtype=torch.float32)
+
+        f1 = R1.T[:, 1]
+        f2 = R2.T[:, 1]
+
+        yaw1 = torch.atan2(f1[1], f1[0])
+        yaw2 = torch.atan2(f2[1], f2[0])
+
+        yaw = yaw2 - yaw1
+        yaw = torch.atan2(torch.sin(yaw), torch.cos(yaw))
+
+        return torch.stack([
+            t_xy[0],
+            t_xy[1],
+            torch.sin(yaw),
+            torch.cos(yaw),
+        ])
 
     def _get_pair(self, idx: int):
         sample = self.samples[idx]

@@ -462,10 +462,7 @@ def vision_loss(
 
     rad_l1 = F.l1_loss(pred_rad, tgt_rad, reduction="none")
 
-    pred_log_depth = torch.log(pred_dep.clamp_min(1e-4))
-    tgt_log_depth = torch.log(tgt_dep.clamp_min(1e-4))
-
-    dep_l1 = F.l1_loss(pred_log_depth, tgt_log_depth, reduction="none")
+    dep_l1 = F.l1_loss(pred_dep, tgt_dep, reduction="none")
 
     rad_loss = (rad_l1 * mask).sum() / mask.sum().clamp_min(1.0)
     dep_loss = (dep_l1 * mask).sum() / mask.sum().clamp_min(1.0)
