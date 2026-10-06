@@ -652,6 +652,51 @@ def relative_depth_structure_loss(pred_vision, target_vision, occ_thresh=0.5):
 
     return torch.stack(losses).mean()
 
+def matched_depth_delta_loss(
+    pred_a,
+    gt_a,
+    pred_b,
+    gt_b,
+    occ_thresh=0.5,
+):
+    losses = []
+
+    for b in range(pred_a.shape[0]):
+        occ_a = gt_a[b, :, 0] > occ_thresh
+        occ_b = gt_b[b, :, 0] > occ_thresh
+
+        ids_a = gt_a[b, :, 3].round().long()
+        ids_b = gt_b[b, :, 3].round().long()
+
+        for cid in torch.unique(ids_a[occ_a]):
+            ia = torch.where(occ_a & (ids_a == cid))[0]
+            ib = torch.where(occ_b & (ids_b == cid))[0]
+
+            if ia.numel() != 1 or ib.numel() != 1:
+                continue
+
+            pred_delta = (
+                pred_b[b, ib[0], 2]
+                - pred_a[b, ia[0], 2]
+            )
+
+            gt_delta = (
+                gt_b[b, ib[0], 2]
+                - gt_a[b, ia[0], 2]
+            )
+
+            losses.append(
+                F.smooth_l1_loss(
+                    pred_delta,
+                    gt_delta,
+                )
+            )
+
+    if not losses:
+        return pred_a[..., 2].sum() * 0.0
+
+    return torch.stack(losses).mean()
+
 
 def compute_forest_loss(
     pred_vision_a, pred_vision_b, pred_pose, occ_thresh,
