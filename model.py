@@ -325,8 +325,20 @@ class CylinderDecoder(nn.Module):
         return torch.stack([occupancy, radius, depth], dim=-1)
 
 class CorrespondenceDecoder(nn.Module):
-    def __init__(self, embed_dim=192, corr_dim=64, num_heads=4):
+    def __init__(
+        self,
+        embed_dim=192,
+        corr_dim=64,
+        num_heads=4,
+        grid_h=8,
+        grid_w=16,
+        output_cols=16,
+    ):
         super().__init__()
+
+        self.grid_h = grid_h
+        self.grid_w = grid_w
+        self.output_cols = output_cols
 
         self.norm_a = nn.LayerNorm(embed_dim)
         self.norm_b = nn.LayerNorm(embed_dim)
@@ -358,9 +370,19 @@ class CorrespondenceDecoder(nn.Module):
 
         B, P, D = corr_a.shape
 
-        # 8x16 patches -> 16 horizontal descriptors
-        corr_a = corr_a.reshape(B, 8, 16, D).mean(dim=1)
-        corr_b = corr_b.reshape(B, 8, 16, D).mean(dim=1)
+        corr_a = corr_a.reshape(B, self.grid_h, self.grid_w, D).mean(dim=1)
+        corr_b = corr_b.reshape(B, self.grid_h, self.grid_w, D).mean(dim=1)
+
+        # [B, grid_w, D] -> [B, D, grid_w]
+        corr_a = corr_a.transpose(1, 2)
+        corr_b = corr_b.transpose(1, 2)
+
+        # Behåll 16 coarse correspondence columns
+        corr_a = F.adaptive_avg_pool1d(corr_a, self.output_cols)
+        corr_b = F.adaptive_avg_pool1d(corr_b, self.output_cols)
+
+        corr_a = corr_a.transpose(1, 2)
+        corr_b = corr_b.transpose(1, 2)
 
         corr_a = F.normalize(corr_a, dim=-1)
         corr_b = F.normalize(corr_b, dim=-1)
@@ -925,6 +947,9 @@ class PairImageCylinderModel(nn.Module):
             embed_dim=embed_dim,
             corr_dim=64,
             num_heads=num_heads,
+            grid_h=self.backbone.patch_embed.grid_h,
+            grid_w=self.backbone.patch_embed.grid_w,
+            output_cols=16,
         )
         self.ransac_pose = RansacPoseEstimator(
             search_radius=16,
@@ -936,7 +961,7 @@ class PairImageCylinderModel(nn.Module):
     def forward(
         self, img_a, img_b, return_attention=False, return_corr=False,
         pose_vision_a=None, pose_vision_b=None, gt_prob_ab=None, gt_prob_ba=None,
-        compute_pose=True,
+        compute_pose=False,
     ):
         if return_attention:
             cam_a, cam_b, patches_a, patches_b, attn_ab_all, attn_ba_all = self.backbone(
