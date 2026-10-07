@@ -1265,3 +1265,230 @@ def test_gt_pose_predicted_geometry(
         "gt_a_to_pred_b": gt_a_to_pred_b,
         "pred_residual": pred_residuals,
     }
+
+def test_depth_by_apparent_width(
+    model, loader, device,
+    occ_thresh=0.5,
+):
+    model.eval()
+
+    widths_all, pred_all, gt_all = [], [], []
+
+    with torch.no_grad():
+        for batch in loader:
+            batch = [x.to(device, non_blocking=True) for x in batch]
+
+            pairs = (
+                [(batch[0], batch[1]), (batch[2], batch[3])]
+                if len(batch) == 5 else
+                [(batch[0], batch[1]), (batch[2], batch[3]),
+                 (batch[5], batch[6]), (batch[7], batch[8])]
+            )
+
+            for img, gt in pairs:
+                pred, _, _ = model(img, img, compute_pose=False)
+
+                mask = gt[..., 0] > occ_thresh
+
+                gt_depth = gt[..., 2][mask]
+                gt_radius = gt[..., 1][mask]
+                pred_depth = pred[..., 2][mask]
+
+                # Samma geometri som project_cylinder:
+                # full angular width = 2 * asin(radius / radial_depth)
+                width_rad = 2.0 * torch.asin(
+                    torch.clamp(gt_radius / gt_depth, 0.0, 1.0)
+                )
+                width_deg = torch.rad2deg(width_rad)
+
+                widths_all.append(width_deg.cpu())
+                pred_all.append(pred_depth.cpu())
+                gt_all.append(gt_depth.cpu())
+
+    widths = torch.cat(widths_all).numpy()
+    pred = torch.cat(pred_all).numpy()
+    gt = torch.cat(gt_all).numpy()
+
+    bins = [
+        (0, 2),
+        (2, 4),
+        (4, 8),
+        (8, 16),
+        (16, np.inf),
+    ]
+
+    def corr(a, b):
+        if len(a) < 2 or np.std(a) < 1e-8 or np.std(b) < 1e-8:
+            return np.nan
+        return np.corrcoef(a, b)[0, 1]
+
+    print("DEPTH ERROR BY APPARENT CYLINDER WIDTH")
+    print("-" * 100)
+    print(
+        f"{'Width':>10} {'N':>7} {'MAE':>8} {'Bias':>8} {'Corr':>8} "
+        f"{'Pred mean':>10} {'GT mean':>9} {'Pred std':>10} {'GT std':>9}"
+    )
+
+    results = {}
+
+    for lo, hi in bins:
+        m = (widths >= lo) & (widths < hi)
+        if not m.any():
+            continue
+
+        p, g = pred[m], gt[m]
+        label = f"{lo}-{hi:g}°" if np.isfinite(hi) else f"{lo}+°"
+
+        mae = np.mean(np.abs(p - g))
+        bias = np.mean(p - g)
+        c = corr(p, g)
+
+        print(
+            f"{label:>10} {len(g):7d} {mae:8.3f} {bias:8.3f} {c:8.3f} "
+            f"{p.mean():10.3f} {g.mean():9.3f} {p.std():10.3f} {g.std():9.3f}"
+        )
+
+        results[label] = {
+            "n": len(g),
+            "mae": mae,
+            "bias": bias,
+            "corr": c,
+            "pred_mean": p.mean(),
+            "gt_mean": g.mean(),
+            "pred_std": p.std(),
+            "gt_std": g.std(),
+        }
+
+    print("\nGLOBAL RELATIONSHIPS")
+    print("-" * 55)
+    print(f"Width ↔ GT depth:          {corr(widths, gt):.3f}")
+    print(f"Width ↔ predicted depth:   {corr(widths, pred):.3f}")
+    print(f"Pred depth ↔ GT depth:     {corr(pred, gt):.3f}")
+
+    return {
+        "width_deg": widths,
+        "pred_depth": pred,
+        "gt_depth": gt,
+        "bins": results,
+    }
+
+def test_radius_size_depth_cue(model, loader, device, occ_thresh=0.5):
+    model.eval()
+
+    gt_depths, pred_depths = [], []
+    depth_gt_radius, depth_pred_radius = [], []
+    gt_radii, pred_radii, widths = [], [], []
+
+    with torch.no_grad():
+        for batch in loader:
+            batch = [x.to(device, non_blocking=True) for x in batch]
+
+            pairs = (
+                [(batch[0], batch[1]), (batch[2], batch[3])]
+                if len(batch) == 5 else
+                [(batch[0], batch[1]), (batch[2], batch[3]),
+                 (batch[5], batch[6]), (batch[7], batch[8])]
+            )
+
+            for img, gt in pairs:
+                pred, _, _ = model(img, img, compute_pose=False)
+                mask = gt[..., 0] > occ_thresh
+
+                gd = gt[..., 2][mask]
+                gr = gt[..., 1][mask]
+                pd = pred[..., 2][mask]
+                pr = pred[..., 1][mask]
+
+                # Exact apparent angular half-width from GT geometry
+                alpha = torch.asin(torch.clamp(gr / gd, 0.0, 1.0))
+                sin_alpha = torch.sin(alpha).clamp_min(1e-6)
+
+                # Sanity: GT radius + exact apparent width
+                d_from_gt_radius = gr / sin_alpha
+
+                # Key test: predicted radius + exact apparent width
+                d_from_pred_radius = pr / sin_alpha
+
+                gt_depths.append(gd.cpu())
+                pred_depths.append(pd.cpu())
+                depth_gt_radius.append(d_from_gt_radius.cpu())
+                depth_pred_radius.append(d_from_pred_radius.cpu())
+                gt_radii.append(gr.cpu())
+                pred_radii.append(pr.cpu())
+                widths.append(torch.rad2deg(2.0 * alpha).cpu())
+
+    gd = torch.cat(gt_depths).numpy()
+    pd = torch.cat(pred_depths).numpy()
+    dgr = torch.cat(depth_gt_radius).numpy()
+    dpr = torch.cat(depth_pred_radius).numpy()
+    gr = torch.cat(gt_radii).numpy()
+    pr = torch.cat(pred_radii).numpy()
+    w = torch.cat(widths).numpy()
+
+    def corr(a, b):
+        if np.std(a) < 1e-8 or np.std(b) < 1e-8:
+            return np.nan
+        return np.corrcoef(a, b)[0, 1]
+
+    def show(name, p):
+        print(
+            f"{name:<30}"
+            f" MAE={np.mean(np.abs(p-gd)):6.3f} m"
+            f"  corr={corr(p, gd):6.3f}"
+            f"  std={p.std():6.3f}"
+        )
+
+    print("RADIUS + APPARENT SIZE DEPTH TEST")
+    print("-" * 75)
+    print(f"Cylinders: {len(gd)}")
+    print()
+
+    show("Network predicted depth", pd)
+    show("GT radius + width", dgr)
+    show("Pred radius + width", dpr)
+
+    print()
+    print(f"GT radius ↔ predicted radius: {corr(gr, pr):.3f}")
+    print(f"GT radius MAE:                {np.mean(np.abs(pr-gr)):.3f} m")
+    print(f"Width ↔ GT depth:             {corr(w, gd):.3f}")
+
+    return {
+        "gt_depth": gd,
+        "pred_depth": pd,
+        "depth_from_gt_radius": dgr,
+        "depth_from_pred_radius": dpr,
+        "gt_radius": gr,
+        "pred_radius": pr,
+        "width_deg": w,
+    }
+
+def test_radius_distribution(loader, device, occ_thresh=0.5):
+    radii = []
+
+    for batch in loader:
+        batch = [x.to(device) for x in batch]
+
+        visions = (
+            [batch[1], batch[3]]
+            if len(batch) == 5 else
+            [batch[1], batch[3], batch[6], batch[8]]
+        )
+
+        for gt in visions:
+            mask = gt[..., 0] > occ_thresh
+            radii.append(gt[..., 1][mask].cpu())
+
+    r = torch.cat(radii).numpy()
+
+    print("GT RADIUS DISTRIBUTION")
+    print("-" * 45)
+    print(f"N:       {len(r)}")
+    print(f"Mean:    {r.mean():.3f} m")
+    print(f"Std:     {r.std():.3f} m")
+    print(f"Min:     {r.min():.3f} m")
+    print(f"P10:     {np.percentile(r, 10):.3f} m")
+    print(f"Median:  {np.median(r):.3f} m")
+    print(f"P90:     {np.percentile(r, 90):.3f} m")
+    print(f"Max:     {r.max():.3f} m")
+
+    return r
