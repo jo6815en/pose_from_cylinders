@@ -8,11 +8,12 @@ from torch.utils.data import DataLoader
 from dataset import SceneTwoPairsDataset
 from augmentations import build_train_transform, build_eval_transform
 from model import PairImageCylinderModel
-from metrics import relative_cylinder_errors
+from metrics import relative_cylinder_errors, relative_pose_vector_errors
 from losses import (
     vision_loss,
     patch_correspondence_loss,
     relative_depth_structure_loss,
+    matched_depth_delta_loss,
 )
 
 
@@ -29,6 +30,7 @@ def train_one_epoch(
     lambda_occ,
     lambda_radius,
     lambda_corr,
+    lambda_depth_delta,
     scaler,
 ):
     model.train()
@@ -38,6 +40,8 @@ def train_one_epoch(
         "supervised": 0.0,
         "vision": 0.0,
         "correspondence": 0.0,
+        "depth_structure": 0.0,
+        "depth_delta": 0.0,
         # Kept so the existing history/checkpoint structure remains compatible.
         "pose": 0.0,
         "translation_error": 0.0,
@@ -147,10 +151,19 @@ def train_one_epoch(
                 depth_structure1 + depth_structure2
             )
 
+            depth_delta1 = matched_depth_delta_loss(
+                pred_vision_a1, vision_a1, pred_vision_b1, vision_b1, occ_thresh
+            )
+            depth_delta2 = matched_depth_delta_loss(
+                pred_vision_a2, vision_a2, pred_vision_b2, vision_b2, occ_thresh
+            )
+            depth_delta_loss = 0.5 * (depth_delta1 + depth_delta2)
+
             loss = (
                 vision_loss_total
                 + lambda_corr * corr_loss
                 + 0.5 * depth_structure_loss
+                + lambda_depth_delta * depth_delta_loss
             )
 
         scaler.scale(loss).backward()
@@ -161,6 +174,8 @@ def train_one_epoch(
         totals["supervised"] += vision_loss_total.item()
         totals["vision"] += vision_loss_total.item()
         totals["correspondence"] += corr_loss.item()
+        totals["depth_structure"] += depth_structure_loss.item()
+        totals["depth_delta"] += depth_delta_loss.item()
 
     return {
         key: value / len(loader)
@@ -177,6 +192,7 @@ def validate(
     lambda_occ,
     lambda_radius,
     lambda_corr,
+    lambda_depth_delta,
 ):
     model.eval()
 
@@ -185,6 +201,8 @@ def validate(
         "supervised": 0.0,
         "vision": 0.0,
         "correspondence": 0.0,
+        "depth_structure": 0.0,
+        "depth_delta": 0.0,
         "pose": 0.0,
         "translation_error": 0.0,
         "translation_magnitude_error": 0.0,
@@ -196,6 +214,10 @@ def validate(
         "cylinder_position_rel_l2": 0.0,
     }
 
+    camera_translation_sum = 0.0
+    camera_rotation_sum = 0.0
+    valid_pose_count = 0
+    total_pose_count = 0
     num_batches = 0
 
     for batch in loader:
@@ -253,10 +275,15 @@ def validate(
                 )
             )
 
+            depth_delta_loss = matched_depth_delta_loss(
+                pred_vision_a, vision_a, pred_vision_b, vision_b, occ_thresh
+            )
+
             total_loss = (
                 vision_loss_total
                 + lambda_corr * corr_loss
                 + 0.5 * depth_structure_loss
+                + lambda_depth_delta * depth_delta_loss
             )
 
         radius_a, position_a = relative_cylinder_errors(
@@ -266,10 +293,26 @@ def validate(
             pred_vision_b, vision_b, occ_thresh
         )
 
+        pred_pose = model.ransac_pose(
+            pred_vision_a, pred_vision_b, corr_a, corr_b
+        )
+        valid_pose = torch.linalg.vector_norm(pred_pose, dim=-1) > 1e-6
+        n_valid = valid_pose.sum().item()
+        total_pose_count += pred_pose.shape[0]
+        if n_valid > 0:
+            trans_err, rot_err = relative_pose_vector_errors(
+                pred_pose[valid_pose], _pose_ab[valid_pose]
+            )
+            camera_translation_sum += trans_err.item() * n_valid
+            camera_rotation_sum += rot_err.item() * n_valid
+            valid_pose_count += n_valid
+
         totals["total"] += total_loss.item()
         totals["supervised"] += vision_loss_total.item()
         totals["vision"] += vision_loss_total.item()
         totals["correspondence"] += corr_loss.item()
+        totals["depth_structure"] += depth_structure_loss.item()
+        totals["depth_delta"] += depth_delta_loss.item()
         totals["cylinder_radius_rel_l2"] += (
             0.5 * (radius_a + radius_b)
         ).item()
@@ -283,10 +326,18 @@ def validate(
             "Validation loader is empty; cannot select a best model."
         )
 
-    return {
+    metrics = {
         key: value / num_batches
         for key, value in totals.items()
     }
+    if valid_pose_count > 0:
+        metrics["camera_translation_rel_l2"] = camera_translation_sum / valid_pose_count
+        metrics["camera_rotation_rel_l2"] = camera_rotation_sum / valid_pose_count
+    else:
+        metrics["camera_translation_rel_l2"] = float("nan")
+        metrics["camera_rotation_rel_l2"] = float("nan")
+    metrics["ransac_failure_rate"] = 1.0 - valid_pose_count / max(total_pose_count, 1)
+    return metrics
 
 
 def main():
@@ -296,14 +347,14 @@ def main():
         "--data-dir",
         default="/nobackup/proj/disk/midlevel_representations/personal/johanna/data",
     )
-    parser.add_argument("--epochs", type=int, default=30)
+    parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--lr", type=float, default=5e-5)
     parser.add_argument("--val-interval", type=int, default=10)
     parser.add_argument("--num-workers", type=int, default=4)
 
     parser.add_argument("--img-size", type=int, default=128)
-    parser.add_argument("--patch-size", type=int, nargs=2, default=(16, 8))
+    parser.add_argument("--patch-size", type=int, nargs=2, default=(16, 4))
     parser.add_argument("--embed-dim", type=int, default=192)
     parser.add_argument("--depth", type=int, default=4)
     parser.add_argument("--num-heads", type=int, default=4)
@@ -314,6 +365,7 @@ def main():
     parser.add_argument("--lambda-radius", type=float, default=10.0)
     parser.add_argument("--occ-thresh", type=float, default=0.5)
     parser.add_argument("--lambda-corr", type=float, default=1.0)
+    parser.add_argument("--lambda-depth-delta", type=float, default=0.5)
 
     parser.add_argument(
         "--output-dir",
@@ -414,6 +466,7 @@ def main():
             args.lambda_occ,
             args.lambda_radius,
             args.lambda_corr,
+            args.lambda_depth_delta,
             scaler,
         )
 
@@ -428,6 +481,8 @@ def main():
             f"sup={train_metrics['supervised']:.4f} | "
             f"vis={train_metrics['vision']:.4f} | "
             f"corr={train_metrics['correspondence']:.4f} | "
+            f"struct={train_metrics['depth_structure']:.4f} | "
+            f"depth_delta={train_metrics['depth_delta']:.4f} | "
             f"pose={train_metrics['pose']:.4f} | "
             f"trans={train_metrics['translation_error']:.4f} | "
             f"radius_cons={train_metrics['radius_consistency']:.4f} | "
@@ -443,6 +498,7 @@ def main():
                 args.lambda_occ,
                 args.lambda_radius,
                 args.lambda_corr,
+                args.lambda_depth_delta,
             )
 
             row["val"] = val_metrics
@@ -452,6 +508,9 @@ def main():
                 f"val_sup={val_metrics['supervised']:.4f} | "
                 f"val_vis={val_metrics['vision']:.4f} | "
                 f"val_corr={val_metrics['correspondence']:.4f} | "
+                f"val_struct={val_metrics['depth_structure']:.4f} | "
+                f"val_depth_delta={val_metrics['depth_delta']:.4f} | "
+                f"ransac_fail={100 * val_metrics['ransac_failure_rate']:.1f}% | "
                 f"val_pose={val_metrics['pose']:.4f} | "
                 f"val_trans={val_metrics['translation_error']:.4f} | "
                 f"val_radius_cons={val_metrics['radius_consistency']:.4f} | "
