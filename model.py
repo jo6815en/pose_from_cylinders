@@ -208,10 +208,12 @@ class CylinderDecoder(nn.Module):
 
         self.occ_head = nn.Linear(embed_dim, 1)
         self.radius_head = nn.Linear(embed_dim, 1)
-        self.depth_head = nn.Linear(embed_dim, 1)
         self.local_norm_q = nn.LayerNorm(embed_dim)
         self.local_norm_kv = nn.LayerNorm(embed_dim)
-
+        
+        self.width_head = nn.Linear(embed_dim, 1)
+        self.depth_head = nn.Linear(embed_dim + 1, 1)
+        
         self.local_attn = nn.MultiheadAttention(
             embed_dim,
             num_heads,
@@ -314,15 +316,16 @@ class CylinderDecoder(nn.Module):
         occupancy = torch.sigmoid(self.occ_head(q).squeeze(-1))
         radius = F.softplus(self.radius_head(q).squeeze(-1))
 
-        log_depth = self.depth_head(q).squeeze(-1)
+        # Predicted apparent angular width in radians
+        width = F.softplus(self.width_head(q).squeeze(-1))
 
-        # Begränsa till ett numeriskt rimligt område
+        # Let depth explicitly use the predicted width
+        depth_input = torch.cat([q, width.unsqueeze(-1)], dim=-1)
+        log_depth = self.depth_head(depth_input).squeeze(-1)
         log_depth = torch.clamp(log_depth, min=-2.0, max=5.0)
-
-        # Resten av modellen får fortfarande vanlig metrisk depth
         depth = torch.exp(log_depth)
 
-        return torch.stack([occupancy, radius, depth], dim=-1)
+        return torch.stack([occupancy, radius, depth, width], dim=-1)
 
 class CorrespondenceDecoder(nn.Module):
     def __init__(

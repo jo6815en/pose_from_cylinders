@@ -440,18 +440,23 @@ def matched_reprojection_loss_2d(
 
 def vision_loss(
     pred_vision, target_vision, occ_thresh=0.5, lambda_occ=1.0,
-    lambda_radius=1.0, lambda_depth=1.0,
+    lambda_radius=1.0, lambda_depth=1.0, lambda_width=0.1,
 ):
     pred_occ = pred_vision[..., 0]
     pred_rad = pred_vision[..., 1]
     pred_dep = pred_vision[..., 2]
+    pred_width = pred_vision[..., 3]
 
     tgt_occ = target_vision[..., 0]
     tgt_rad = target_vision[..., 1]
     tgt_dep = target_vision[..., 2]
 
-    # BCE on sigmoid probabilities is unsafe under autocast/float16.
-    # Keep the current probability-based output, but compute this loss in float32.
+    gt_width = torch.rad2deg(
+        2.0 * torch.asin(
+            torch.clamp(tgt_rad / tgt_dep.clamp_min(1e-6), 0.0, 0.9999)
+        )
+    )
+
     with torch.autocast(device_type=pred_occ.device.type, enabled=False):
         occ_loss = F.binary_cross_entropy(
             pred_occ.float().clamp(1e-6, 1.0 - 1e-6),
@@ -460,16 +465,13 @@ def vision_loss(
 
     mask = (tgt_occ > occ_thresh).float()
 
-    rad_l1 = F.l1_loss(pred_rad, tgt_rad, reduction="none")
+    rad_loss = (F.l1_loss(pred_rad, tgt_rad, reduction="none") * mask).sum() / mask.sum().clamp_min(1.0)
+    dep_loss = (F.l1_loss(pred_dep, tgt_dep, reduction="none") * mask).sum() / mask.sum().clamp_min(1.0)
+    width_loss = (F.smooth_l1_loss(pred_width, gt_width, reduction="none") * mask).sum() / mask.sum().clamp_min(1.0)
 
-    dep_l1 = F.l1_loss(pred_dep, tgt_dep, reduction="none")
+    total = (lambda_occ * occ_loss + lambda_radius * rad_loss + lambda_depth * dep_loss + lambda_width * width_loss)
 
-    rad_loss = (rad_l1 * mask).sum() / mask.sum().clamp_min(1.0)
-    dep_loss = (dep_l1 * mask).sum() / mask.sum().clamp_min(1.0)
-
-    total = lambda_occ * occ_loss + lambda_radius * rad_loss + lambda_depth * dep_loss
-
-    return total, occ_loss, rad_loss, dep_loss
+    return total, occ_loss, rad_loss, dep_loss, width_loss
 
 def relative_pose_loss_2d(pred_pose, target_pose, t_weight=1.0, r_weight=1.0):
     pred_t = F.normalize(pred_pose[:, :2], dim=-1)
