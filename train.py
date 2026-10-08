@@ -8,7 +8,7 @@ from torch.utils.data import DataLoader
 from dataset import SceneTwoPairsDataset
 from augmentations import build_train_transform, build_eval_transform
 from model import PairImageCylinderModel
-from metrics import relative_cylinder_errors, relative_pose_vector_errors
+from metrics import relative_cylinder_errors
 from losses import (
     vision_loss,
     patch_correspondence_loss,
@@ -214,10 +214,6 @@ def validate(
         "cylinder_position_rel_l2": 0.0,
     }
 
-    camera_translation_sum = 0.0
-    camera_rotation_sum = 0.0
-    valid_pose_count = 0
-    total_pose_count = 0
     num_batches = 0
 
     for batch in loader:
@@ -229,62 +225,56 @@ def validate(
             _pose_ab,
         ) = move_batch_to_device(batch, device)
 
-        with torch.autocast(
-            device_type=device.type,
-            dtype=torch.float16,
-            enabled=(device.type == "cuda"),
-        ):
-            pred_vision_a, pred_vision_b, _, corr_a, corr_b = model(
-                img_a,
-                img_b,
-                compute_pose=False,
-                return_corr=True,
-            )
+        pred_vision_a, pred_vision_b, _, corr_a, corr_b = model(
+            img_a,
+            img_b,
+            compute_pose=False,
+            return_corr=True,
+        )
 
-            vis_a, *_ = vision_loss(
-                pred_vision_a,
-                vision_a,
-                occ_thresh=occ_thresh,
-                lambda_occ=lambda_occ,
-                lambda_radius=lambda_radius,
-                lambda_depth=1.0,
-            )
-            vis_b, *_ = vision_loss(
-                pred_vision_b,
-                vision_b,
-                occ_thresh=occ_thresh,
-                lambda_occ=lambda_occ,
-                lambda_radius=lambda_radius,
-                lambda_depth=1.0,
-            )
-            vision_loss_total = 0.5 * (vis_a + vis_b)
+        vis_a, *_ = vision_loss(
+            pred_vision_a, vision_a,
+            occ_thresh=occ_thresh,
+            lambda_occ=lambda_occ,
+            lambda_radius=lambda_radius,
+            lambda_depth=1.0,
+        )
+        vis_b, *_ = vision_loss(
+            pred_vision_b, vision_b,
+            occ_thresh=occ_thresh,
+            lambda_occ=lambda_occ,
+            lambda_radius=lambda_radius,
+            lambda_depth=1.0,
+        )
+        vision_loss_total = 0.5 * (vis_a + vis_b)
 
-            corr_loss = patch_correspondence_loss(
-                corr_a,
-                vision_a,
-                corr_b,
-                vision_b,
-            )
+        corr_loss = patch_correspondence_loss(
+            corr_a, vision_a, corr_b, vision_b
+        )
 
-            depth_structure_loss = 0.5 * (
-                relative_depth_structure_loss(
-                    pred_vision_a, vision_a, occ_thresh
-                )
-                + relative_depth_structure_loss(
-                    pred_vision_b, vision_b, occ_thresh
-                )
+        depth_structure_loss = 0.5 * (
+            relative_depth_structure_loss(
+                pred_vision_a, vision_a, occ_thresh
             )
+            + relative_depth_structure_loss(
+                pred_vision_b, vision_b, occ_thresh
+            )
+        )
 
-            depth_delta_loss = matched_depth_delta_loss(
-                pred_vision_a, vision_a, pred_vision_b, vision_b, occ_thresh
-            )
+        depth_delta_loss = matched_depth_delta_loss(
+            pred_vision_a,
+            vision_a,
+            pred_vision_b,
+            vision_b,
+            occ_thresh,
+        )
 
-            total_loss = (
-                vision_loss_total
-                + lambda_corr * corr_loss
-                + 0.5 * depth_structure_loss
-                + lambda_depth_delta * depth_delta_loss
-            )
+        total_loss = (
+            vision_loss_total
+            + lambda_corr * corr_loss
+            + 0.5 * depth_structure_loss
+            + lambda_depth_delta * depth_delta_loss
+        )
 
         radius_a, position_a = relative_cylinder_errors(
             pred_vision_a, vision_a, occ_thresh
@@ -292,20 +282,6 @@ def validate(
         radius_b, position_b = relative_cylinder_errors(
             pred_vision_b, vision_b, occ_thresh
         )
-
-        pred_pose = model.ransac_pose(
-            pred_vision_a, pred_vision_b, corr_a, corr_b
-        )
-        valid_pose = torch.linalg.vector_norm(pred_pose, dim=-1) > 1e-6
-        n_valid = valid_pose.sum().item()
-        total_pose_count += pred_pose.shape[0]
-        if n_valid > 0:
-            trans_err, rot_err = relative_pose_vector_errors(
-                pred_pose[valid_pose], _pose_ab[valid_pose]
-            )
-            camera_translation_sum += trans_err.item() * n_valid
-            camera_rotation_sum += rot_err.item() * n_valid
-            valid_pose_count += n_valid
 
         totals["total"] += total_loss.item()
         totals["supervised"] += vision_loss_total.item()
@@ -322,21 +298,19 @@ def validate(
         num_batches += 1
 
     if num_batches == 0:
-        raise RuntimeError(
-            "Validation loader is empty; cannot select a best model."
-        )
+        raise RuntimeError("Validation loader is empty.")
 
     metrics = {
         key: value / num_batches
         for key, value in totals.items()
     }
-    if valid_pose_count > 0:
-        metrics["camera_translation_rel_l2"] = camera_translation_sum / valid_pose_count
-        metrics["camera_rotation_rel_l2"] = camera_rotation_sum / valid_pose_count
-    else:
-        metrics["camera_translation_rel_l2"] = float("nan")
-        metrics["camera_rotation_rel_l2"] = float("nan")
-    metrics["ransac_failure_rate"] = 1.0 - valid_pose_count / max(total_pose_count, 1)
+
+    # RANSAC is evaluated separately after training in train_v2.ipynb.
+    # Keep these keys for compatibility with the existing history/checkpoints.
+    metrics["camera_translation_rel_l2"] = float("nan")
+    metrics["camera_rotation_rel_l2"] = float("nan")
+    metrics["ransac_failure_rate"] = float("nan")
+
     return metrics
 
 
@@ -365,7 +339,7 @@ def main():
     parser.add_argument("--lambda-radius", type=float, default=10.0)
     parser.add_argument("--occ-thresh", type=float, default=0.5)
     parser.add_argument("--lambda-corr", type=float, default=1.0)
-    parser.add_argument("--lambda-depth-delta", type=float, default=0.5)
+    parser.add_argument("--lambda-depth-delta", type=float, default=0.25)
 
     parser.add_argument(
         "--output-dir",
