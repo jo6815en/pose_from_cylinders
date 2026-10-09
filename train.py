@@ -1,6 +1,8 @@
 import argparse
 import json
 import os
+import random
+import numpy as np
 
 import torch
 from torch.utils.data import DataLoader
@@ -31,25 +33,17 @@ def train_one_epoch(
     lambda_radius,
     lambda_corr,
     lambda_depth_delta,
+    lambda_width,
     scaler,
 ):
     model.train()
 
     totals = {
         "total": 0.0,
-        "supervised": 0.0,
         "vision": 0.0,
         "correspondence": 0.0,
         "depth_structure": 0.0,
         "depth_delta": 0.0,
-        # Kept so the existing history/checkpoint structure remains compatible.
-        "pose": 0.0,
-        "translation_error": 0.0,
-        "translation_magnitude_error": 0.0,
-        "translation_direction_error": 0.0,
-        "yaw_error_deg": 0.0,
-        "radius_consistency": 0.0,
-        "reprojection": 0.0,
     }
 
     for batch in loader:
@@ -76,13 +70,11 @@ def train_one_epoch(
             pred_vision_a1, pred_vision_b1, _, corr_a1, corr_b1 = model(
                 img_a1,
                 img_b1,
-                compute_pose=False,
                 return_corr=True,
             )
             pred_vision_a2, pred_vision_b2, _, corr_a2, corr_b2 = model(
                 img_a2,
                 img_b2,
-                compute_pose=False,
                 return_corr=True,
             )
 
@@ -101,6 +93,7 @@ def train_one_epoch(
                 lambda_occ=lambda_occ,
                 lambda_radius=lambda_radius,
                 lambda_depth=1.0,
+                lambda_width=lambda_width,
             )
             vis_b1, *_ = vision_loss(
                 pred_vision_b1,
@@ -109,6 +102,7 @@ def train_one_epoch(
                 lambda_occ=lambda_occ,
                 lambda_radius=lambda_radius,
                 lambda_depth=1.0,
+                lambda_width=lambda_width,
             )
             vis_a2, *_ = vision_loss(
                 pred_vision_a2,
@@ -117,6 +111,7 @@ def train_one_epoch(
                 lambda_occ=lambda_occ,
                 lambda_radius=lambda_radius,
                 lambda_depth=1.0,
+                lambda_width=lambda_width,
             )
             vis_b2, *_ = vision_loss(
                 pred_vision_b2,
@@ -125,6 +120,7 @@ def train_one_epoch(
                 lambda_occ=lambda_occ,
                 lambda_radius=lambda_radius,
                 lambda_depth=1.0,
+                lambda_width=lambda_width,
             )
 
             vision_loss_total = 0.25 * (
@@ -171,7 +167,6 @@ def train_one_epoch(
         scaler.update()
 
         totals["total"] += loss.item()
-        totals["supervised"] += vision_loss_total.item()
         totals["vision"] += vision_loss_total.item()
         totals["correspondence"] += corr_loss.item()
         totals["depth_structure"] += depth_structure_loss.item()
@@ -193,23 +188,16 @@ def validate(
     lambda_radius,
     lambda_corr,
     lambda_depth_delta,
+    lambda_width,
 ):
     model.eval()
 
     totals = {
         "total": 0.0,
-        "supervised": 0.0,
         "vision": 0.0,
         "correspondence": 0.0,
         "depth_structure": 0.0,
         "depth_delta": 0.0,
-        "pose": 0.0,
-        "translation_error": 0.0,
-        "translation_magnitude_error": 0.0,
-        "translation_direction_error": 0.0,
-        "yaw_error_deg": 0.0,
-        "radius_consistency": 0.0,
-        "reprojection": 0.0,
         "cylinder_radius_rel_l2": 0.0,
         "cylinder_position_rel_l2": 0.0,
     }
@@ -228,7 +216,6 @@ def validate(
         pred_vision_a, pred_vision_b, _, corr_a, corr_b = model(
             img_a,
             img_b,
-            compute_pose=False,
             return_corr=True,
         )
 
@@ -238,6 +225,7 @@ def validate(
             lambda_occ=lambda_occ,
             lambda_radius=lambda_radius,
             lambda_depth=1.0,
+            lambda_width=lambda_width,
         )
         vis_b, *_ = vision_loss(
             pred_vision_b, vision_b,
@@ -245,6 +233,7 @@ def validate(
             lambda_occ=lambda_occ,
             lambda_radius=lambda_radius,
             lambda_depth=1.0,
+            lambda_width=lambda_width,
         )
         vision_loss_total = 0.5 * (vis_a + vis_b)
 
@@ -284,7 +273,6 @@ def validate(
         )
 
         totals["total"] += total_loss.item()
-        totals["supervised"] += vision_loss_total.item()
         totals["vision"] += vision_loss_total.item()
         totals["correspondence"] += corr_loss.item()
         totals["depth_structure"] += depth_structure_loss.item()
@@ -305,12 +293,6 @@ def validate(
         for key, value in totals.items()
     }
 
-    # RANSAC is evaluated separately after training in train_v2.ipynb.
-    # Keep these keys for compatibility with the existing history/checkpoints.
-    metrics["camera_translation_rel_l2"] = float("nan")
-    metrics["camera_rotation_rel_l2"] = float("nan")
-    metrics["ransac_failure_rate"] = float("nan")
-
     return metrics
 
 
@@ -326,6 +308,7 @@ def main():
     parser.add_argument("--lr", type=float, default=5e-5)
     parser.add_argument("--val-interval", type=int, default=10)
     parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument("--seed", type=int, default=0)
 
     parser.add_argument("--img-size", type=int, default=128)
     parser.add_argument("--patch-size", type=int, nargs=2, default=(16, 4))
@@ -340,6 +323,7 @@ def main():
     parser.add_argument("--occ-thresh", type=float, default=0.5)
     parser.add_argument("--lambda-corr", type=float, default=1.0)
     parser.add_argument("--lambda-depth-delta", type=float, default=0.25)
+    parser.add_argument("--lambda-width", type=float, default=0.1)
 
     parser.add_argument(
         "--output-dir",
@@ -359,6 +343,13 @@ def main():
     if device.type == "cuda":
         print("GPU:", torch.cuda.get_device_name(0))
         print("CUDA:", torch.version.cuda)
+
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    torch.cuda.manual_seed_all(args.seed)
+
+    print("Seed: ", args.seed)
 
     train_dataset = SceneTwoPairsDataset(
         root_dir=os.path.join(args.data_dir, "dataset"),
@@ -432,7 +423,6 @@ def main():
         "epoch": [],
         "loss": [],
         "vision_loss": [],
-        "pose_loss": [],
         "correspondence_loss": [],
         "depth_structure_loss": [],
         "depth_delta_loss": [],
@@ -457,13 +447,13 @@ def main():
             args.lambda_radius,
             args.lambda_corr,
             args.lambda_depth_delta,
+            args.lambda_width,
             scaler,
         )
 
         history["epoch"].append(epoch)
         history["loss"].append(train_metrics["total"])
         history["vision_loss"].append(train_metrics["vision"])
-        history["pose_loss"].append(train_metrics["pose"])
         history["correspondence_loss"].append(train_metrics["correspondence"])
         history["depth_structure_loss"].append(train_metrics["depth_structure"])
         history["depth_delta_loss"].append(train_metrics["depth_delta"])
@@ -471,15 +461,10 @@ def main():
         log = (
             f"Epoch {epoch}: "
             f"tot={train_metrics['total']:.4f} | "
-            f"sup={train_metrics['supervised']:.4f} | "
             f"vis={train_metrics['vision']:.4f} | "
             f"corr={train_metrics['correspondence']:.4f} | "
             f"struct={train_metrics['depth_structure']:.4f} | "
-            f"depth_delta={train_metrics['depth_delta']:.4f} | "
-            f"pose={train_metrics['pose']:.4f} | "
-            f"trans={train_metrics['translation_error']:.4f} | "
-            f"radius_cons={train_metrics['radius_consistency']:.4f} | "
-            f"reproj={train_metrics['reprojection']:.4f}"
+            f"delta={train_metrics['depth_delta']:.4f}"
         )
 
         if epoch == 1 or epoch % args.val_interval == 0:
@@ -492,6 +477,7 @@ def main():
                 args.lambda_radius,
                 args.lambda_corr,
                 args.lambda_depth_delta,
+                args.lambda_width
             )
 
             history["val_epoch"].append(epoch)
@@ -502,17 +488,11 @@ def main():
             history["val_depth_delta"].append(val_metrics["depth_delta"])
 
             log += (
-                f" | val_tot={val_metrics['total']:.4f} | "
-                f"val_sup={val_metrics['supervised']:.4f} | "
-                f"val_vis={val_metrics['vision']:.4f} | "
-                f"val_corr={val_metrics['correspondence']:.4f} | "
-                f"val_struct={val_metrics['depth_structure']:.4f} | "
-                f"val_depth_delta={val_metrics['depth_delta']:.4f} | "
-                f"ransac_fail={100 * val_metrics['ransac_failure_rate']:.1f}% | "
-                f"val_pose={val_metrics['pose']:.4f} | "
-                f"val_trans={val_metrics['translation_error']:.4f} | "
-                f"val_radius_cons={val_metrics['radius_consistency']:.4f} | "
-                f"val_reproj={val_metrics['reprojection']:.4f}"
+                f" | val_tot={val_metrics['total']:.4f}"
+                f" | val_vis={val_metrics['vision']:.4f}"
+                f" | val_corr={val_metrics['correspondence']:.4f}"
+                f" | val_struct={val_metrics['depth_structure']:.4f}"
+                f" | val_delta={val_metrics['depth_delta']:.4f}"
             )
             if val_metrics["total"] < best_val_loss:
                 best_val_loss = val_metrics["total"]

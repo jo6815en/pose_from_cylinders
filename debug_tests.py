@@ -17,7 +17,7 @@ def test_matched_depth_consistency(model, loader, device, occ_thresh=0.5):
             ]
 
             for img_a, gt_a, img_b, gt_b in pairs:
-                pred_a, pred_b, _ = model(img_a, img_b, compute_pose=False)
+                pred_a, pred_b, _ = model(img_a, img_b,)
 
                 for b in range(img_a.shape[0]):
                     occ_a = gt_a[b, :, 0] > occ_thresh
@@ -90,7 +90,7 @@ def evaluate_train_geometry(model, loader, device, occ_thresh=0.5):
                 raise ValueError(f"Unexpected batch length: {len(batch)}")
 
             for img_a, vision_a, img_b, vision_b in pairs:
-                pred_a, pred_b, _ = model(img_a, img_b, compute_pose=False)
+                pred_a, pred_b, _ = model(img_a, img_b)
 
                 for pred, gt in [(pred_a, vision_a), (pred_b, vision_b)]:
                     for b in range(pred.shape[0]):
@@ -176,7 +176,7 @@ def test_depth_by_distance(model, loader, device, bins=(0, 5, 10, 15, 20, 30, fl
             ]
 
             for img_a, gt_a, img_b, gt_b in pairs:
-                pred_a, pred_b, _ = model(img_a, img_b, compute_pose=False)
+                pred_a, pred_b, _ = model(img_a, img_b)
 
                 for pred, gt in [(pred_a, gt_a), (pred_b, gt_b)]:
                     mask = gt[..., 0] > 0.5
@@ -231,7 +231,7 @@ def evaluate_16_correspondences(model, loader, device, occ_thresh=0.5, temperatu
             ]
 
             for img_a, vision_a, img_b, vision_b in pairs:
-                _, _, _, corr_a, corr_b = model(img_a, img_b, return_corr=True, compute_pose=False)
+                _, _, _, corr_a, corr_b = model(img_a, img_b, return_corr=True)
                 corr_a = F.normalize(corr_a, dim=-1)
                 corr_b = F.normalize(corr_b, dim=-1)
 
@@ -387,7 +387,7 @@ def test_ransac_geometry_ablation_gt_coarse(
                 )
 
                 for img_a, gt_a, img_b, gt_b, pose_gt in pairs:
-                    pred_a, pred_b, _ = model(img_a, img_b, compute_pose=False)
+                    pred_a, pred_b, _ = model(img_a, img_b, )
 
                     Bsz, N, _ = gt_a.shape
                     dtype = gt_a.dtype
@@ -688,7 +688,7 @@ def test_gt_pose_predicted_geometry(
 
             for img_a, gt_a, img_b, gt_b, pose_gt in pairs:
                 pred_a, pred_b, _ = model(
-                    img_a, img_b, compute_pose=False
+                    img_a, img_b,
                 )
 
                 B, N, _ = gt_a.shape
@@ -831,7 +831,7 @@ def test_depth_by_apparent_width(
             )
 
             for img, gt in pairs:
-                pred, _, _ = model(img, img, compute_pose=False)
+                pred, _, _ = model(img, img,)
 
                 mask = gt[..., 0] > occ_thresh
 
@@ -936,7 +936,7 @@ def test_radius_size_depth_cue(model, loader, device, occ_thresh=0.5):
             )
 
             for img, gt in pairs:
-                pred, _, _ = model(img, img, compute_pose=False)
+                pred, _, _ = model(img, img,)
                 mask = gt[..., 0] > occ_thresh
 
                 gd = gt[..., 2][mask]
@@ -1078,7 +1078,7 @@ def test_ransac_depth_corr_ablation(
 
             for img_a, gt_a, img_b, gt_b, pose_gt in pairs:
                 pred_a, pred_b, _, corr_a, corr_b = model(
-                    img_a, img_b, compute_pose=False, return_corr=True
+                    img_a, img_b,  return_corr=True
                 )
 
                 corr_a = F.normalize(corr_a, dim=-1)
@@ -1249,7 +1249,7 @@ def evaluate_width_prediction(model, loader, device, occ_thresh=0.5):
             )
 
             for img, gt in pairs:
-                pred, _, _ = model(img, img, compute_pose=False)
+                pred, _, _ = model(img, img,)
                 mask = gt[..., 0] > occ_thresh
 
                 gt_width = torch.rad2deg(
