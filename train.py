@@ -16,6 +16,7 @@ from losses import (
     patch_correspondence_loss,
     relative_depth_structure_loss,
     matched_depth_delta_loss,
+    reliability_loss,
 )
 
 
@@ -34,6 +35,7 @@ def train_one_epoch(
     lambda_corr,
     lambda_depth_delta,
     lambda_width,
+    lambda_reliability,
     scaler,
 ):
     model.train()
@@ -67,99 +69,57 @@ def train_one_epoch(
             dtype=torch.float16,
             enabled=(device.type == "cuda"),
         ):
-            pred_vision_a1, pred_vision_b1, _, corr_a1, corr_b1 = model(
+            pred_vision_a1, pred_vision_b1, reliability1, corr_a1, corr_b1 = model(
                 img_a1,
                 img_b1,
                 return_corr=True,
             )
-            pred_vision_a2, pred_vision_b2, _, corr_a2, corr_b2 = model(
+            pred_vision_a2, pred_vision_b2, reliability2, corr_a2, corr_b2 = model(
                 img_a2,
                 img_b2,
                 return_corr=True,
             )
 
-            corr1 = patch_correspondence_loss(
-                corr_a1, vision_a1, corr_b1, vision_b1
-            )
-            corr2 = patch_correspondence_loss(
-                corr_a2, vision_a2, corr_b2, vision_b2
-            )
+            vis_a1, *_ = vision_loss(pred_vision_a1, vision_a1, occ_thresh=occ_thresh, lambda_occ=lambda_occ,
+                lambda_radius=lambda_radius, lambda_depth=1.0, lambda_width=lambda_width)
+            vis_b1, *_ = vision_loss(pred_vision_b1, vision_b1, occ_thresh=occ_thresh, lambda_occ=lambda_occ,
+                lambda_radius=lambda_radius, lambda_depth=1.0, lambda_width=lambda_width)
+            vis_a2, *_ = vision_loss(pred_vision_a2, vision_a2, occ_thresh=occ_thresh, lambda_occ=lambda_occ,
+                lambda_radius=lambda_radius, lambda_depth=1.0, lambda_width=lambda_width)
+            vis_b2, *_ = vision_loss(pred_vision_b2, vision_b2, occ_thresh=occ_thresh, lambda_occ=lambda_occ,
+                lambda_radius=lambda_radius, lambda_depth=1.0, lambda_width=lambda_width)
+
+            vision_loss_total = 0.25 * (vis_a1 + vis_b1 + vis_a2 + vis_b2)
+
+            corr1 = patch_correspondence_loss(corr_a1, vision_a1, corr_b1, vision_b1)
+            corr2 = patch_correspondence_loss(corr_a2, vision_a2, corr_b2, vision_b2)
             corr_loss = 0.5 * (corr1 + corr2)
 
-            vis_a1, *_ = vision_loss(
-                pred_vision_a1,
-                vision_a1,
-                occ_thresh=occ_thresh,
-                lambda_occ=lambda_occ,
-                lambda_radius=lambda_radius,
-                lambda_depth=1.0,
-                lambda_width=lambda_width,
-            )
-            vis_b1, *_ = vision_loss(
-                pred_vision_b1,
-                vision_b1,
-                occ_thresh=occ_thresh,
-                lambda_occ=lambda_occ,
-                lambda_radius=lambda_radius,
-                lambda_depth=1.0,
-                lambda_width=lambda_width,
-            )
-            vis_a2, *_ = vision_loss(
-                pred_vision_a2,
-                vision_a2,
-                occ_thresh=occ_thresh,
-                lambda_occ=lambda_occ,
-                lambda_radius=lambda_radius,
-                lambda_depth=1.0,
-                lambda_width=lambda_width,
-            )
-            vis_b2, *_ = vision_loss(
-                pred_vision_b2,
-                vision_b2,
-                occ_thresh=occ_thresh,
-                lambda_occ=lambda_occ,
-                lambda_radius=lambda_radius,
-                lambda_depth=1.0,
-                lambda_width=lambda_width,
-            )
-
-            vision_loss_total = 0.25 * (
-                vis_a1 + vis_b1 + vis_a2 + vis_b2
-            )
-
             depth_structure1 = 0.5 * (
-                relative_depth_structure_loss(
-                    pred_vision_a1, vision_a1, occ_thresh
-                )
-                + relative_depth_structure_loss(
-                    pred_vision_b1, vision_b1, occ_thresh
-                )
+                relative_depth_structure_loss(pred_vision_a1, vision_a1, occ_thresh)
+                + relative_depth_structure_loss(pred_vision_b1, vision_b1, occ_thresh)
             )
             depth_structure2 = 0.5 * (
-                relative_depth_structure_loss(
-                    pred_vision_a2, vision_a2, occ_thresh
-                )
-                + relative_depth_structure_loss(
-                    pred_vision_b2, vision_b2, occ_thresh
-                )
+                relative_depth_structure_loss(pred_vision_a2, vision_a2, occ_thresh)
+                + relative_depth_structure_loss(pred_vision_b2, vision_b2, occ_thresh)
             )
-            depth_structure_loss = 0.5 * (
-                depth_structure1 + depth_structure2
-            )
+            depth_structure_loss = 0.5 * (depth_structure1 + depth_structure2)
 
-            depth_delta1 = matched_depth_delta_loss(
-                pred_vision_a1, vision_a1, pred_vision_b1, vision_b1, occ_thresh
-            )
-            depth_delta2 = matched_depth_delta_loss(
-                pred_vision_a2, vision_a2, pred_vision_b2, vision_b2, occ_thresh
-            )
+            depth_delta1 = matched_depth_delta_loss(pred_vision_a1, vision_a1, pred_vision_b1, vision_b1, occ_thresh)
+            depth_delta2 = matched_depth_delta_loss(pred_vision_a2, vision_a2, pred_vision_b2, vision_b2, occ_thresh)
             depth_delta_loss = 0.5 * (depth_delta1 + depth_delta2)
+
+            rel1 = reliability_loss(reliability1, pred_vision_a1, vision_a1, pred_vision_b1, vision_b1, occ_thresh)
+            rel2 = reliability_loss(reliability2, pred_vision_a2, vision_a2, pred_vision_b2, vision_b2, occ_thresh)
+
+            reliability_loss_total = 0.5 * (rel1 + rel2)
 
             loss = (
                 vision_loss_total
                 + lambda_corr * corr_loss
                 + 0.5 * depth_structure_loss
                 + lambda_depth_delta * depth_delta_loss
+                + lambda_reliability * reliability_loss_total
             )
 
         scaler.scale(loss).backward()
@@ -189,6 +149,7 @@ def validate(
     lambda_corr,
     lambda_depth_delta,
     lambda_width,
+    lambda_reliability,
 ):
     model.eval()
 
@@ -213,56 +174,35 @@ def validate(
             _pose_ab,
         ) = move_batch_to_device(batch, device)
 
-        pred_vision_a, pred_vision_b, _, corr_a, corr_b = model(
+        pred_vision_a, pred_vision_b, reliability, corr_a, corr_b = model(
             img_a,
             img_b,
             return_corr=True,
         )
 
-        vis_a, *_ = vision_loss(
-            pred_vision_a, vision_a,
-            occ_thresh=occ_thresh,
-            lambda_occ=lambda_occ,
-            lambda_radius=lambda_radius,
-            lambda_depth=1.0,
-            lambda_width=lambda_width,
-        )
-        vis_b, *_ = vision_loss(
-            pred_vision_b, vision_b,
-            occ_thresh=occ_thresh,
-            lambda_occ=lambda_occ,
-            lambda_radius=lambda_radius,
-            lambda_depth=1.0,
-            lambda_width=lambda_width,
-        )
+        vis_a, *_ = vision_loss(pred_vision_a, vision_a, occ_thresh=occ_thresh, lambda_occ=lambda_occ,
+            lambda_radius=lambda_radius, lambda_depth=1.0, lambda_width=lambda_width)
+        vis_b, *_ = vision_loss(pred_vision_b, vision_b, occ_thresh=occ_thresh, lambda_occ=lambda_occ,
+            lambda_radius=lambda_radius, lambda_depth=1.0, lambda_width=lambda_width)
         vision_loss_total = 0.5 * (vis_a + vis_b)
 
-        corr_loss = patch_correspondence_loss(
-            corr_a, vision_a, corr_b, vision_b
-        )
+        corr_loss = patch_correspondence_loss(corr_a, vision_a, corr_b, vision_b)
 
         depth_structure_loss = 0.5 * (
-            relative_depth_structure_loss(
-                pred_vision_a, vision_a, occ_thresh
-            )
-            + relative_depth_structure_loss(
-                pred_vision_b, vision_b, occ_thresh
-            )
+            relative_depth_structure_loss(pred_vision_a, vision_a, occ_thresh)
+            + relative_depth_structure_loss(pred_vision_b, vision_b, occ_thresh)
         )
 
-        depth_delta_loss = matched_depth_delta_loss(
-            pred_vision_a,
-            vision_a,
-            pred_vision_b,
-            vision_b,
-            occ_thresh,
-        )
+        depth_delta_loss = matched_depth_delta_loss(pred_vision_a, vision_a, pred_vision_b, vision_b, occ_thresh)
+
+        rel_loss = reliability_loss(reliability, pred_vision_a, vision_a, pred_vision_b, vision_b, occ_thresh)
 
         total_loss = (
             vision_loss_total
             + lambda_corr * corr_loss
             + 0.5 * depth_structure_loss
             + lambda_depth_delta * depth_delta_loss
+            + lambda_reliability * rel_loss
         )
 
         radius_a, position_a = relative_cylinder_errors(
@@ -324,6 +264,7 @@ def main():
     parser.add_argument("--lambda-corr", type=float, default=1.0)
     parser.add_argument("--lambda-depth-delta", type=float, default=0.25)
     parser.add_argument("--lambda-width", type=float, default=0.1)
+    parser.add_argument("--lambda-reliability", type=float, default=1.0)
 
     parser.add_argument(
         "--output-dir",
@@ -448,6 +389,7 @@ def main():
             args.lambda_corr,
             args.lambda_depth_delta,
             args.lambda_width,
+            args.lambda_reliability,
             scaler,
         )
 
@@ -477,7 +419,8 @@ def main():
                 args.lambda_radius,
                 args.lambda_corr,
                 args.lambda_depth_delta,
-                args.lambda_width
+                args.lambda_width,
+                args.lambda_reliability,
             )
 
             history["val_epoch"].append(epoch)

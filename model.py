@@ -298,7 +298,7 @@ class CylinderDecoder(nn.Module):
 
         return aligned
 
-    def forward(self, patches):
+    def forward(self, patches, return_features=False):
         B = patches.shape[0]
 
         # Explicit visuell feature för rätt spatial position.
@@ -325,7 +325,12 @@ class CylinderDecoder(nn.Module):
         log_depth = torch.clamp(log_depth, min=-2.0, max=5.0)
         depth = torch.exp(log_depth)
 
-        return torch.stack([occupancy, radius, depth, width], dim=-1)
+        vision = torch.stack([occupancy, radius, depth, width], dim=-1)
+
+        if return_features:
+            return vision, q
+
+        return vision
 
 class CorrespondenceDecoder(nn.Module):
     def __init__(
@@ -412,6 +417,25 @@ class CorrespondenceDecoder(nn.Module):
         corr = corr.transpose(1, 2)
 
         return F.normalize(corr, dim=-1)
+
+class ReliabilityHead(nn.Module):
+    def __init__(self, embed_dim=192, hidden_dim=128):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(2 * embed_dim + 8, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, 1),
+        )
+
+    def forward(self, feat_a, feat_b, vision_a, vision_b):
+        x = torch.cat([
+            feat_a.detach(),
+            feat_b.detach(),
+            vision_a.detach(),
+            vision_b.detach(),
+        ], dim=-1)
+
+        return F.softplus(self.net(x).squeeze(-1))
 
 
 class RansacPoseEstimator(nn.Module):
@@ -647,6 +671,10 @@ class PairImageCylinderModel(nn.Module):
             grid_w=self.backbone.patch_embed.grid_w,
             output_cols=16,
         )
+        self.reliability_head = ReliabilityHead(
+            embed_dim=embed_dim,
+            hidden_dim=128,
+        )
         self.ransac_pose = RansacPoseEstimator(
             search_radius=16,
             temperature=0.1,
@@ -664,15 +692,22 @@ class PairImageCylinderModel(nn.Module):
         else:
             _, _, patches_a, patches_b = self.backbone(img_a, img_b)
 
-        vision_a = self.vision_head(patches_a)
-        vision_b = self.vision_head(patches_b)
+        vision_a, feat_a = self.vision_head(patches_a, return_features=True)
+        vision_b, feat_b = self.vision_head(patches_b, return_features=True)
 
         corr_a, corr_b = self.corr_decoder(
             patches_a,
             patches_b,
         )
 
-        outputs = (vision_a, vision_b, None)
+        reliability = self.reliability_head(
+            feat_a,
+            feat_b,
+            vision_a,
+            vision_b,
+        )
+
+        outputs = (vision_a, vision_b, reliability)
         
         if return_corr:
             outputs += (corr_a, corr_b)

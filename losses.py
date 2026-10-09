@@ -699,6 +699,56 @@ def matched_depth_delta_loss(
 
     return torch.stack(losses).mean()
 
+def reliability_loss(
+    pred_reliability,
+    pred_a, gt_a,
+    pred_b, gt_b,
+    occ_thresh=0.5,
+):
+    losses = []
+
+    for b in range(gt_a.shape[0]):
+        mask_a = gt_a[b, :, 0] > occ_thresh
+        mask_b = gt_b[b, :, 0] > occ_thresh
+
+        ids_a = gt_a[b, :, 3].round().long()
+        ids_b = gt_b[b, :, 3].round().long()
+
+        for cid in torch.unique(ids_a[mask_a]):
+            ia = torch.where(mask_a & (ids_a == cid))[0]
+            ib = torch.where(mask_b & (ids_b == cid))[0]
+
+            if ia.numel() != 1 or ib.numel() != 1:
+                continue
+
+            ia, ib = ia[0], ib[0]
+
+            pred_delta = (
+                pred_b[b, ib, 2].detach()
+                - pred_a[b, ia, 2].detach()
+            )
+
+            gt_delta = (
+                gt_b[b, ib, 2]
+                - gt_a[b, ia, 2]
+            )
+
+            target_error = torch.abs(
+                pred_delta - gt_delta
+            )
+
+            losses.append(
+                F.smooth_l1_loss(
+                    pred_reliability[b, ia],
+                    target_error,
+                )
+            )
+
+    if not losses:
+        return pred_reliability.sum() * 0.0
+
+    return torch.stack(losses).mean()
+
 
 def compute_forest_loss(
     pred_vision_a, pred_vision_b, pred_pose, occ_thresh,
