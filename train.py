@@ -426,7 +426,23 @@ def main():
     )
     scaler = torch.amp.GradScaler("cuda", enabled=(device.type == "cuda"))
 
-    history = []
+    # Epoch-aligned history dict. This format is directly plottable and is
+    # stored unchanged in history.json, latest.pt, and best.pt.
+    history = {
+        "epoch": [],
+        "loss": [],
+        "vision_loss": [],
+        "pose_loss": [],
+        "correspondence_loss": [],
+        "depth_structure_loss": [],
+        "depth_delta_loss": [],
+        "val_epoch": [],
+        "val_total": [],
+        "val_vision": [],
+        "val_correspondence": [],
+        "val_depth_structure": [],
+        "val_depth_delta": [],
+    }
     best_val_loss = float("inf")
 
 
@@ -444,10 +460,13 @@ def main():
             scaler,
         )
 
-        row = {
-            "epoch": epoch,
-            "train": train_metrics,
-        }
+        history["epoch"].append(epoch)
+        history["loss"].append(train_metrics["total"])
+        history["vision_loss"].append(train_metrics["vision"])
+        history["pose_loss"].append(train_metrics["pose"])
+        history["correspondence_loss"].append(train_metrics["correspondence"])
+        history["depth_structure_loss"].append(train_metrics["depth_structure"])
+        history["depth_delta_loss"].append(train_metrics["depth_delta"])
 
         log = (
             f"Epoch {epoch}: "
@@ -475,7 +494,12 @@ def main():
                 args.lambda_depth_delta,
             )
 
-            row["val"] = val_metrics
+            history["val_epoch"].append(epoch)
+            history["val_total"].append(val_metrics["total"])
+            history["val_vision"].append(val_metrics["vision"])
+            history["val_correspondence"].append(val_metrics["correspondence"])
+            history["val_depth_structure"].append(val_metrics["depth_structure"])
+            history["val_depth_delta"].append(val_metrics["depth_delta"])
 
             log += (
                 f" | val_tot={val_metrics['total']:.4f} | "
@@ -499,7 +523,7 @@ def main():
                         "model_state_dict": model.state_dict(),
                         "optimizer_state_dict": optimizer.state_dict(),
                         "args": vars(args),
-                        "history": history + [row],
+                        "history": history,
                         "best_val_loss": best_val_loss,
                     },
                     os.path.join(
@@ -512,8 +536,6 @@ def main():
                 log += f" | BEST (val_tot={best_val_loss:.4f})"
 
         print(log, flush=True)
-
-        history.append(row)
 
         torch.save(
             {
