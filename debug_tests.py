@@ -1277,3 +1277,429 @@ def evaluate_width_prediction(model, loader, device, occ_thresh=0.5):
     print(f"GT std:           {gt.std():.3f}°")
 
     return {"pred": pred, "gt": gt}
+
+def test_ransac_failure_groups(
+    model, loader, device, occ_thresh=0.5,
+    inlier_threshold=0.4, num_iters=200,
+    fov_degrees=90.0,
+):
+    model.eval()
+    rows = []
+
+    def rigid(A, B):
+        ca, cb = A.mean(0), B.mean(0)
+        Ac, Bc = A-ca, B-cb
+        dot = (Ac[:,0]*Bc[:,0] + Ac[:,1]*Bc[:,1]).sum()
+        cross = (Ac[:,0]*Bc[:,1] - Ac[:,1]*Bc[:,0]).sum()
+        n = torch.sqrt(dot.square() + cross.square() + 1e-8)
+        c, s = dot/n, cross/n
+        R = torch.stack([torch.stack([c,-s]), torch.stack([s,c])])
+        return R, cb-R@ca, s, c
+
+    def ransac(A, B):
+        if len(A) < 2: return None
+        best, best_n, best_err = None, 0, float("inf")
+
+        for _ in range(num_iters):
+            idx = torch.randperm(len(A), device=A.device)[:2]
+            R, t, _, _ = rigid(A[idx], B[idx])
+            res = torch.linalg.vector_norm(A@R.T + t-B, dim=-1)
+            mask = res < inlier_threshold
+            n = mask.sum().item()
+
+            if n >= 2:
+                err = res[mask].mean().item()
+                if n > best_n or (n == best_n and err < best_err):
+                    best, best_n, best_err = mask, n, err
+
+        if best is None: return None
+        R, t, s, c = rigid(A[best], B[best])
+        return R, t, s, c, best
+
+    with torch.no_grad():
+        for batch in loader:
+            batch = [x.to(device, non_blocking=True) for x in batch]
+            pairs = [(batch[0],batch[1],batch[2],batch[3],batch[4])] if len(batch)==5 else [
+                (batch[0],batch[1],batch[2],batch[3],batch[4]),
+                (batch[5],batch[6],batch[7],batch[8],batch[9]),
+            ]
+
+            for img_a, gt_a, img_b, gt_b, pose_gt in pairs:
+                pred_a, pred_b, _ = model(img_a, img_b)
+                Bsz, N, _ = gt_a.shape
+                fov = torch.tensor(np.deg2rad(fov_degrees), device=device, dtype=gt_a.dtype)
+                theta = torch.linspace(-0.5*fov, 0.5*fov, N, device=device, dtype=gt_a.dtype)
+
+                pa = torch.stack([pred_a[...,2]*torch.cos(theta), pred_a[...,2]*torch.sin(theta)], -1)
+                pb = torch.stack([pred_b[...,2]*torch.cos(theta), pred_b[...,2]*torch.sin(theta)], -1)
+
+                for b in range(Bsz):
+                    ma, mb = gt_a[b,:,0] > occ_thresh, gt_b[b,:,0] > occ_thresh
+                    ida, idb = gt_a[b,:,3].round().long(), gt_b[b,:,3].round().long()
+                    A, Bp, depth_errs, gt_depths = [], [], [], []
+
+                    for cid in torch.unique(ida[ma]):
+                        ia = torch.where(ma & (ida==cid))[0]
+                        ib = torch.where(mb & (idb==cid))[0]
+                        if ia.numel()!=1 or ib.numel()!=1: continue
+                        ia, ib = ia[0], ib[0]
+                        A.append(pa[b,ia]); Bp.append(pb[b,ib])
+                        depth_errs += [
+                            (pred_a[b,ia,2]-gt_a[b,ia,2]).item(),
+                            (pred_b[b,ib,2]-gt_b[b,ib,2]).item(),
+                        ]
+                        gt_depths += [gt_a[b,ia,2].item(), gt_b[b,ib,2].item()]
+
+                    if len(A) < 2:
+                        rows.append({"failed":True, "matches":len(A)})
+                        continue
+
+                    result = ransac(torch.stack(A), torch.stack(Bp))
+                    if result is None:
+                        rows.append({"failed":True, "matches":len(A)})
+                        continue
+
+                    R, t_ext, s, c, inliers = result
+                    t_pred = F.normalize(-R.T@t_ext, dim=0)
+                    t_gt = F.normalize(pose_gt[b,:2], dim=0)
+                    t_err = torch.rad2deg(torch.acos(torch.clamp(torch.dot(t_pred,t_gt),-1,1))).item()
+
+                    yaw_gt = F.normalize(pose_gt[b,2:], dim=0)
+                    a_pred, a_gt = torch.atan2(-s,c), torch.atan2(yaw_gt[0],yaw_gt[1])
+                    dyaw = torch.atan2(torch.sin(a_pred-a_gt), torch.cos(a_pred-a_gt))
+
+                    e = np.asarray(depth_errs)
+                    gd = np.asarray(gt_depths)
+
+                    rows.append({
+                        "failed":False,
+                        "t":t_err,
+                        "yaw":abs(torch.rad2deg(dyaw).item()),
+                        "matches":len(A),
+                        "inliers":inliers.sum().item(),
+                        "depth_mae":np.abs(e).mean(),
+                        "depth_bias":e.mean(),
+                        "depth_error_std":e.std(),
+                        "gt_depth_mean":gd.mean(),
+                        "gt_depth_std":gd.std(),
+                    })
+
+    groups = {
+        "GOOD <20°":[r for r in rows if not r["failed"] and r["t"]<20],
+        "MEDIUM 20-60°":[r for r in rows if not r["failed"] and 20<=r["t"]<60],
+        "BAD >=60°":[r for r in rows if not r["failed"] and r["t"]>=60],
+        "FAILED":[r for r in rows if r["failed"]],
+    }
+
+    print("RANSAC FAILURE GROUP ANALYSIS")
+    print("-"*105)
+    print(f"{'Group':<18}{'N':>6}{'T med':>9}{'Yaw':>9}{'Matches':>9}{'Inliers':>9}{'D MAE':>9}{'D bias':>9}{'D err std':>11}{'GT depth':>10}")
+
+    for name, g in groups.items():
+        if not g: continue
+        if name == "FAILED":
+            print(f"{name:<18}{len(g):6d}{'-':>9}{'-':>9}{np.mean([x['matches'] for x in g]):9.2f}")
+            continue
+
+        mean = lambda k: np.mean([x[k] for x in g])
+        print(
+            f"{name:<18}{len(g):6d}"
+            f"{np.median([x['t'] for x in g]):9.2f}"
+            f"{mean('yaw'):9.2f}{mean('matches'):9.2f}{mean('inliers'):9.2f}"
+            f"{mean('depth_mae'):9.2f}{mean('depth_bias'):9.2f}"
+            f"{mean('depth_error_std'):11.2f}{mean('gt_depth_mean'):10.2f}"
+        )
+
+    return rows
+
+def test_oracle_delta_filter_ransac(
+    model, loader, device, occ_thresh=0.5,
+    inlier_threshold=0.4, num_iters=200, fov_degrees=90.0,
+):
+    model.eval()
+
+    configs = [
+        ("All", None),
+        ("Best 75%", 0.75),
+        ("Best 50%", 0.50),
+        ("Best 4", 4),
+    ]
+    results = {name: {"t": [], "yaw": [], "used": [], "inliers": [], "fail": 0}
+               for name, _ in configs}
+
+    def rigid(A, B):
+        ca, cb = A.mean(0), B.mean(0)
+        Ac, Bc = A-ca, B-cb
+        dot = (Ac[:,0]*Bc[:,0] + Ac[:,1]*Bc[:,1]).sum()
+        cross = (Ac[:,0]*Bc[:,1] - Ac[:,1]*Bc[:,0]).sum()
+        n = torch.sqrt(dot.square() + cross.square() + 1e-8)
+        c, s = dot/n, cross/n
+        R = torch.stack([torch.stack([c,-s]), torch.stack([s,c])])
+        return R, cb-R@ca, s, c
+
+    def ransac(A, B):
+        if len(A) < 2: return None
+        best, best_n, best_err = None, 0, float("inf")
+
+        for _ in range(num_iters):
+            idx = torch.randperm(len(A), device=A.device)[:2]
+            R, t, _, _ = rigid(A[idx], B[idx])
+            res = torch.linalg.vector_norm(A@R.T + t-B, dim=-1)
+            mask = res < inlier_threshold
+            n = mask.sum().item()
+
+            if n >= 2:
+                err = res[mask].mean().item()
+                if n > best_n or (n == best_n and err < best_err):
+                    best, best_n, best_err = mask, n, err
+
+        if best is None: return None
+        R, t, s, c = rigid(A[best], B[best])
+        return R, t, s, c, best
+
+    with torch.no_grad():
+        for batch in loader:
+            batch = [x.to(device, non_blocking=True) for x in batch]
+            pairs = [(batch[0],batch[1],batch[2],batch[3],batch[4])] if len(batch)==5 else [
+                (batch[0],batch[1],batch[2],batch[3],batch[4]),
+                (batch[5],batch[6],batch[7],batch[8],batch[9]),
+            ]
+
+            for img_a, gt_a, img_b, gt_b, pose_gt in pairs:
+                pred_a, pred_b, _ = model(img_a, img_b)
+
+                Bsz, N, _ = gt_a.shape
+                fov = torch.tensor(np.deg2rad(fov_degrees), device=device, dtype=gt_a.dtype)
+                theta = torch.linspace(-0.5*fov, 0.5*fov, N, device=device, dtype=gt_a.dtype)
+
+                pa = torch.stack([
+                    pred_a[...,2]*torch.cos(theta),
+                    pred_a[...,2]*torch.sin(theta)
+                ], -1)
+                pb = torch.stack([
+                    pred_b[...,2]*torch.cos(theta),
+                    pred_b[...,2]*torch.sin(theta)
+                ], -1)
+
+                for b in range(Bsz):
+                    ma = gt_a[b,:,0] > occ_thresh
+                    mb = gt_b[b,:,0] > occ_thresh
+                    ida = gt_a[b,:,3].round().long()
+                    idb = gt_b[b,:,3].round().long()
+
+                    A, Bp, delta_err = [], [], []
+
+                    for cid in torch.unique(ida[ma]):
+                        ia = torch.where(ma & (ida==cid))[0]
+                        ib = torch.where(mb & (idb==cid))[0]
+                        if ia.numel()!=1 or ib.numel()!=1:
+                            continue
+
+                        ia, ib = ia[0], ib[0]
+                        A.append(pa[b,ia])
+                        Bp.append(pb[b,ib])
+
+                        pred_delta = pred_b[b,ib,2] - pred_a[b,ia,2]
+                        gt_delta = gt_b[b,ib,2] - gt_a[b,ia,2]
+                        delta_err.append(torch.abs(pred_delta-gt_delta))
+
+                    if len(A) < 2:
+                        for name, _ in configs:
+                            results[name]["fail"] += 1
+                        continue
+
+                    A, Bp = torch.stack(A), torch.stack(Bp)
+                    delta_err = torch.stack(delta_err)
+                    order = torch.argsort(delta_err)
+
+                    for name, keep in configs:
+                        if keep is None:
+                            idx = order
+                        elif isinstance(keep, float):
+                            k = max(2, int(np.ceil(len(A)*keep)))
+                            idx = order[:k]
+                        else:
+                            k = min(len(A), keep)
+                            idx = order[:k]
+
+                        if len(idx) < 2:
+                            results[name]["fail"] += 1
+                            continue
+
+                        result = ransac(A[idx], Bp[idx])
+                        if result is None:
+                            results[name]["fail"] += 1
+                            continue
+
+                        R, t_ext, s, c, inliers = result
+                        t_pred = F.normalize(-R.T@t_ext, dim=0)
+                        t_gt = F.normalize(pose_gt[b,:2], dim=0)
+
+                        t_err = torch.rad2deg(torch.acos(
+                            torch.clamp(torch.dot(t_pred,t_gt), -1, 1)
+                        )).item()
+
+                        yaw_gt = F.normalize(pose_gt[b,2:], dim=0)
+                        a_pred = torch.atan2(-s,c)
+                        a_gt = torch.atan2(yaw_gt[0],yaw_gt[1])
+                        dyaw = torch.atan2(
+                            torch.sin(a_pred-a_gt),
+                            torch.cos(a_pred-a_gt)
+                        )
+
+                        results[name]["t"].append(t_err)
+                        results[name]["yaw"].append(abs(torch.rad2deg(dyaw).item()))
+                        results[name]["used"].append(len(idx))
+                        results[name]["inliers"].append(inliers.sum().item())
+
+    print("ORACLE DELTA-ERROR FILTER -> RANSAC")
+    print("-"*90)
+    print(
+        f"{'Subset':<14}{'T mean':>10}{'T med':>10}{'T p90':>10}"
+        f"{'Yaw med':>10}{'Used':>9}{'Inliers':>10}{'Fails':>8}"
+    )
+
+    for name, _ in configs:
+        r = results[name]
+        t, y = np.asarray(r["t"]), np.asarray(r["yaw"])
+
+        print(
+            f"{name:<14}"
+            f"{t.mean():10.2f}{np.median(t):10.2f}{np.percentile(t,90):10.2f}"
+            f"{np.median(y):10.2f}"
+            f"{np.mean(r['used']):9.1f}"
+            f"{np.mean(r['inliers']):10.1f}"
+            f"{r['fail']:8d}"
+        )
+
+    return results
+
+def test_pred_delta_filter_ransac(
+    model, loader, device, occ_thresh=0.5,
+    inlier_threshold=0.4, num_iters=200, fov_degrees=90.0,
+):
+    model.eval()
+    configs = [("All", None), ("Best 75%", 0.75), ("Best 50%", 0.50), ("Best 4", 4)]
+    results = {n: {"t": [], "yaw": [], "used": [], "inliers": [], "fail": 0} for n, _ in configs}
+
+    def rigid(A, B):
+        ca, cb = A.mean(0), B.mean(0)
+        Ac, Bc = A-ca, B-cb
+        dot = (Ac[:,0]*Bc[:,0] + Ac[:,1]*Bc[:,1]).sum()
+        cross = (Ac[:,0]*Bc[:,1] - Ac[:,1]*Bc[:,0]).sum()
+        norm = torch.sqrt(dot.square() + cross.square() + 1e-8)
+        c, s = dot/norm, cross/norm
+        R = torch.stack([torch.stack([c,-s]), torch.stack([s,c])])
+        return R, cb-R@ca, s, c
+
+    def ransac(A, B):
+        if len(A) < 2: return None
+        best, best_n, best_err = None, 0, float("inf")
+
+        for _ in range(num_iters):
+            idx = torch.randperm(len(A), device=A.device)[:2]
+            R, t, _, _ = rigid(A[idx], B[idx])
+            res = torch.linalg.vector_norm(A@R.T + t-B, dim=-1)
+            mask = res < inlier_threshold
+            n = mask.sum().item()
+
+            if n >= 2:
+                err = res[mask].mean().item()
+                if n > best_n or (n == best_n and err < best_err):
+                    best, best_n, best_err = mask, n, err
+
+        if best is None: return None
+        R, t, s, c = rigid(A[best], B[best])
+        return R, t, s, c, best
+
+    with torch.no_grad():
+        for batch in loader:
+            batch = [x.to(device, non_blocking=True) for x in batch]
+            pairs = [(batch[0],batch[1],batch[2],batch[3],batch[4])] if len(batch)==5 else [
+                (batch[0],batch[1],batch[2],batch[3],batch[4]),
+                (batch[5],batch[6],batch[7],batch[8],batch[9]),
+            ]
+
+            for img_a, gt_a, img_b, gt_b, pose_gt in pairs:
+                pred_a, pred_b, _ = model(img_a, img_b)
+
+                Bsz, N, _ = gt_a.shape
+                fov = torch.tensor(np.deg2rad(fov_degrees), device=device, dtype=gt_a.dtype)
+                theta = torch.linspace(-0.5*fov, 0.5*fov, N, device=device, dtype=gt_a.dtype)
+
+                pa = torch.stack([pred_a[...,2]*torch.cos(theta), pred_a[...,2]*torch.sin(theta)], -1)
+                pb = torch.stack([pred_b[...,2]*torch.cos(theta), pred_b[...,2]*torch.sin(theta)], -1)
+
+                for b in range(Bsz):
+                    ma, mb = gt_a[b,:,0]>occ_thresh, gt_b[b,:,0]>occ_thresh
+                    ida, idb = gt_a[b,:,3].round().long(), gt_b[b,:,3].round().long()
+
+                    A, Bp, score = [], [], []
+
+                    for cid in torch.unique(ida[ma]):
+                        ia = torch.where(ma & (ida==cid))[0]
+                        ib = torch.where(mb & (idb==cid))[0]
+                        if ia.numel()!=1 or ib.numel()!=1: continue
+
+                        ia, ib = ia[0], ib[0]
+                        A.append(pa[b,ia])
+                        Bp.append(pb[b,ib])
+
+                        # Inference-available reliability score:
+                        # smaller predicted cross-view depth change = more reliable
+                        score.append(torch.abs(pred_b[b,ib,2] - pred_a[b,ia,2]))
+
+                    if len(A) < 2:
+                        for name, _ in configs: results[name]["fail"] += 1
+                        continue
+
+                    A, Bp, score = torch.stack(A), torch.stack(Bp), torch.stack(score)
+                    order = torch.argsort(score)
+
+                    for name, keep in configs:
+                        if keep is None:
+                            idx = order
+                        elif isinstance(keep, float):
+                            idx = order[:max(2, int(np.ceil(len(A)*keep)))]
+                        else:
+                            idx = order[:min(len(A), keep)]
+
+                        if len(idx) < 2:
+                            results[name]["fail"] += 1
+                            continue
+
+                        result = ransac(A[idx], Bp[idx])
+                        if result is None:
+                            results[name]["fail"] += 1
+                            continue
+
+                        R, t_ext, s, c, inliers = result
+                        t_pred = F.normalize(-R.T@t_ext, dim=0)
+                        t_gt = F.normalize(pose_gt[b,:2], dim=0)
+                        t_err = torch.rad2deg(torch.acos(
+                            torch.clamp(torch.dot(t_pred,t_gt), -1, 1)
+                        )).item()
+
+                        yaw_gt = F.normalize(pose_gt[b,2:], dim=0)
+                        a_pred = torch.atan2(-s,c)
+                        a_gt = torch.atan2(yaw_gt[0],yaw_gt[1])
+                        dyaw = torch.atan2(torch.sin(a_pred-a_gt), torch.cos(a_pred-a_gt))
+
+                        results[name]["t"].append(t_err)
+                        results[name]["yaw"].append(abs(torch.rad2deg(dyaw).item()))
+                        results[name]["used"].append(len(idx))
+                        results[name]["inliers"].append(inliers.sum().item())
+
+    print("PREDICTED |DELTA DEPTH| FILTER -> RANSAC (GT CORRESPONDENCE)")
+    print("-"*94)
+    print(f"{'Subset':<14}{'T mean':>10}{'T med':>10}{'T p90':>10}{'Yaw med':>10}{'Used':>9}{'Inliers':>10}{'Fails':>8}")
+
+    for name, _ in configs:
+        r = results[name]
+        t, y = np.asarray(r["t"]), np.asarray(r["yaw"])
+        print(
+            f"{name:<14}{t.mean():10.2f}{np.median(t):10.2f}{np.percentile(t,90):10.2f}"
+            f"{np.median(y):10.2f}{np.mean(r['used']):9.1f}{np.mean(r['inliers']):10.1f}{r['fail']:8d}"
+        )
+
+    return results
