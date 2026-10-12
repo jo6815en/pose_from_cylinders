@@ -113,8 +113,8 @@ def train_one_epoch(
             depth_delta2 = matched_depth_delta_loss(pred_vision_a2, vision_a2, pred_vision_b2, vision_b2, occ_thresh)
             depth_delta_loss = 0.5 * (depth_delta1 + depth_delta2)
 
-            cons1 = matched_feature_consistency_loss(feat_a1, vision_a1, feat_b1, vision_b1, OCC_THRESH)
-            cons2 = matched_feature_consistency_loss(feat_a2, vision_a2, feat_b2, vision_b2, OCC_THRESH)
+            cons1 = matched_feature_consistency_loss(feat_a1, vision_a1, feat_b1, vision_b1, occ_thresh)
+            cons2 = matched_feature_consistency_loss(feat_a2, vision_a2, feat_b2, vision_b2, occ_thresh)
 
             feature_consistency_loss = 0.5 * (cons1 + cons2)
 
