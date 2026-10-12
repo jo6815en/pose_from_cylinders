@@ -764,6 +764,43 @@ def reliability_loss(
         target_error,
     )
 
+def matched_feature_consistency_loss(
+    feat_a, gt_a,
+    feat_b, gt_b,
+    occ_thresh=0.5,
+):
+    valid_a = gt_a[..., 0] > occ_thresh
+    valid_b = gt_b[..., 0] > occ_thresh
+
+    ids_a = gt_a[..., 3].round().long()
+    ids_b = gt_b[..., 3].round().long()
+
+    match = (
+        valid_a.unsqueeze(2)
+        & valid_b.unsqueeze(1)
+        & (ids_a.unsqueeze(2) == ids_b.unsqueeze(1))
+    )
+
+    unique_a = match.sum(dim=2) == 1
+    unique_b = match.sum(dim=1) == 1
+
+    ib = match.float().argmax(dim=2)
+    keep = unique_a & torch.gather(unique_b, 1, ib)
+
+    if not keep.any():
+        return feat_a.sum() * 0.0
+
+    feat_b_match = torch.gather(
+        feat_b,
+        1,
+        ib.unsqueeze(-1).expand(-1, -1, feat_b.shape[-1]),
+    )
+
+    fa = F.normalize(feat_a[keep], dim=-1)
+    fb = F.normalize(feat_b_match[keep], dim=-1)
+
+    return (1.0 - (fa * fb).sum(dim=-1)).mean()
+
 def compute_forest_loss(
     pred_vision_a, pred_vision_b, pred_pose, occ_thresh,
     lambda_radius, lambda_reproj, lambda_sparsity,

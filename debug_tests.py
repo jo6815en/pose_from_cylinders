@@ -1062,3 +1062,497 @@ def test_learned_reliability(model, loader, device, occ_thresh=0.5):
         "heuristic": heuristic,
         "target": target,
     }
+
+
+
+def test_learned_reliability_v2(
+    model, loader, device, occ_thresh=0.5,
+):
+    model.eval()
+
+    learned_all = []
+    heuristic_all = []
+    target_all = []
+
+    with torch.no_grad():
+        for batch in loader:
+            batch = [x.to(device, non_blocking=True) for x in batch]
+
+            pairs = (
+                [(batch[0], batch[1], batch[2], batch[3])]
+                if len(batch) == 5 else
+                [
+                    (batch[0], batch[1], batch[2], batch[3]),
+                    (batch[5], batch[6], batch[7], batch[8]),
+                ]
+            )
+
+            for img_a, gt_a, img_b, gt_b in pairs:
+
+                pred_a, pred_b, _, feat_a, feat_b = model(
+                    img_a,
+                    img_b,
+                    return_features=True,
+                )
+
+                # -----------------------------------------
+                # Vectorized GT cylinder matching
+                # -----------------------------------------
+                valid_a = gt_a[..., 0] > occ_thresh
+                valid_b = gt_b[..., 0] > occ_thresh
+
+                ids_a = gt_a[..., 3].round().long()
+                ids_b = gt_b[..., 3].round().long()
+
+                # [B, N, N]
+                match = (
+                    valid_a.unsqueeze(2)
+                    & valid_b.unsqueeze(1)
+                    & (ids_a.unsqueeze(2) == ids_b.unsqueeze(1))
+                )
+
+                unique_a = match.sum(dim=2) == 1
+                unique_b = match.sum(dim=1) == 1
+
+                # B index corresponding to each A bin
+                ib = match.float().argmax(dim=2)
+
+                selected_unique_b = torch.gather(
+                    unique_b, 1, ib
+                )
+
+                keep = unique_a & selected_unique_b
+
+                if not keep.any():
+                    continue
+
+                # -----------------------------------------
+                # Gather matched B data
+                # -----------------------------------------
+                feat_b_match = torch.gather(
+                    feat_b,
+                    1,
+                    ib.unsqueeze(-1).expand(
+                        -1, -1, feat_b.shape[-1]
+                    ),
+                )
+
+                pred_b_match = torch.gather(
+                    pred_b,
+                    1,
+                    ib.unsqueeze(-1).expand(
+                        -1, -1, pred_b.shape[-1]
+                    ),
+                )
+
+                gt_b_match = torch.gather(
+                    gt_b,
+                    1,
+                    ib.unsqueeze(-1).expand(
+                        -1, -1, gt_b.shape[-1]
+                    ),
+                )
+
+                # [M, ...]
+                fa = feat_a[keep]
+                fb = feat_b_match[keep]
+                pa = pred_a[keep]
+                pb = pred_b_match[keep]
+
+                # -----------------------------------------
+                # Learned reliability
+                # -----------------------------------------
+                learned = model.reliability_head(
+                    fa, fb, pa, pb
+                )
+
+                # -----------------------------------------
+                # Previous simple heuristic
+                # -----------------------------------------
+                pred_delta = pb[:, 2] - pa[:, 2]
+
+                heuristic = torch.abs(pred_delta)
+
+                # -----------------------------------------
+                # True reliability target
+                # -----------------------------------------
+                gt_delta = (
+                    gt_b_match[..., 2][keep]
+                    - gt_a[..., 2][keep]
+                )
+
+                target = torch.abs(
+                    pred_delta - gt_delta
+                )
+
+                learned_all.append(learned.cpu())
+                heuristic_all.append(heuristic.cpu())
+                target_all.append(target.cpu())
+
+    learned = torch.cat(learned_all).numpy()
+    heuristic = torch.cat(heuristic_all).numpy()
+    target = torch.cat(target_all).numpy()
+
+    def corr(x, y):
+        if np.std(x) < 1e-8 or np.std(y) < 1e-8:
+            return np.nan
+        return np.corrcoef(x, y)[0, 1]
+
+    def ranking_stats(score):
+        order = np.argsort(score)  # low = reliable
+        q = max(1, len(order) // 4)
+
+        return (
+            target[order[:q]].mean(),
+            target[order[-q:]].mean(),
+        )
+
+    learned_good, learned_bad = ranking_stats(learned)
+    heuristic_good, heuristic_bad = ranking_stats(heuristic)
+
+    oracle_order = np.argsort(target)
+    q = max(1, len(oracle_order) // 4)
+
+    oracle_good = target[oracle_order[:q]].mean()
+    oracle_bad = target[oracle_order[-q:]].mean()
+
+    print("LEARNED RELIABILITY V2 — MATCHED FEATURES")
+    print("-" * 76)
+
+    print(f"Matched cylinders:          {len(target)}")
+    print(f"True delta error mean:      {target.mean():.3f} m")
+    print(f"True delta error median:    {np.median(target):.3f} m")
+    print()
+
+    print(
+        f"{'Ranking':<24}"
+        f"{'Corr w/error':>15}"
+        f"{'Best 25%':>15}"
+        f"{'Worst 25%':>15}"
+    )
+    print("-" * 76)
+
+    print(
+        f"{'Learned reliability':<24}"
+        f"{corr(learned, target):15.3f}"
+        f"{learned_good:15.3f}"
+        f"{learned_bad:15.3f}"
+    )
+
+    print(
+        f"{'Pred |delta depth|':<24}"
+        f"{corr(heuristic, target):15.3f}"
+        f"{heuristic_good:15.3f}"
+        f"{heuristic_bad:15.3f}"
+    )
+
+    print(
+        f"{'Oracle':<24}"
+        f"{1.0:15.3f}"
+        f"{oracle_good:15.3f}"
+        f"{oracle_bad:15.3f}"
+    )
+
+    print()
+    print("LEARNED OUTPUT")
+    print("-" * 40)
+    print(f"Mean: {learned.mean():.3f} m")
+    print(f"Std:  {learned.std():.3f} m")
+    print(f"Min:  {learned.min():.3f} m")
+    print(f"Max:  {learned.max():.3f} m")
+
+    return {
+        "learned": learned,
+        "heuristic": heuristic,
+        "target": target,
+    }
+
+
+def test_learned_reliability_ransac(
+    model, loader, device, occ_thresh=0.5,
+    inlier_threshold=0.4, num_iters=200, fov_degrees=90.0,
+):
+    model.eval()
+
+    configs = [
+        ("All", None),
+        ("Best 75%", 0.75),
+        ("Best 50%", 0.50),
+        ("Best 4", 4),
+    ]
+
+    results = {
+        name: {"t": [], "yaw": [], "used": [], "inliers": [], "fail": 0}
+        for name, _ in configs
+    }
+
+    def rigid(A, B):
+        ca, cb = A.mean(0), B.mean(0)
+        Ac, Bc = A - ca, B - cb
+
+        dot = (Ac[:, 0]*Bc[:, 0] + Ac[:, 1]*Bc[:, 1]).sum()
+        cross = (Ac[:, 0]*Bc[:, 1] - Ac[:, 1]*Bc[:, 0]).sum()
+
+        norm = torch.sqrt(dot.square() + cross.square() + 1e-8)
+        c, s = dot/norm, cross/norm
+
+        R = torch.stack([
+            torch.stack([c, -s]),
+            torch.stack([s,  c]),
+        ])
+
+        return R, cb - R @ ca, s, c
+
+    def ransac(A, B):
+        if len(A) < 2:
+            return None
+
+        best = None
+        best_n = 0
+        best_err = float("inf")
+
+        for _ in range(num_iters):
+            idx = torch.randperm(len(A), device=A.device)[:2]
+
+            R, t, _, _ = rigid(A[idx], B[idx])
+
+            res = torch.linalg.vector_norm(
+                A @ R.T + t - B,
+                dim=-1,
+            )
+
+            mask = res < inlier_threshold
+            n = mask.sum().item()
+
+            if n < 2:
+                continue
+
+            err = res[mask].mean().item()
+
+            if n > best_n or (n == best_n and err < best_err):
+                best = mask
+                best_n = n
+                best_err = err
+
+        if best is None:
+            return None
+
+        R, t, s, c = rigid(A[best], B[best])
+
+        return R, t, s, c, best
+
+    with torch.no_grad():
+        for batch in loader:
+            batch = [
+                x.to(device, non_blocking=True)
+                for x in batch
+            ]
+
+            pairs = (
+                [(batch[0], batch[1], batch[2], batch[3], batch[4])]
+                if len(batch) == 5 else
+                [
+                    (batch[0], batch[1], batch[2], batch[3], batch[4]),
+                    (batch[5], batch[6], batch[7], batch[8], batch[9]),
+                ]
+            )
+
+            for img_a, gt_a, img_b, gt_b, pose_gt in pairs:
+
+                pred_a, pred_b, _, feat_a, feat_b = model(
+                    img_a,
+                    img_b,
+                    return_features=True,
+                )
+
+                Bsz, N, _ = gt_a.shape
+
+                fov = torch.tensor(
+                    np.deg2rad(fov_degrees),
+                    device=device,
+                    dtype=gt_a.dtype,
+                )
+
+                theta = torch.linspace(
+                    -0.5*fov,
+                    0.5*fov,
+                    N,
+                    device=device,
+                    dtype=gt_a.dtype,
+                )
+
+                pts_a = torch.stack([
+                    pred_a[..., 2] * torch.cos(theta),
+                    pred_a[..., 2] * torch.sin(theta),
+                ], dim=-1)
+
+                pts_b = torch.stack([
+                    pred_b[..., 2] * torch.cos(theta),
+                    pred_b[..., 2] * torch.sin(theta),
+                ], dim=-1)
+
+                # ------------------------------------------
+                # Vectorized GT correspondence
+                # ------------------------------------------
+                valid_a = gt_a[..., 0] > occ_thresh
+                valid_b = gt_b[..., 0] > occ_thresh
+
+                ids_a = gt_a[..., 3].round().long()
+                ids_b = gt_b[..., 3].round().long()
+
+                match = (
+                    valid_a.unsqueeze(2)
+                    & valid_b.unsqueeze(1)
+                    & (ids_a.unsqueeze(2) == ids_b.unsqueeze(1))
+                )
+
+                unique_a = match.sum(dim=2) == 1
+                unique_b = match.sum(dim=1) == 1
+
+                ib_all = match.float().argmax(dim=2)
+
+                selected_unique_b = torch.gather(
+                    unique_b,
+                    1,
+                    ib_all,
+                )
+
+                keep_all = unique_a & selected_unique_b
+
+                for b in range(Bsz):
+
+                    ia = torch.where(keep_all[b])[0]
+
+                    if ia.numel() < 2:
+                        for name, _ in configs:
+                            results[name]["fail"] += 1
+                        continue
+
+                    ib = ib_all[b, ia]
+
+                    A = pts_a[b, ia]
+                    Bpts = pts_b[b, ib]
+
+                    # ------------------------------------------
+                    # Learned reliability for ACTUAL A-B pairs
+                    # ------------------------------------------
+                    score = model.reliability_head(
+                        feat_a[b, ia],
+                        feat_b[b, ib],
+                        pred_a[b, ia],
+                        pred_b[b, ib],
+                    )
+
+                    # Lower predicted error = more reliable
+                    order = torch.argsort(score)
+
+                    for name, keep in configs:
+
+                        if keep is None:
+                            idx = order
+
+                        elif isinstance(keep, float):
+                            k = max(
+                                2,
+                                int(np.ceil(len(A) * keep)),
+                            )
+                            idx = order[:k]
+
+                        else:
+                            k = min(len(A), keep)
+                            idx = order[:k]
+
+                        if len(idx) < 2:
+                            results[name]["fail"] += 1
+                            continue
+
+                        result = ransac(
+                            A[idx],
+                            Bpts[idx],
+                        )
+
+                        if result is None:
+                            results[name]["fail"] += 1
+                            continue
+
+                        R, t_ext, s, c, inliers = result
+
+                        # Translation direction
+                        t_pred = F.normalize(
+                            -R.T @ t_ext,
+                            dim=0,
+                        )
+
+                        t_gt = F.normalize(
+                            pose_gt[b, :2],
+                            dim=0,
+                        )
+
+                        t_err = torch.rad2deg(
+                            torch.acos(
+                                torch.clamp(
+                                    torch.dot(t_pred, t_gt),
+                                    -1.0,
+                                    1.0,
+                                )
+                            )
+                        ).item()
+
+                        # Yaw
+                        yaw_gt = F.normalize(
+                            pose_gt[b, 2:],
+                            dim=0,
+                        )
+
+                        a_pred = torch.atan2(-s, c)
+                        a_gt = torch.atan2(
+                            yaw_gt[0],
+                            yaw_gt[1],
+                        )
+
+                        dyaw = torch.atan2(
+                            torch.sin(a_pred - a_gt),
+                            torch.cos(a_pred - a_gt),
+                        )
+
+                        results[name]["t"].append(t_err)
+                        results[name]["yaw"].append(
+                            abs(torch.rad2deg(dyaw).item())
+                        )
+                        results[name]["used"].append(len(idx))
+                        results[name]["inliers"].append(
+                            inliers.sum().item()
+                        )
+
+    print("LEARNED RELIABILITY V2 FILTER -> RANSAC (GT CORRESPONDENCE)")
+    print("-" * 98)
+
+    print(
+        f"{'Subset':<14}"
+        f"{'T mean':>10}"
+        f"{'T med':>10}"
+        f"{'T p90':>10}"
+        f"{'Yaw med':>10}"
+        f"{'Used':>9}"
+        f"{'Inliers':>10}"
+        f"{'Fails':>8}"
+    )
+
+    for name, _ in configs:
+        r = results[name]
+
+        t = np.asarray(r["t"])
+        yaw = np.asarray(r["yaw"])
+
+        print(
+            f"{name:<14}"
+            f"{t.mean():10.2f}"
+            f"{np.median(t):10.2f}"
+            f"{np.percentile(t, 90):10.2f}"
+            f"{np.median(yaw):10.2f}"
+            f"{np.mean(r['used']):9.1f}"
+            f"{np.mean(r['inliers']):10.1f}"
+            f"{r['fail']:8d}"
+        )
+
+    return results
