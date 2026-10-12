@@ -705,45 +705,64 @@ def reliability_loss(
     feat_b, pred_b, gt_b,
     occ_thresh=0.5,
 ):
-    pred_errors, targets = [], []
+    B, N, _ = gt_a.shape
 
-    for b in range(gt_a.shape[0]):
-        mask_a = gt_a[b, :, 0] > occ_thresh
-        mask_b = gt_b[b, :, 0] > occ_thresh
-        ids_a = gt_a[b, :, 3].round().long()
-        ids_b = gt_b[b, :, 3].round().long()
+    # [B, N]
+    valid_a = gt_a[..., 0] > occ_thresh
+    valid_b = gt_b[..., 0] > occ_thresh
 
-        for cid in torch.unique(ids_a[mask_a]):
-            ia = torch.where(mask_a & (ids_a == cid))[0]
-            ib = torch.where(mask_b & (ids_b == cid))[0]
+    ids_a = gt_a[..., 3].round().long()
+    ids_b = gt_b[..., 3].round().long()
 
-            if ia.numel() != 1 or ib.numel() != 1:
-                continue
-
-            ia, ib = ia[0], ib[0]
-
-            pred_error = reliability_head(
-                feat_a[b, ia],
-                feat_b[b, ib],
-                pred_a[b, ia],
-                pred_b[b, ib],
-            )
-
-            pred_delta = pred_b[b, ib, 2].detach() - pred_a[b, ia, 2].detach()
-            gt_delta = gt_b[b, ib, 2] - gt_a[b, ia, 2]
-            target_error = torch.abs(pred_delta - gt_delta)
-
-            pred_errors.append(pred_error)
-            targets.append(target_error)
-
-    if not pred_errors:
-        return feat_a.sum() * 0.0
-
-    return F.smooth_l1_loss(
-        torch.stack(pred_errors),
-        torch.stack(targets),
+    # [B, N, N]
+    # True where A-bin i and B-bin j contain the same valid cylinder.
+    match = (
+        valid_a.unsqueeze(2)
+        & valid_b.unsqueeze(1)
+        & (ids_a.unsqueeze(2) == ids_b.unsqueeze(1))
     )
 
+    # Require a unique match in both directions.
+    unique_a = match.sum(dim=2) == 1
+    unique_b = match.sum(dim=1) == 1
+
+    # B index corresponding to each A bin.
+    ib = match.float().argmax(dim=2)  # [B, N]
+
+    # Gather whether selected B bin is unique.
+    selected_unique_b = torch.gather(unique_b, 1, ib)
+    keep = unique_a & selected_unique_b
+
+    if not keep.any():
+        return feat_a.sum() * 0.0
+
+    # Gather matched B features/predictions for every A bin.
+    feat_b_match = torch.gather(feat_b, 1, ib.unsqueeze(-1).expand(-1, -1, feat_b.shape[-1]))
+
+    pred_b_match = torch.gather(pred_b, 1, ib.unsqueeze(-1).expand(-1, -1, pred_b.shape[-1]))
+
+    gt_b_match = torch.gather(gt_b, 1, ib.unsqueeze(-1).expand(-1, -1, gt_b.shape[-1]))
+
+    # Flatten only valid matched cylinders: [M, ...]
+    fa = feat_a[keep]
+    fb = feat_b_match[keep]
+    pa = pred_a[keep]
+    pb = pred_b_match[keep]
+
+    # ONE batched ReliabilityHead call.
+    pred_error = reliability_head(fa, fb, pa, pb)
+
+    # Target must not backprop into depth predictions.
+    pred_delta = (pb[:, 2].detach() - pa[:, 2].detach())
+
+    gt_delta = (gt_b_match[..., 2][keep] - gt_a[..., 2][keep])
+
+    target_error = torch.abs(pred_delta - gt_delta)
+
+    return F.smooth_l1_loss(
+        pred_error,
+        target_error,
+    )
 
 def compute_forest_loss(
     pred_vision_a, pred_vision_b, pred_pose, occ_thresh,
