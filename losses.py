@@ -700,17 +700,16 @@ def matched_depth_delta_loss(
     return torch.stack(losses).mean()
 
 def reliability_loss(
-    pred_reliability,
-    pred_a, gt_a,
-    pred_b, gt_b,
+    reliability_head,
+    feat_a, pred_a, gt_a,
+    feat_b, pred_b, gt_b,
     occ_thresh=0.5,
 ):
-    losses = []
+    pred_errors, targets = [], []
 
     for b in range(gt_a.shape[0]):
         mask_a = gt_a[b, :, 0] > occ_thresh
         mask_b = gt_b[b, :, 0] > occ_thresh
-
         ids_a = gt_a[b, :, 3].round().long()
         ids_b = gt_b[b, :, 3].round().long()
 
@@ -723,31 +722,27 @@ def reliability_loss(
 
             ia, ib = ia[0], ib[0]
 
-            pred_delta = (
-                pred_b[b, ib, 2].detach()
-                - pred_a[b, ia, 2].detach()
+            pred_error = reliability_head(
+                feat_a[b, ia],
+                feat_b[b, ib],
+                pred_a[b, ia],
+                pred_b[b, ib],
             )
 
-            gt_delta = (
-                gt_b[b, ib, 2]
-                - gt_a[b, ia, 2]
-            )
+            pred_delta = pred_b[b, ib, 2].detach() - pred_a[b, ia, 2].detach()
+            gt_delta = gt_b[b, ib, 2] - gt_a[b, ia, 2]
+            target_error = torch.abs(pred_delta - gt_delta)
 
-            target_error = torch.abs(
-                pred_delta - gt_delta
-            )
+            pred_errors.append(pred_error)
+            targets.append(target_error)
 
-            losses.append(
-                F.smooth_l1_loss(
-                    pred_reliability[b, ia],
-                    target_error,
-                )
-            )
+    if not pred_errors:
+        return feat_a.sum() * 0.0
 
-    if not losses:
-        return pred_reliability.sum() * 0.0
-
-    return torch.stack(losses).mean()
+    return F.smooth_l1_loss(
+        torch.stack(pred_errors),
+        torch.stack(targets),
+    )
 
 
 def compute_forest_loss(

@@ -428,15 +428,8 @@ class ReliabilityHead(nn.Module):
         )
 
     def forward(self, feat_a, feat_b, vision_a, vision_b):
-        x = torch.cat([
-            feat_a.detach(),
-            feat_b.detach(),
-            vision_a.detach(),
-            vision_b.detach(),
-        ], dim=-1)
-
+        x = torch.cat([feat_a, feat_b, vision_a, vision_b], dim=-1)
         return F.softplus(self.net(x).squeeze(-1))
-
 
 class RansacPoseEstimator(nn.Module):
     def __init__(
@@ -683,7 +676,12 @@ class PairImageCylinderModel(nn.Module):
         )
 
     def forward(
-        self, img_a, img_b, return_attention=False, return_corr=False,
+        self,
+        img_a,
+        img_b,
+        return_attention=False,
+        return_corr=False,
+        return_features=False,
     ):
         if return_attention:
             _, _, patches_a, patches_b, attn_ab_all, attn_ba_all = self.backbone(
@@ -693,24 +691,17 @@ class PairImageCylinderModel(nn.Module):
             _, _, patches_a, patches_b = self.backbone(img_a, img_b)
 
         vision_a, feat_a = self.vision_head(patches_a, return_features=True)
-        vision_b, feat_b = self.vision_head(patches_b, return_features=True)
+        vision_b, feat_b = self.vision_head(patches_b,return_features=True)
 
-        corr_a, corr_b = self.corr_decoder(
-            patches_a,
-            patches_b,
-        )
+        corr_a, corr_b = self.corr_decoder(patches_a, patches_b)
 
-        reliability = self.reliability_head(
-            feat_a,
-            feat_b,
-            vision_a,
-            vision_b,
-        )
+        outputs = (vision_a, vision_b, None)
 
-        outputs = (vision_a, vision_b, reliability)
-        
         if return_corr:
             outputs += (corr_a, corr_b)
+
+        if return_features:
+            outputs += (feat_a, feat_b)
 
         if return_attention:
             outputs += (attn_ab_all, attn_ba_all)

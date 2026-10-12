@@ -69,15 +69,17 @@ def train_one_epoch(
             dtype=torch.float16,
             enabled=(device.type == "cuda"),
         ):
-            pred_vision_a1, pred_vision_b1, reliability1, corr_a1, corr_b1 = model(
+            pred_vision_a1, pred_vision_b1, _, corr_a1, corr_b1, feat_a1, feat_b1 = model(
                 img_a1,
                 img_b1,
                 return_corr=True,
+                return_features=True,
             )
-            pred_vision_a2, pred_vision_b2, reliability2, corr_a2, corr_b2 = model(
+            pred_vision_a2, pred_vision_b2, _, corr_a2, corr_b2, feat_a2, feat_b2 = model(
                 img_a2,
                 img_b2,
                 return_corr=True,
+                return_features=True,
             )
 
             vis_a1, *_ = vision_loss(pred_vision_a1, vision_a1, occ_thresh=occ_thresh, lambda_occ=lambda_occ,
@@ -109,8 +111,18 @@ def train_one_epoch(
             depth_delta2 = matched_depth_delta_loss(pred_vision_a2, vision_a2, pred_vision_b2, vision_b2, occ_thresh)
             depth_delta_loss = 0.5 * (depth_delta1 + depth_delta2)
 
-            rel1 = reliability_loss(reliability1, pred_vision_a1, vision_a1, pred_vision_b1, vision_b1, occ_thresh)
-            rel2 = reliability_loss(reliability2, pred_vision_a2, vision_a2, pred_vision_b2, vision_b2, occ_thresh)
+            rel1 = reliability_loss(
+                model.reliability_head,
+                feat_a1, pred_vision_a1, vision_a1,
+                feat_b1, pred_vision_b1, vision_b1,
+                occ_thresh,
+            )
+            rel2 = reliability_loss(
+                model.reliability_head,
+                feat_a2, pred_vision_a2, vision_a2,
+                feat_b2, pred_vision_b2, vision_b2,
+                occ_thresh,
+            )
 
             reliability_loss_total = 0.5 * (rel1 + rel2)
 
@@ -174,10 +186,11 @@ def validate(
             _pose_ab,
         ) = move_batch_to_device(batch, device)
 
-        pred_vision_a, pred_vision_b, reliability, corr_a, corr_b = model(
+        pred_vision_a, pred_vision_b, _, corr_a, corr_b, feat_a, feat_b = model(
             img_a,
             img_b,
             return_corr=True,
+            return_features=True,
         )
 
         vis_a, *_ = vision_loss(pred_vision_a, vision_a, occ_thresh=occ_thresh, lambda_occ=lambda_occ,
@@ -195,7 +208,12 @@ def validate(
 
         depth_delta_loss = matched_depth_delta_loss(pred_vision_a, vision_a, pred_vision_b, vision_b, occ_thresh)
 
-        rel_loss = reliability_loss(reliability, pred_vision_a, vision_a, pred_vision_b, vision_b, occ_thresh)
+        rel_loss = reliability_loss(
+            model.reliability_head,
+            feat_a, pred_vision_a, vision_a,
+            feat_b, pred_vision_b, vision_b,
+            occ_thresh,
+        )
 
         total_loss = (
             vision_loss_total

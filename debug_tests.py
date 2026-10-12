@@ -1703,3 +1703,86 @@ def test_pred_delta_filter_ransac(
         )
 
     return results
+
+def test_learned_reliability(model, loader, device, occ_thresh=0.5):
+    model.eval()
+    learned, heuristic, target = [], [], []
+
+    with torch.no_grad():
+        for batch in loader:
+            batch = [x.to(device, non_blocking=True) for x in batch]
+            pairs = [(batch[0],batch[1],batch[2],batch[3])] if len(batch)==5 else [
+                (batch[0],batch[1],batch[2],batch[3]),
+                (batch[5],batch[6],batch[7],batch[8]),
+            ]
+
+            for img_a, gt_a, img_b, gt_b in pairs:
+                pred_a, pred_b, reliability = model(img_a, img_b)
+
+                for b in range(img_a.shape[0]):
+                    ma = gt_a[b,:,0] > occ_thresh
+                    mb = gt_b[b,:,0] > occ_thresh
+                    ida = gt_a[b,:,3].round().long()
+                    idb = gt_b[b,:,3].round().long()
+
+                    for cid in torch.unique(ida[ma]):
+                        ia = torch.where(ma & (ida == cid))[0]
+                        ib = torch.where(mb & (idb == cid))[0]
+                        if ia.numel()!=1 or ib.numel()!=1:
+                            continue
+
+                        ia, ib = ia[0], ib[0]
+
+                        pred_delta = pred_b[b,ib,2] - pred_a[b,ia,2]
+                        gt_delta = gt_b[b,ib,2] - gt_a[b,ia,2]
+                        true_error = torch.abs(pred_delta - gt_delta)
+
+                        learned.append(reliability[b,ia].item())
+                        heuristic.append(torch.abs(pred_delta).item())
+                        target.append(true_error.item())
+
+    learned = np.asarray(learned)
+    heuristic = np.asarray(heuristic)
+    target = np.asarray(target)
+
+    def corr(x, y):
+        return np.corrcoef(x, y)[0,1]
+
+    def ranking_stats(score):
+        order = np.argsort(score)  # low = predicted reliable
+        n = len(order)
+        q = max(1, n//4)
+        return target[order[:q]].mean(), target[order[-q:]].mean()
+
+    l_good, l_bad = ranking_stats(learned)
+    h_good, h_bad = ranking_stats(heuristic)
+
+    oracle = np.argsort(target)
+    q = max(1, len(oracle)//4)
+    o_good = target[oracle[:q]].mean()
+    o_bad = target[oracle[-q:]].mean()
+
+    print("LEARNED RELIABILITY")
+    print("-"*72)
+    print(f"Matched cylinders:          {len(target)}")
+    print(f"True delta error mean:      {target.mean():.3f} m")
+    print(f"True delta error median:    {np.median(target):.3f} m")
+    print()
+    print(f"{'Ranking':<22}{'Corr w/error':>15}{'Best 25%':>15}{'Worst 25%':>15}")
+    print("-"*72)
+    print(f"{'Learned reliability':<22}{corr(learned,target):15.3f}{l_good:15.3f}{l_bad:15.3f}")
+    print(f"{'Pred |delta depth|':<22}{corr(heuristic,target):15.3f}{h_good:15.3f}{h_bad:15.3f}")
+    print(f"{'Oracle':<22}{1.0:15.3f}{o_good:15.3f}{o_bad:15.3f}")
+    print()
+    print("LEARNED OUTPUT")
+    print("-"*40)
+    print(f"Mean: {learned.mean():.3f} m")
+    print(f"Std:  {learned.std():.3f} m")
+    print(f"Min:  {learned.min():.3f} m")
+    print(f"Max:  {learned.max():.3f} m")
+
+    return {
+        "learned": learned,
+        "heuristic": heuristic,
+        "target": target,
+    }
