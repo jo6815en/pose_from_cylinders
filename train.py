@@ -17,6 +17,7 @@ from losses import (
     relative_depth_structure_loss,
     matched_depth_delta_loss,
     reliability_loss,
+    matched_feature_consistency_loss
 )
 
 
@@ -36,6 +37,7 @@ def train_one_epoch(
     lambda_depth_delta,
     lambda_width,
     lambda_reliability,
+    lambda_feature_consistency,
     scaler,
 ):
     model.train()
@@ -111,27 +113,17 @@ def train_one_epoch(
             depth_delta2 = matched_depth_delta_loss(pred_vision_a2, vision_a2, pred_vision_b2, vision_b2, occ_thresh)
             depth_delta_loss = 0.5 * (depth_delta1 + depth_delta2)
 
-            rel1 = reliability_loss(
-                model.reliability_head,
-                feat_a1, pred_vision_a1, vision_a1,
-                feat_b1, pred_vision_b1, vision_b1,
-                occ_thresh,
-            )
-            rel2 = reliability_loss(
-                model.reliability_head,
-                feat_a2, pred_vision_a2, vision_a2,
-                feat_b2, pred_vision_b2, vision_b2,
-                occ_thresh,
-            )
+            cons1 = matched_feature_consistency_loss(feat_a1, vision_a1, feat_b1, vision_b1, occ_thresh)
+            cons2 = matched_feature_consistency_loss(feat_a2, vision_a2, feat_b2, vision_b2, occ_thresh)
 
-            reliability_loss_total = 0.5 * (rel1 + rel2)
+            feature_consistency_loss = 0.5 * (cons1 + cons2)
 
             loss = (
                 vision_loss_total
                 + lambda_corr * corr_loss
                 + 0.5 * depth_structure_loss
                 + lambda_depth_delta * depth_delta_loss
-                + lambda_reliability * reliability_loss_total
+                + lambda_feature_consistency * feature_consistency_loss
             )
 
         scaler.scale(loss).backward()
@@ -162,6 +154,7 @@ def validate(
     lambda_depth_delta,
     lambda_width,
     lambda_reliability,
+    lambda_feature_consistency
 ):
     model.eval()
 
@@ -208,19 +201,15 @@ def validate(
 
         depth_delta_loss = matched_depth_delta_loss(pred_vision_a, vision_a, pred_vision_b, vision_b, occ_thresh)
 
-        rel_loss = reliability_loss(
-            model.reliability_head,
-            feat_a, pred_vision_a, vision_a,
-            feat_b, pred_vision_b, vision_b,
-            occ_thresh,
-        )
+        feature_consistency_loss = matched_feature_consistency_loss(feat_a, vision_a, feat_b, vision_b, occ_thresh)
 
         total_loss = (
             vision_loss_total
             + lambda_corr * corr_loss
             + 0.5 * depth_structure_loss
             + lambda_depth_delta * depth_delta_loss
-            + lambda_reliability * rel_loss
+            + lambda_feature_consistency * feature_consistency_loss
+
         )
 
         radius_a, position_a = relative_cylinder_errors(
@@ -283,6 +272,7 @@ def main():
     parser.add_argument("--lambda-depth-delta", type=float, default=0.25)
     parser.add_argument("--lambda-width", type=float, default=0.1)
     parser.add_argument("--lambda-reliability", type=float, default=1.0)
+    parser.add_argument("--lambda-feature-consistency", type=float, default=0.1)
 
     parser.add_argument(
         "--output-dir",
@@ -408,6 +398,7 @@ def main():
             args.lambda_depth_delta,
             args.lambda_width,
             args.lambda_reliability,
+            args.lambda_feature_consistency,
             scaler,
         )
 
@@ -439,6 +430,7 @@ def main():
                 args.lambda_depth_delta,
                 args.lambda_width,
                 args.lambda_reliability,
+                args.lambda_feature_consistency,
             )
 
             history["val_epoch"].append(epoch)
