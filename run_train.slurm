@@ -7,7 +7,7 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --gpus=1
 #SBATCH -t 24:00:00
-#SBATCH -J new_model
+#SBATCH -J cons_loss_005
 
 #SBATCH -o logs/%x-%j.out
 #SBATCH -e logs/%x-%j.err
@@ -34,8 +34,9 @@ python --version
 echo "Starting training..."
 
 srun python train.py \
-    --epochs 300 \
-    --batch-size 256 \
+    --lambda-feature-consistency 0.05
+    --epochs 100 \
+    --batch-size 16 \
     --lr 5e-5\
     --num-workers 4\
     --output-dir runs/slurm_${SLURM_JOB_NAME}
