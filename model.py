@@ -418,7 +418,8 @@ class CorrespondenceDecoder(nn.Module):
 
         return F.normalize(corr, dim=-1)
 
-class ReliabilityHead(nn.Module):
+
+class CrossViewDeltaHead(nn.Module):
     def __init__(self, embed_dim=192, hidden_dim=128):
         super().__init__()
         self.net = nn.Sequential(
@@ -428,8 +429,14 @@ class ReliabilityHead(nn.Module):
         )
 
     def forward(self, feat_a, feat_b, vision_a, vision_b):
-        x = torch.cat([feat_a, feat_b, vision_a, vision_b], dim=-1)
-        return F.softplus(self.net(x).squeeze(-1))
+        x = torch.cat([
+            feat_a,
+            feat_b,
+            vision_a,
+            vision_b,
+        ], dim=-1)
+
+        return self.net(x).squeeze(-1)
 
 class RansacPoseEstimator(nn.Module):
     def __init__(
@@ -664,7 +671,7 @@ class PairImageCylinderModel(nn.Module):
             grid_w=self.backbone.patch_embed.grid_w,
             output_cols=16,
         )
-        self.reliability_head = ReliabilityHead(
+        self.cross_delta_head = CrossViewDeltaHead(
             embed_dim=embed_dim,
             hidden_dim=128,
         )

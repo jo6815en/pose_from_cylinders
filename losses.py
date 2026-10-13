@@ -801,6 +801,75 @@ def matched_feature_consistency_loss(
 
     return (1.0 - (fa * fb).sum(dim=-1)).mean()
 
+def cross_view_delta_loss(
+    cross_delta_head,
+    feat_a, pred_a, gt_a,
+    feat_b, pred_b, gt_b,
+    occ_thresh=0.5,
+):
+    valid_a = gt_a[..., 0] > occ_thresh
+    valid_b = gt_b[..., 0] > occ_thresh
+
+    ids_a = gt_a[..., 3].round().long()
+    ids_b = gt_b[..., 3].round().long()
+
+    # [B, N, N]
+    match = (
+        valid_a.unsqueeze(2)
+        & valid_b.unsqueeze(1)
+        & (ids_a.unsqueeze(2) == ids_b.unsqueeze(1))
+    )
+
+    unique_a = match.sum(dim=2) == 1
+    unique_b = match.sum(dim=1) == 1
+
+    ib = match.float().argmax(dim=2)
+    keep = unique_a & torch.gather(unique_b, 1, ib)
+
+    if not keep.any():
+        return feat_a.sum() * 0.0
+
+    feat_b_match = torch.gather(
+        feat_b,
+        1,
+        ib.unsqueeze(-1).expand(-1, -1, feat_b.shape[-1]),
+    )
+
+    pred_b_match = torch.gather(
+        pred_b,
+        1,
+        ib.unsqueeze(-1).expand(-1, -1, pred_b.shape[-1]),
+    )
+
+    gt_b_match = torch.gather(
+        gt_b,
+        1,
+        ib.unsqueeze(-1).expand(-1, -1, gt_b.shape[-1]),
+    )
+
+    fa = feat_a[keep]
+    fb = feat_b_match[keep]
+    pa = pred_a[keep]
+    pb = pred_b_match[keep]
+
+    pred_delta = cross_delta_head(
+        fa,
+        fb,
+        pa,
+        pb,
+    )
+
+    # Actual geometric target, not prediction error.
+    target_delta = (
+        gt_b_match[..., 2][keep]
+        - gt_a[..., 2][keep]
+    )
+
+    return F.smooth_l1_loss(
+        pred_delta,
+        target_delta,
+    )
+
 def compute_forest_loss(
     pred_vision_a, pred_vision_b, pred_pose, occ_thresh,
     lambda_radius, lambda_reproj, lambda_sparsity,
