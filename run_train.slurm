@@ -34,7 +34,7 @@ python --version
 echo "Starting training..."
 
 srun python train.py \
-    --lambda-feature-consistency 0.05
+    --lambda-feature-consistency 0.05 \
     --epochs 100 \
     --batch-size 16 \
     --lr 5e-5\
