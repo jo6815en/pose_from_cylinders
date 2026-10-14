@@ -345,8 +345,8 @@ def main():
     raw_model = model
 
     # Compile the model used for forward/backward.
-    if device.type == "cuda":
-        model = torch.compile(model)
+    #if device.type == "cuda":
+    #    model = torch.compile(model)
 
     optimizer = torch.optim.AdamW(
         model.parameters(),
