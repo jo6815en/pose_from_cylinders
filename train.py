@@ -3,6 +3,7 @@ import json
 import os
 import random
 import numpy as np
+import time
 
 import torch
 from torch.utils.data import DataLoader
@@ -373,8 +374,8 @@ def main():
     }
     best_val_loss = float("inf")
 
-
     for epoch in range(1, args.epochs + 1):
+        epoch_start = time.perf_counter()
         train_metrics = train_one_epoch(
             model,
             train_loader,
@@ -457,6 +458,8 @@ def main():
 
                 log += f" | BEST (val_tot={best_val_loss:.4f})"
 
+        epoch_time = time.perf_counter() - epoch_start
+        log += f" | time={epoch_time:.1f}s"
         print(log, flush=True)
 
         torch.save(
