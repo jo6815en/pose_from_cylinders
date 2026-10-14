@@ -399,7 +399,7 @@ def main():
             f"vis={train_metrics['vision']:.4f} | "
             f"corr={train_metrics['correspondence']:.4f} | "
             f"struct={train_metrics['depth_structure']:.4f} | "
-            f"delta={train_metrics['depth_delta']:.4f}"
+            f"delta={train_metrics['depth_delta']:.4f} | "
             f"gate={gate:.4f}"
         )
 
