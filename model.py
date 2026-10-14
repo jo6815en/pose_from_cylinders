@@ -350,7 +350,7 @@ class CrossViewDepthRefiner(nn.Module):
         )
 
         self.gate = nn.Parameter(
-            torch.tensor(-4.0)
+            torch.tensor(-2.0)
         )
 
     def forward(self, feat_a, feat_b):

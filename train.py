@@ -16,7 +16,6 @@ from losses import (
     patch_correspondence_loss,
     relative_depth_structure_loss,
     matched_depth_delta_loss,
-    matched_feature_consistency_loss,
 )
 
 
@@ -35,7 +34,6 @@ def train_one_epoch(
     lambda_corr,
     lambda_depth_delta,
     lambda_width,
-    lambda_feature_consistency,
     scaler,
 ):
     model.train()
@@ -145,7 +143,6 @@ def validate(
     lambda_corr,
     lambda_depth_delta,
     lambda_width,
-    lambda_feature_consistency
 ):
     model.eval()
 
@@ -258,7 +255,6 @@ def main():
     parser.add_argument("--lambda-corr", type=float, default=1.0)
     parser.add_argument("--lambda-depth-delta", type=float, default=0.25)
     parser.add_argument("--lambda-width", type=float, default=0.1)
-    parser.add_argument("--lambda-feature-consistency", type=float, default=0.1)
 
     parser.add_argument(
         "--output-dir",
@@ -361,6 +357,7 @@ def main():
         "correspondence_loss": [],
         "depth_structure_loss": [],
         "depth_delta_loss": [],
+        "refiner_gate": [],
         "val_epoch": [],
         "val_total": [],
         "val_vision": [],
@@ -383,9 +380,10 @@ def main():
             args.lambda_corr,
             args.lambda_depth_delta,
             args.lambda_width,
-            args.lambda_feature_consistency,
             scaler,
         )
+
+        gate = torch.sigmoid(model.depth_refiner.gate).item()
 
         history["epoch"].append(epoch)
         history["loss"].append(train_metrics["total"])
@@ -393,6 +391,7 @@ def main():
         history["correspondence_loss"].append(train_metrics["correspondence"])
         history["depth_structure_loss"].append(train_metrics["depth_structure"])
         history["depth_delta_loss"].append(train_metrics["depth_delta"])
+        history["refiner_gate"].append(gate)
 
         log = (
             f"Epoch {epoch}: "
@@ -401,6 +400,7 @@ def main():
             f"corr={train_metrics['correspondence']:.4f} | "
             f"struct={train_metrics['depth_structure']:.4f} | "
             f"delta={train_metrics['depth_delta']:.4f}"
+            f"gate={gate:.4f}"
         )
 
         if epoch == 1 or epoch % args.val_interval == 0:
@@ -414,7 +414,6 @@ def main():
                 args.lambda_corr,
                 args.lambda_depth_delta,
                 args.lambda_width,
-                args.lambda_feature_consistency,
             )
 
             history["val_epoch"].append(epoch)
