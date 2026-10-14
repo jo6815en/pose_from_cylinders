@@ -266,6 +266,9 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     torch.set_float32_matmul_precision("high")
 
+    if device.type == "cuda":
+        torch.backends.cudnn.benchmark = True
+
     os.makedirs(args.output_dir, exist_ok=True)
     os.makedirs(os.path.join(args.output_dir, "checkpoints"), exist_ok=True)
 
@@ -332,14 +335,17 @@ def main():
         dropout=args.dropout,
     ).to(device)
 
-    n_params = sum(
-        p.numel()
-        for p in model.parameters()
-    )
+    n_params = sum(p.numel()for p in model.parameters())
 
-    print(
-        f"Model parameters: {n_params / 1e6:.2f} M"
-    )
+    print(f"Model parameters: {n_params / 1e6:.2f} M")
+
+    # Keep a reference to the normal, uncompiled model.
+    # Use this for direct attribute access and checkpoint saving.
+    raw_model = model
+
+    # Compile the model used for forward/backward.
+    if device.type == "cuda":
+        model = torch.compile(model)
 
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -383,7 +389,7 @@ def main():
             scaler,
         )
 
-        gate = torch.sigmoid(model.depth_refiner.gate).item()
+        gate = torch.sigmoid(raw_model.depth_refiner.gate).item()
 
         history["epoch"].append(epoch)
         history["loss"].append(train_metrics["total"])
@@ -436,7 +442,7 @@ def main():
                 torch.save(
                     {
                         "epoch": epoch,
-                        "model_state_dict": model.state_dict(),
+                        "model_state_dict": raw_model.state_dict(),
                         "optimizer_state_dict": optimizer.state_dict(),
                         "args": vars(args),
                         "history": history,
@@ -456,7 +462,7 @@ def main():
         torch.save(
             {
                 "epoch": epoch,
-                "model_state_dict": model.state_dict(),
+                "model_state_dict": raw_model.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
                 "args": vars(args),
                 "history": history,
