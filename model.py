@@ -287,16 +287,18 @@ class CylinderDecoder(nn.Module):
         qn = self.local_norm_q(q)
         kvn = self.local_norm_kv(kv)
 
-        aligned, _ = self.local_attn(
-            qn,
-            kvn,
-            kvn,
-            need_weights=False,
-        )
-
+        aligned, _ = self.local_attn(qn, kvn, kvn, need_weights=False)
         aligned = aligned.reshape(B, self.num_bins, D)
 
         return aligned
+
+    def predict_depth(self, q, width):
+        depth_input = torch.cat([q, width.unsqueeze(-1),], dim=-1)
+
+        log_depth = self.depth_head(depth_input).squeeze(-1)
+        log_depth = torch.clamp(log_depth, min=-2.0, max=5.0)
+
+        return torch.exp(log_depth)
 
     def forward(self, patches, return_features=False):
         B = patches.shape[0]
@@ -319,11 +321,7 @@ class CylinderDecoder(nn.Module):
         # Predicted apparent angular width in degrees.
         width = F.softplus(self.width_head(q).squeeze(-1))
 
-        # Let depth explicitly use the predicted width
-        depth_input = torch.cat([q, width.unsqueeze(-1)], dim=-1)
-        log_depth = self.depth_head(depth_input).squeeze(-1)
-        log_depth = torch.clamp(log_depth, min=-2.0, max=5.0)
-        depth = torch.exp(log_depth)
+        depth = self.predict_depth(q, width)
 
         vision = torch.stack([occupancy, radius, depth, width], dim=-1)
 
@@ -331,6 +329,50 @@ class CylinderDecoder(nn.Module):
             return vision, q
 
         return vision
+
+class CrossViewDepthRefiner(nn.Module):
+    def __init__(
+        self,
+        embed_dim=192,
+        num_heads=4,
+        dropout=0.0,
+    ):
+        super().__init__()
+
+        self.norm_q = nn.LayerNorm(embed_dim)
+        self.norm_kv = nn.LayerNorm(embed_dim)
+
+        self.cross_attn = nn.MultiheadAttention(
+            embed_dim,
+            num_heads,
+            dropout=dropout,
+            batch_first=True,
+        )
+
+        self.gate = nn.Parameter(
+            torch.tensor(-4.0)
+        )
+
+    def forward(self, feat_a, feat_b):
+        a = self.norm_q(feat_a)
+        b = self.norm_kv(feat_b)
+
+        delta_a, _ = self.cross_attn(
+            a, b, b,
+            need_weights=False,
+        )
+
+        delta_b, _ = self.cross_attn(
+            b, a, a,
+            need_weights=False,
+        )
+
+        g = torch.sigmoid(self.gate)
+
+        refined_a = feat_a + g * delta_a
+        refined_b = feat_b + g * delta_b
+
+        return refined_a, refined_b
 
 class CorrespondenceDecoder(nn.Module):
     def __init__(
@@ -418,25 +460,6 @@ class CorrespondenceDecoder(nn.Module):
 
         return F.normalize(corr, dim=-1)
 
-
-class CrossViewDeltaHead(nn.Module):
-    def __init__(self, embed_dim=192, hidden_dim=128):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(2 * embed_dim + 8, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, 1),
-        )
-
-    def forward(self, feat_a, feat_b, vision_a, vision_b):
-        x = torch.cat([
-            feat_a,
-            feat_b,
-            vision_a,
-            vision_b,
-        ], dim=-1)
-
-        return self.net(x).squeeze(-1)
 
 class RansacPoseEstimator(nn.Module):
     def __init__(
@@ -663,6 +686,11 @@ class PairImageCylinderModel(nn.Module):
             dropout=dropout,
             depth=3,
         )
+        self.depth_refiner = CrossViewDepthRefiner(
+            embed_dim=embed_dim,
+            num_heads=num_heads,
+            dropout=dropout,
+        )
         self.corr_decoder = CorrespondenceDecoder(
             embed_dim=embed_dim,
             corr_dim=64,
@@ -670,10 +698,6 @@ class PairImageCylinderModel(nn.Module):
             grid_h=self.backbone.patch_embed.grid_h,
             grid_w=self.backbone.patch_embed.grid_w,
             output_cols=16,
-        )
-        self.cross_delta_head = CrossViewDeltaHead(
-            embed_dim=embed_dim,
-            hidden_dim=128,
         )
         self.ransac_pose = RansacPoseEstimator(
             search_radius=16,
@@ -699,6 +723,26 @@ class PairImageCylinderModel(nn.Module):
 
         vision_a, feat_a = self.vision_head(patches_a, return_features=True)
         vision_b, feat_b = self.vision_head(patches_b,return_features=True)
+
+        refined_a, refined_b = self.depth_refiner(feat_a, feat_b)
+
+        width_a = vision_a[..., 3]
+        width_b = vision_b[..., 3]
+
+        depth_a = self.vision_head.predict_depth(refined_a, width_a)
+        depth_b = self.vision_head.predict_depth(refined_b, width_b)
+
+        vision_a = torch.cat([
+            vision_a[..., :2],
+            depth_a.unsqueeze(-1),
+            vision_a[..., 3:4],
+        ], dim=-1)
+
+        vision_b = torch.cat([
+            vision_b[..., :2],
+            depth_b.unsqueeze(-1),
+            vision_b[..., 3:4],
+        ], dim=-1)
 
         corr_a, corr_b = self.corr_decoder(patches_a, patches_b)
 

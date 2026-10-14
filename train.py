@@ -17,7 +17,6 @@ from losses import (
     relative_depth_structure_loss,
     matched_depth_delta_loss,
     matched_feature_consistency_loss,
-    cross_view_delta_loss
 )
 
 
@@ -36,7 +35,6 @@ def train_one_epoch(
     lambda_corr,
     lambda_depth_delta,
     lambda_width,
-    lambda_cross_delta,
     lambda_feature_consistency,
     scaler,
 ):
@@ -113,19 +111,11 @@ def train_one_epoch(
             depth_delta2 = matched_depth_delta_loss(pred_vision_a2, vision_a2, pred_vision_b2, vision_b2, occ_thresh)
             depth_delta_loss = 0.5 * (depth_delta1 + depth_delta2)
 
-
-            cross_delta1 = cross_view_delta_loss(model.cross_delta_head,feat_a1, pred_vision_a1, vision_a1,
-                feat_b1, pred_vision_b1, vision_b1, occ_thresh)
-            cross_delta2 = cross_view_delta_loss(model.cross_delta_head, feat_a2, pred_vision_a2, vision_a2,
-                feat_b2, pred_vision_b2, vision_b2, occ_thresh,)
-            cross_delta_loss = 0.5 * (cross_delta1 + cross_delta2)
-
             loss = (
                 vision_loss_total
                 + lambda_corr * corr_loss
                 + 0.5 * depth_structure_loss
                 + lambda_depth_delta * depth_delta_loss
-                + lambda_cross_delta * cross_delta_loss
             )
 
         scaler.scale(loss).backward()
@@ -155,7 +145,6 @@ def validate(
     lambda_corr,
     lambda_depth_delta,
     lambda_width,
-    lambda_cross_delta,
     lambda_feature_consistency
 ):
     model.eval()
@@ -202,17 +191,12 @@ def validate(
         )
 
         depth_delta_loss = matched_depth_delta_loss(pred_vision_a, vision_a, pred_vision_b, vision_b, occ_thresh)
-
-        cross_delta = cross_view_delta_loss(model.cross_delta_head, feat_a, pred_vision_a, vision_a,
-            feat_b, pred_vision_b, vision_b, occ_thresh)
         
         total_loss = (
             vision_loss_total
             + lambda_corr * corr_loss
             + 0.5 * depth_structure_loss
             + lambda_depth_delta * depth_delta_loss
-            + lambda_cross_delta * cross_delta
-
         )
 
         radius_a, position_a = relative_cylinder_errors(
@@ -274,7 +258,6 @@ def main():
     parser.add_argument("--lambda-corr", type=float, default=1.0)
     parser.add_argument("--lambda-depth-delta", type=float, default=0.25)
     parser.add_argument("--lambda-width", type=float, default=0.1)
-    parser.add_argument("--lambda-cross-delta", type=float, default=0.1)
     parser.add_argument("--lambda-feature-consistency", type=float, default=0.1)
 
     parser.add_argument(
@@ -400,7 +383,6 @@ def main():
             args.lambda_corr,
             args.lambda_depth_delta,
             args.lambda_width,
-            args.lambda_cross_delta,
             args.lambda_feature_consistency,
             scaler,
         )
@@ -432,7 +414,6 @@ def main():
                 args.lambda_corr,
                 args.lambda_depth_delta,
                 args.lambda_width,
-                args.lambda_cross_delta,
                 args.lambda_feature_consistency,
             )
 
