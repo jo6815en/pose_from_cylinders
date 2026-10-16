@@ -330,50 +330,6 @@ class CylinderDecoder(nn.Module):
 
         return vision
 
-class CrossViewDepthRefiner(nn.Module):
-    def __init__(
-        self,
-        embed_dim=192,
-        num_heads=4,
-        dropout=0.0,
-    ):
-        super().__init__()
-
-        self.norm_q = nn.LayerNorm(embed_dim)
-        self.norm_kv = nn.LayerNorm(embed_dim)
-
-        self.cross_attn = nn.MultiheadAttention(
-            embed_dim,
-            num_heads,
-            dropout=dropout,
-            batch_first=True,
-        )
-
-        self.gate = nn.Parameter(
-            torch.tensor(-2.0)
-        )
-
-    def forward(self, feat_a, feat_b):
-        a = self.norm_q(feat_a)
-        b = self.norm_kv(feat_b)
-
-        delta_a, _ = self.cross_attn(
-            a, b, b,
-            need_weights=False,
-        )
-
-        delta_b, _ = self.cross_attn(
-            b, a, a,
-            need_weights=False,
-        )
-
-        g = torch.sigmoid(self.gate)
-
-        refined_a = feat_a + g * delta_a
-        refined_b = feat_b + g * delta_b
-
-        return refined_a, refined_b
-
 class CorrespondenceDecoder(nn.Module):
     def __init__(
         self,
@@ -670,7 +626,6 @@ class PairImageCylinderModel(nn.Module):
         dropout=0.0,
         mlp_ratio=3.0, 
         num_register_tokens=2,
-        use_depth_refiner=True,
     ):
         super().__init__()
         self.backbone = PairViTBackbone(
@@ -687,11 +642,6 @@ class PairImageCylinderModel(nn.Module):
             dropout=dropout,
             depth=3,
         )
-        self.depth_refiner = CrossViewDepthRefiner(
-            embed_dim=embed_dim,
-            num_heads=num_heads,
-            dropout=dropout,
-        )
         self.corr_decoder = CorrespondenceDecoder(
             embed_dim=embed_dim,
             corr_dim=64,
@@ -706,7 +656,6 @@ class PairImageCylinderModel(nn.Module):
             num_iters=200,
             inlier_threshold=0.4,
         )
-        self.use_depth_refiner = use_depth_refiner
 
     def forward(
         self,
@@ -726,14 +675,8 @@ class PairImageCylinderModel(nn.Module):
         vision_a, feat_a = self.vision_head(patches_a, return_features=True)
         vision_b, feat_b = self.vision_head(patches_b,return_features=True)
 
-        if self.use_depth_refiner:
-            depth_feat_a, depth_feat_b = self.depth_refiner(
-                feat_a,
-                feat_b,
-            )
-        else:
-            depth_feat_a = feat_a
-            depth_feat_b = feat_b
+        depth_feat_a = feat_a
+        depth_feat_b = feat_b
 
         width_a = vision_a[..., 3]
         width_b = vision_b[..., 3]

@@ -223,7 +223,6 @@ def main():
     parser.add_argument("--num-heads", type=int, default=4)
     parser.add_argument("--num-bins", type=int, default=128)
     parser.add_argument("--dropout", type=float, default=0.1)
-    parser.add_argument("--use-depth-refiner", action=argparse.BooleanOptionalAction, default=True)
 
     parser.add_argument("--lambda-occ", type=float, default=10.0)
     parser.add_argument("--lambda-radius", type=float, default=10.0)
@@ -309,7 +308,6 @@ def main():
         num_heads=args.num_heads,
         num_bins=args.num_bins,
         dropout=args.dropout,
-        use_depth_refiner=args.use_depth_refiner,
     ).to(device)
 
     n_params = sum(p.numel()for p in model.parameters())
@@ -340,7 +338,6 @@ def main():
         "correspondence_loss": [],
         "depth_structure_loss": [],
         "depth_delta_loss": [],
-        "refiner_gate": [],
         "val_epoch": [],
         "val_total": [],
         "val_vision": [],
@@ -366,12 +363,6 @@ def main():
             scaler,
         )
 
-        if raw_model.use_depth_refiner:
-            gate = torch.sigmoid(
-                raw_model.depth_refiner.gate
-            ).item()
-        else:
-            gate = 0.0
 
         history["epoch"].append(epoch)
         history["loss"].append(train_metrics["total"])
@@ -379,7 +370,6 @@ def main():
         history["correspondence_loss"].append(train_metrics["correspondence"])
         history["depth_structure_loss"].append(train_metrics["depth_structure"])
         history["depth_delta_loss"].append(train_metrics["depth_delta"])
-        history["refiner_gate"].append(gate)
 
         log = (
             f"Epoch {epoch}: "
@@ -388,7 +378,6 @@ def main():
             f"corr={train_metrics['correspondence']:.4f} | "
             f"struct={train_metrics['depth_structure']:.4f} | "
             f"delta={train_metrics['depth_delta']:.4f} | "
-            f"gate={gate:.4f}"
         )
 
         if epoch == 1 or epoch % args.val_interval == 0:
