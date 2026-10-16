@@ -49,16 +49,11 @@ def train_one_epoch(
 
     for batch in loader:
         (
-            img_a1,
-            vision_a1,
-            img_b1,
-            vision_b1,
-            _pose_ab1,
-            img_a2,
-            vision_a2,
-            img_b2,
-            vision_b2,
-            _pose_ab2,
+            img_a,
+            vision_a,
+            img_b,
+            vision_b,
+            _pose_ab,
         ) = move_batch_to_device(batch, device)
 
         optimizer.zero_grad(set_to_none=True)
@@ -68,47 +63,27 @@ def train_one_epoch(
             dtype=torch.float16,
             enabled=(device.type == "cuda"),
         ):
-            pred_vision_a1, pred_vision_b1, _, corr_a1, corr_b1, feat_a1, feat_b1 = model(
-                img_a1,
-                img_b1,
-                return_corr=True,
-                return_features=True,
-            )
-            pred_vision_a2, pred_vision_b2, _, corr_a2, corr_b2, feat_a2, feat_b2 = model(
-                img_a2,
-                img_b2,
+            pred_vision_a, pred_vision_b, _, corr_a, corr_b, feat_a, feat_b = model(
+                img_a,
+                img_b,
                 return_corr=True,
                 return_features=True,
             )
 
-            vis_a1, *_ = vision_loss(pred_vision_a1, vision_a1, occ_thresh=occ_thresh, lambda_occ=lambda_occ,
-                lambda_radius=lambda_radius, lambda_depth=1.0, lambda_width=lambda_width)
-            vis_b1, *_ = vision_loss(pred_vision_b1, vision_b1, occ_thresh=occ_thresh, lambda_occ=lambda_occ,
-                lambda_radius=lambda_radius, lambda_depth=1.0, lambda_width=lambda_width)
-            vis_a2, *_ = vision_loss(pred_vision_a2, vision_a2, occ_thresh=occ_thresh, lambda_occ=lambda_occ,
-                lambda_radius=lambda_radius, lambda_depth=1.0, lambda_width=lambda_width)
-            vis_b2, *_ = vision_loss(pred_vision_b2, vision_b2, occ_thresh=occ_thresh, lambda_occ=lambda_occ,
+            vis_a, *_ = vision_loss(pred_vision_a, vision_a, occ_thresh=occ_thresh, lambda_occ=lambda_occ,
                 lambda_radius=lambda_radius, lambda_depth=1.0, lambda_width=lambda_width)
 
-            vision_loss_total = 0.25 * (vis_a1 + vis_b1 + vis_a2 + vis_b2)
+            vis_b, *_ = vision_loss(pred_vision_b, vision_b, occ_thresh=occ_thresh, lambda_occ=lambda_occ,
+                lambda_radius=lambda_radius, lambda_depth=1.0, lambda_width=lambda_width)
 
-            corr1 = patch_correspondence_loss(corr_a1, vision_a1, corr_b1, vision_b1)
-            corr2 = patch_correspondence_loss(corr_a2, vision_a2, corr_b2, vision_b2)
-            corr_loss = 0.5 * (corr1 + corr2)
+            vision_loss_total = 0.5 * ( vis_a + vis_b)
 
-            depth_structure1 = 0.5 * (
-                relative_depth_structure_loss(pred_vision_a1, vision_a1, occ_thresh)
-                + relative_depth_structure_loss(pred_vision_b1, vision_b1, occ_thresh)
-            )
-            depth_structure2 = 0.5 * (
-                relative_depth_structure_loss(pred_vision_a2, vision_a2, occ_thresh)
-                + relative_depth_structure_loss(pred_vision_b2, vision_b2, occ_thresh)
-            )
-            depth_structure_loss = 0.5 * (depth_structure1 + depth_structure2)
+            corr_loss = patch_correspondence_loss(corr_a, vision_a, corr_b, vision_b)
 
-            depth_delta1 = matched_depth_delta_loss(pred_vision_a1, vision_a1, pred_vision_b1, vision_b1, occ_thresh)
-            depth_delta2 = matched_depth_delta_loss(pred_vision_a2, vision_a2, pred_vision_b2, vision_b2, occ_thresh)
-            depth_delta_loss = 0.5 * (depth_delta1 + depth_delta2)
+            depth_structure_loss = 0.5 * (relative_depth_structure_loss(pred_vision_a, vision_a,  occ_thresh)
+                + relative_depth_structure_loss(pred_vision_b, vision_b, occ_thresh))
+
+            depth_delta_loss = matched_depth_delta_loss(pred_vision_a, vision_a, pred_vision_b, vision_b, occ_thresh)
 
             loss = (
                 vision_loss_total
@@ -131,7 +106,6 @@ def train_one_epoch(
         key: value / len(loader)
         for key, value in totals.items()
     }
-
 
 @torch.no_grad()
 def validate(
@@ -239,7 +213,7 @@ def main():
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--lr", type=float, default=5e-5)
     parser.add_argument("--val-interval", type=int, default=10)
-    parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument("--num-workers", type=int, default=8)
     parser.add_argument("--seed", type=int, default=0)
 
     parser.add_argument("--img-size", type=int, default=128)
@@ -290,7 +264,7 @@ def main():
         root_dir=os.path.join(args.data_dir, "dataset"),
         image_size=args.img_size,
         debug=False,
-        return_two_pairs=True,
+        return_two_pairs=False,
         transform=build_train_transform(args.img_size),
     )
 
