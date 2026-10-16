@@ -3,6 +3,7 @@ import json
 import os
 import random
 import numpy as np
+import time
 
 import torch
 from torch.utils.data import DataLoader
@@ -16,7 +17,6 @@ from losses import (
     patch_correspondence_loss,
     relative_depth_structure_loss,
     matched_depth_delta_loss,
-    matched_feature_consistency_loss,
 )
 
 
@@ -35,7 +35,6 @@ def train_one_epoch(
     lambda_corr,
     lambda_depth_delta,
     lambda_width,
-    lambda_feature_consistency,
     scaler,
 ):
     model.train()
@@ -145,7 +144,6 @@ def validate(
     lambda_corr,
     lambda_depth_delta,
     lambda_width,
-    lambda_feature_consistency
 ):
     model.eval()
 
@@ -258,7 +256,6 @@ def main():
     parser.add_argument("--lambda-corr", type=float, default=1.0)
     parser.add_argument("--lambda-depth-delta", type=float, default=0.5)
     parser.add_argument("--lambda-width", type=float, default=0.1)
-    parser.add_argument("--lambda-feature-consistency", type=float, default=0.1)
 
     parser.add_argument(
         "--output-dir",
@@ -269,6 +266,9 @@ def main():
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     torch.set_float32_matmul_precision("high")
+
+    if device.type == "cuda":
+        torch.backends.cudnn.benchmark = True
 
     os.makedirs(args.output_dir, exist_ok=True)
     os.makedirs(os.path.join(args.output_dir, "checkpoints"), exist_ok=True)
@@ -336,14 +336,17 @@ def main():
         dropout=args.dropout,
     ).to(device)
 
-    n_params = sum(
-        p.numel()
-        for p in model.parameters()
-    )
+    n_params = sum(p.numel()for p in model.parameters())
 
-    print(
-        f"Model parameters: {n_params / 1e6:.2f} M"
-    )
+    print(f"Model parameters: {n_params / 1e6:.2f} M")
+
+    # Keep a reference to the normal, uncompiled model.
+    # Use this for direct attribute access and checkpoint saving.
+    raw_model = model
+
+    # Compile the model used for forward/backward.
+    if device.type == "cuda":
+        model = torch.compile(model)
 
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -361,6 +364,7 @@ def main():
         "correspondence_loss": [],
         "depth_structure_loss": [],
         "depth_delta_loss": [],
+        "refiner_gate": [],
         "val_epoch": [],
         "val_total": [],
         "val_vision": [],
@@ -370,8 +374,8 @@ def main():
     }
     best_val_loss = float("inf")
 
-
     for epoch in range(1, args.epochs + 1):
+        epoch_start = time.perf_counter()
         train_metrics = train_one_epoch(
             model,
             train_loader,
@@ -383,9 +387,10 @@ def main():
             args.lambda_corr,
             args.lambda_depth_delta,
             args.lambda_width,
-            args.lambda_feature_consistency,
             scaler,
         )
+
+        gate = torch.sigmoid(raw_model.depth_refiner.gate).item()
 
         history["epoch"].append(epoch)
         history["loss"].append(train_metrics["total"])
@@ -393,6 +398,7 @@ def main():
         history["correspondence_loss"].append(train_metrics["correspondence"])
         history["depth_structure_loss"].append(train_metrics["depth_structure"])
         history["depth_delta_loss"].append(train_metrics["depth_delta"])
+        history["refiner_gate"].append(gate)
 
         log = (
             f"Epoch {epoch}: "
@@ -400,7 +406,8 @@ def main():
             f"vis={train_metrics['vision']:.4f} | "
             f"corr={train_metrics['correspondence']:.4f} | "
             f"struct={train_metrics['depth_structure']:.4f} | "
-            f"delta={train_metrics['depth_delta']:.4f}"
+            f"delta={train_metrics['depth_delta']:.4f} | "
+            f"gate={gate:.4f}"
         )
 
         if epoch == 1 or epoch % args.val_interval == 0:
@@ -414,7 +421,6 @@ def main():
                 args.lambda_corr,
                 args.lambda_depth_delta,
                 args.lambda_width,
-                args.lambda_feature_consistency,
             )
 
             history["val_epoch"].append(epoch)
@@ -437,7 +443,7 @@ def main():
                 torch.save(
                     {
                         "epoch": epoch,
-                        "model_state_dict": model.state_dict(),
+                        "model_state_dict": raw_model.state_dict(),
                         "optimizer_state_dict": optimizer.state_dict(),
                         "args": vars(args),
                         "history": history,
@@ -452,12 +458,14 @@ def main():
 
                 log += f" | BEST (val_tot={best_val_loss:.4f})"
 
+        epoch_time = time.perf_counter() - epoch_start
+        log += f" | time={epoch_time:.1f}s"
         print(log, flush=True)
 
         torch.save(
             {
                 "epoch": epoch,
-                "model_state_dict": model.state_dict(),
+                "model_state_dict": raw_model.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
                 "args": vars(args),
                 "history": history,
