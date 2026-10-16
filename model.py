@@ -670,6 +670,7 @@ class PairImageCylinderModel(nn.Module):
         dropout=0.0,
         mlp_ratio=3.0, 
         num_register_tokens=2,
+        use_depth_refiner=True,
     ):
         super().__init__()
         self.backbone = PairViTBackbone(
@@ -705,6 +706,7 @@ class PairImageCylinderModel(nn.Module):
             num_iters=200,
             inlier_threshold=0.4,
         )
+        self.use_depth_refiner = use_depth_refiner
 
     def forward(
         self,
@@ -724,13 +726,20 @@ class PairImageCylinderModel(nn.Module):
         vision_a, feat_a = self.vision_head(patches_a, return_features=True)
         vision_b, feat_b = self.vision_head(patches_b,return_features=True)
 
-        refined_a, refined_b = self.depth_refiner(feat_a, feat_b)
+        if self.use_depth_refiner:
+            depth_feat_a, depth_feat_b = self.depth_refiner(
+                feat_a,
+                feat_b,
+            )
+        else:
+            depth_feat_a = feat_a
+            depth_feat_b = feat_b
 
         width_a = vision_a[..., 3]
         width_b = vision_b[..., 3]
 
-        depth_a = self.vision_head.predict_depth(refined_a, width_a)
-        depth_b = self.vision_head.predict_depth(refined_b, width_b)
+        depth_a = self.vision_head.predict_depth(depth_feat_a, width_a)
+        depth_b = self.vision_head.predict_depth(depth_feat_b, width_b)
 
         vision_a = torch.cat([
             vision_a[..., :2],

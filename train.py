@@ -223,6 +223,7 @@ def main():
     parser.add_argument("--num-heads", type=int, default=4)
     parser.add_argument("--num-bins", type=int, default=128)
     parser.add_argument("--dropout", type=float, default=0.1)
+    parser.add_argument("--use-depth-refiner", action=argparse.BooleanOptionalAction, default=True)
 
     parser.add_argument("--lambda-occ", type=float, default=10.0)
     parser.add_argument("--lambda-radius", type=float, default=10.0)
@@ -308,6 +309,7 @@ def main():
         num_heads=args.num_heads,
         num_bins=args.num_bins,
         dropout=args.dropout,
+        use_depth_refiner=args.use_depth_refiner,
     ).to(device)
 
     n_params = sum(p.numel()for p in model.parameters())
@@ -364,7 +366,12 @@ def main():
             scaler,
         )
 
-        gate = torch.sigmoid(raw_model.depth_refiner.gate).item()
+        if raw_model.use_depth_refiner:
+            gate = torch.sigmoid(
+                raw_model.depth_refiner.gate
+            ).item()
+        else:
+            gate = 0.0
 
         history["epoch"].append(epoch)
         history["loss"].append(train_metrics["total"])
