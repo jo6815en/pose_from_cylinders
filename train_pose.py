@@ -1,0 +1,507 @@
+import argparse
+import json
+import os
+import random
+import numpy as np
+import time
+
+import torch
+import torch.nn.functional as F
+from torch.utils.data import DataLoader
+
+from dataset import SceneTwoPairsDataset
+from augmentations import build_train_transform, build_eval_transform
+from model_pose import PairImageCylinderModel
+from metrics import relative_cylinder_errors
+from losses import (
+    vision_loss,
+    patch_correspondence_loss,
+    relative_depth_structure_loss,
+    matched_depth_delta_loss,
+)
+
+
+def move_batch_to_device(batch, device):
+    return tuple(x.to(device, non_blocking=True) for x in batch)
+
+
+def pose_loss(pred, target):
+    """Same direction and yaw supervision as train_pose.ipynb."""
+    target = target.float()
+    valid_t = target[:, :2].norm(dim=-1) > 1e-6
+    if valid_t.any():
+        gt_t = F.normalize(target[valid_t, :2], dim=-1)
+        translation = (1.0 - (pred[valid_t, :2] * gt_t).sum(-1)).mean()
+    else:
+        translation = pred[:, :2].sum() * 0.0
+    gt_yaw = F.normalize(target[:, 2:], dim=-1)
+    rotation = (1.0 - (pred[:, 2:] * gt_yaw).sum(-1)).mean()
+    return translation + rotation, translation, rotation
+
+
+def train_one_epoch(
+    model,
+    loader,
+    optimizer,
+    device,
+    occ_thresh,
+    lambda_occ,
+    lambda_radius,
+    lambda_corr,
+    lambda_depth_delta,
+    lambda_pose,
+    lambda_width,
+    scaler,
+):
+    model.train()
+
+    totals = {
+        "total": 0.0,
+        "vision": 0.0,
+        "correspondence": 0.0,
+        "depth_structure": 0.0,
+        "depth_delta": 0.0,
+        "pose": 0.0,
+        "translation": 0.0,
+        "rotation": 0.0,
+    }
+
+    for batch in loader:
+        (
+            img_a,
+            vision_a,
+            img_b,
+            vision_b,
+            pose_ab,
+        ) = move_batch_to_device(batch, device)
+
+        optimizer.zero_grad(set_to_none=True)
+
+        with torch.autocast(
+            device_type=device.type,
+            dtype=torch.float16,
+            enabled=(device.type == "cuda"),
+        ):
+            pred_vision_a, pred_vision_b, pred_pose, corr_a, corr_b, feat_a, feat_b = model(
+                img_a,
+                img_b,
+                return_corr=True,
+                return_features=True,
+            )
+
+            vis_a, *_ = vision_loss(pred_vision_a, vision_a, occ_thresh=occ_thresh, lambda_occ=lambda_occ,
+                lambda_radius=lambda_radius, lambda_depth=1.0, lambda_width=lambda_width)
+
+            vis_b, *_ = vision_loss(pred_vision_b, vision_b, occ_thresh=occ_thresh, lambda_occ=lambda_occ,
+                lambda_radius=lambda_radius, lambda_depth=1.0, lambda_width=lambda_width)
+
+            vision_loss_total = 0.5 * ( vis_a + vis_b)
+
+            corr_loss = patch_correspondence_loss(corr_a, vision_a, corr_b, vision_b)
+
+            depth_structure_loss = 0.5 * (relative_depth_structure_loss(pred_vision_a, vision_a,  occ_thresh)
+                + relative_depth_structure_loss(pred_vision_b, vision_b, occ_thresh))
+
+            depth_delta_loss = matched_depth_delta_loss(pred_vision_a, vision_a, pred_vision_b, vision_b, occ_thresh)
+
+            pose_total, t_loss, r_loss = pose_loss(pred_pose, pose_ab)
+
+            loss = (
+                vision_loss_total
+                + lambda_corr * corr_loss
+                + 0.5 * depth_structure_loss
+                + lambda_depth_delta * depth_delta_loss
+                + lambda_pose * pose_total
+            )
+
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
+
+        totals["total"] += loss.item()
+        totals["vision"] += vision_loss_total.item()
+        totals["correspondence"] += corr_loss.item()
+        totals["depth_structure"] += depth_structure_loss.item()
+        totals["depth_delta"] += depth_delta_loss.item()
+        totals["pose"] += pose_total.item()
+        totals["translation"] += t_loss.item()
+        totals["rotation"] += r_loss.item()
+
+    return {
+        key: value / len(loader)
+        for key, value in totals.items()
+    }
+
+@torch.no_grad()
+def validate(
+    model,
+    loader,
+    device,
+    occ_thresh,
+    lambda_occ,
+    lambda_radius,
+    lambda_corr,
+    lambda_depth_delta,
+    lambda_pose,
+    lambda_width,
+):
+    model.eval()
+
+    totals = {
+        "total": 0.0,
+        "vision": 0.0,
+        "correspondence": 0.0,
+        "depth_structure": 0.0,
+        "depth_delta": 0.0,
+        "pose": 0.0,
+        "translation": 0.0,
+        "rotation": 0.0,
+        "cylinder_radius_rel_l2": 0.0,
+        "cylinder_position_rel_l2": 0.0,
+    }
+
+    num_batches = 0
+
+    for batch in loader:
+        (
+            img_a,
+            vision_a,
+            img_b,
+            vision_b,
+            pose_ab,
+        ) = move_batch_to_device(batch, device)
+
+        pred_vision_a, pred_vision_b, pred_pose, corr_a, corr_b, feat_a, feat_b = model(
+            img_a,
+            img_b,
+            return_corr=True,
+            return_features=True,
+        )
+
+        vis_a, *_ = vision_loss(pred_vision_a, vision_a, occ_thresh=occ_thresh, lambda_occ=lambda_occ,
+            lambda_radius=lambda_radius, lambda_depth=1.0, lambda_width=lambda_width)
+        vis_b, *_ = vision_loss(pred_vision_b, vision_b, occ_thresh=occ_thresh, lambda_occ=lambda_occ,
+            lambda_radius=lambda_radius, lambda_depth=1.0, lambda_width=lambda_width)
+        vision_loss_total = 0.5 * (vis_a + vis_b)
+
+        corr_loss = patch_correspondence_loss(corr_a, vision_a, corr_b, vision_b)
+
+        depth_structure_loss = 0.5 * (
+            relative_depth_structure_loss(pred_vision_a, vision_a, occ_thresh)
+            + relative_depth_structure_loss(pred_vision_b, vision_b, occ_thresh)
+        )
+
+        depth_delta_loss = matched_depth_delta_loss(pred_vision_a, vision_a, pred_vision_b, vision_b, occ_thresh)
+
+        pose_total, t_loss, r_loss = pose_loss(pred_pose, pose_ab)
+        
+        total_loss = (
+            vision_loss_total
+            + lambda_corr * corr_loss
+            + 0.5 * depth_structure_loss
+            + lambda_depth_delta * depth_delta_loss
+            + lambda_pose * pose_total
+        )
+
+        radius_a, position_a = relative_cylinder_errors(
+            pred_vision_a, vision_a, occ_thresh
+        )
+        radius_b, position_b = relative_cylinder_errors(
+            pred_vision_b, vision_b, occ_thresh
+        )
+
+        totals["total"] += total_loss.item()
+        totals["vision"] += vision_loss_total.item()
+        totals["correspondence"] += corr_loss.item()
+        totals["depth_structure"] += depth_structure_loss.item()
+        totals["depth_delta"] += depth_delta_loss.item()
+        totals["pose"] += pose_total.item()
+        totals["translation"] += t_loss.item()
+        totals["rotation"] += r_loss.item()
+        totals["cylinder_radius_rel_l2"] += (
+            0.5 * (radius_a + radius_b)
+        ).item()
+        totals["cylinder_position_rel_l2"] += (
+            0.5 * (position_a + position_b)
+        ).item()
+        num_batches += 1
+
+    if num_batches == 0:
+        raise RuntimeError("Validation loader is empty.")
+
+    metrics = {
+        key: value / num_batches
+        for key, value in totals.items()
+    }
+
+    return metrics
+
+
+def main():
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument(
+        "--data-dir",
+        default="/nobackup/proj/disk/midlevel_representations/personal/johanna/data",
+    )
+    parser.add_argument("--epochs", type=int, default=100)
+    parser.add_argument("--batch-size", type=int, default=16)
+    parser.add_argument("--lr", type=float, default=5e-5)
+    parser.add_argument("--val-interval", type=int, default=10)
+    parser.add_argument("--num-workers", type=int, default=8)
+    parser.add_argument("--seed", type=int, default=0)
+
+    parser.add_argument("--img-size", type=int, default=128)
+    parser.add_argument("--patch-size", type=int, nargs=2, default=(16, 4))
+    parser.add_argument("--embed-dim", type=int, default=192)
+    parser.add_argument("--depth", type=int, default=4)
+    parser.add_argument("--num-heads", type=int, default=4)
+    parser.add_argument("--num-bins", type=int, default=128)
+    parser.add_argument("--dropout", type=float, default=0.1)
+
+    parser.add_argument("--lambda-occ", type=float, default=10.0)
+    parser.add_argument("--lambda-radius", type=float, default=10.0)
+    parser.add_argument("--occ-thresh", type=float, default=0.5)
+    parser.add_argument("--lambda-corr", type=float, default=1.0)
+    parser.add_argument("--lambda-depth-delta", type=float, default=0.35)
+    parser.add_argument("--lambda-pose", type=float, default=2.0)
+    parser.add_argument("--lambda-width", type=float, default=0.1)
+
+    parser.add_argument("--output-dir", default="runs/pose")
+
+    args = parser.parse_args()
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    torch.set_float32_matmul_precision("high")
+
+    if device.type == "cuda":
+        torch.backends.cudnn.benchmark = True
+
+    os.makedirs(args.output_dir, exist_ok=True)
+    os.makedirs(os.path.join(args.output_dir, "checkpoints"), exist_ok=True)
+
+    print("Device:", device)
+
+    if device.type == "cuda":
+        print("GPU:", torch.cuda.get_device_name(0))
+        print("CUDA:", torch.version.cuda)
+
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    torch.cuda.manual_seed_all(args.seed)
+
+    print("Seed: ", args.seed)
+
+    train_dataset = SceneTwoPairsDataset(
+        root_dir=os.path.join(args.data_dir, "dataset"),
+        image_size=args.img_size,
+        debug=False,
+        return_two_pairs=False,
+        transform=build_train_transform(args.img_size),
+    )
+
+    val_dataset = SceneTwoPairsDataset(
+        root_dir=os.path.join(args.data_dir, "valdataset"),
+        image_size=args.img_size,
+        debug=False,
+        return_two_pairs=False,
+        transform=build_eval_transform(args.img_size),
+    )
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=args.num_workers,
+        pin_memory=(device.type == "cuda"),
+        persistent_workers=(args.num_workers > 0),
+    )
+
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        pin_memory=(device.type == "cuda"),
+        persistent_workers=(args.num_workers > 0),
+    )
+
+    print("Train samples:", len(train_dataset))
+    print("Validation samples:", len(val_dataset))
+    print("Train batches:", len(train_loader))
+    print("Validation batches:", len(val_loader))
+
+    model = PairImageCylinderModel(
+        img_size=args.img_size,
+        patch_size=args.patch_size,
+        in_chans=3,
+        embed_dim=args.embed_dim,
+        depth=args.depth,
+        num_heads=args.num_heads,
+        num_bins=args.num_bins,
+        dropout=args.dropout,
+    ).to(device)
+
+    n_params = sum(p.numel()for p in model.parameters())
+
+    print(f"Model parameters: {n_params / 1e6:.2f} M")
+
+    # Keep a reference to the normal, uncompiled model.
+    # Use this for direct attribute access and checkpoint saving.
+    raw_model = model
+
+    # Compile the model used for forward/backward.
+    if device.type == "cuda":
+        model = torch.compile(model)
+
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=args.lr,
+        weight_decay=0.05,
+    )
+    scaler = torch.amp.GradScaler("cuda", enabled=(device.type == "cuda"))
+
+    # Epoch-aligned history dict. This format is directly plottable and is
+    # stored unchanged in history.json, latest.pt, and best.pt.
+    history = {
+        "epoch": [],
+        "loss": [],
+        "vision_loss": [],
+        "correspondence_loss": [],
+        "depth_structure_loss": [],
+        "depth_delta_loss": [],
+        "pose_loss": [],
+        "translation_loss": [],
+        "rotation_loss": [],
+        "val_epoch": [],
+        "val_total": [],
+        "val_vision": [],
+        "val_correspondence": [],
+        "val_depth_structure": [],
+        "val_depth_delta": [],
+        "val_pose": [],
+        "val_translation": [],
+        "val_rotation": [],
+    }
+    best_val_loss = float("inf")
+
+    for epoch in range(1, args.epochs + 1):
+        epoch_start = time.perf_counter()
+        train_metrics = train_one_epoch(
+            model,
+            train_loader,
+            optimizer,
+            device,
+            args.occ_thresh,
+            args.lambda_occ,
+            args.lambda_radius,
+            args.lambda_corr,
+            args.lambda_depth_delta,
+            args.lambda_pose,
+            args.lambda_width,
+            scaler,
+        )
+
+        history["epoch"].append(epoch)
+        history["loss"].append(train_metrics["total"])
+        history["vision_loss"].append(train_metrics["vision"])
+        history["correspondence_loss"].append(train_metrics["correspondence"])
+        history["depth_structure_loss"].append(train_metrics["depth_structure"])
+        history["depth_delta_loss"].append(train_metrics["depth_delta"])
+        history["pose_loss"].append(train_metrics["pose"])
+        history["translation_loss"].append(train_metrics["translation"])
+        history["rotation_loss"].append(train_metrics["rotation"])
+
+        log = (
+            f"Epoch {epoch}: "
+            f"tot={train_metrics['total']:.4f} | "
+            f"vis={train_metrics['vision']:.4f} | "
+            f"corr={train_metrics['correspondence']:.4f} | "
+            f"struct={train_metrics['depth_structure']:.4f} | "
+            f"delta={train_metrics['depth_delta']:.4f} | "
+            f"pose={train_metrics['pose']:.4f} | "
+        )
+
+        if epoch == 1 or epoch % args.val_interval == 0:
+            val_metrics = validate(
+                model,
+                val_loader,
+                device,
+                args.occ_thresh,
+                args.lambda_occ,
+                args.lambda_radius,
+                args.lambda_corr,
+                args.lambda_depth_delta,
+                args.lambda_pose,
+                args.lambda_width,
+            )
+
+            history["val_epoch"].append(epoch)
+            history["val_total"].append(val_metrics["total"])
+            history["val_vision"].append(val_metrics["vision"])
+            history["val_correspondence"].append(val_metrics["correspondence"])
+            history["val_depth_structure"].append(val_metrics["depth_structure"])
+            history["val_depth_delta"].append(val_metrics["depth_delta"])
+            history["val_pose"].append(val_metrics["pose"])
+            history["val_translation"].append(val_metrics["translation"])
+            history["val_rotation"].append(val_metrics["rotation"])
+
+            log += (
+                f" | val_tot={val_metrics['total']:.4f}"
+                f" | val_vis={val_metrics['vision']:.4f}"
+                f" | val_corr={val_metrics['correspondence']:.4f}"
+                f" | val_struct={val_metrics['depth_structure']:.4f}"
+                f" | val_delta={val_metrics['depth_delta']:.4f}"
+                f" | val_pose={val_metrics['pose']:.4f}"
+            )
+            if val_metrics["total"] < best_val_loss:
+                best_val_loss = val_metrics["total"]
+
+                torch.save(
+                    {
+                        "epoch": epoch,
+                        "model_state_dict": raw_model.state_dict(),
+                        "optimizer_state_dict": optimizer.state_dict(),
+                        "args": vars(args),
+                        "history": history,
+                        "best_val_loss": best_val_loss,
+                    },
+                    os.path.join(
+                        args.output_dir,
+                        "checkpoints",
+                        "best.pt",
+                    ),
+                )
+
+                log += f" | BEST (val_tot={best_val_loss:.4f})"
+
+        epoch_time = time.perf_counter() - epoch_start
+        log += f" | time={epoch_time:.1f}s"
+        print(log, flush=True)
+
+        torch.save(
+            {
+                "epoch": epoch,
+                "model_state_dict": raw_model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "args": vars(args),
+                "history": history,
+            },
+            os.path.join(
+                args.output_dir,
+                "checkpoints",
+                "latest.pt",
+            ),
+        )
+
+        with open(
+            os.path.join(args.output_dir, "history.json"),
+            "w",
+            encoding="utf-8",
+        ) as f:
+            json.dump(history, f, indent=2)
+
+
+if __name__ == "__main__":
+    main()
