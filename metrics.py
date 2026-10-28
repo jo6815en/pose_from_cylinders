@@ -496,3 +496,142 @@ def evaluate_pose(
         "yaw_p90": np.percentile(yaw, 90),
     }
 
+import numpy as np
+import torch
+import torch.nn.functional as F
+
+
+@torch.no_grad()
+def evaluate_pose_pose(model, loader, device):
+    model.eval()
+
+    translation_errors = []
+    yaw_errors = []
+
+    failures = 0
+    total = 0
+
+    for batch in loader:
+        img_a, _, img_b, _, pose_gt = [
+            x.to(device, non_blocking=True)
+            for x in batch
+        ]
+
+        _, _, pose_pred = model(img_a, img_b)
+
+        for pred, gt in zip(pose_pred, pose_gt):
+            total += 1
+
+            # Ogiltig prediktion eller odefinierad translationsriktning
+            if (
+                not torch.isfinite(pred).all()
+                or torch.linalg.vector_norm(pred[:2]) < 1e-8
+                or torch.linalg.vector_norm(gt[:2]) < 1e-8
+            ):
+                failures += 1
+                continue
+
+            # ------------------------------------------
+            # Translation direction error
+            # ------------------------------------------
+
+            t_pred = torch.nn.functional.normalize(
+                pred[:2],
+                dim=0,
+            )
+
+            t_gt = torch.nn.functional.normalize(
+                gt[:2],
+                dim=0,
+            )
+
+            cos_t = torch.clamp(
+                torch.dot(t_pred, t_gt),
+                -1.0,
+                1.0,
+            )
+
+            t_error = torch.rad2deg(
+                torch.acos(cos_t)
+            ).item()
+
+            # ------------------------------------------
+            # Yaw error
+            # pose = [tx, ty, sin(yaw), cos(yaw)]
+            # ------------------------------------------
+
+            yaw_pred = torch.atan2(
+                pred[2],
+                pred[3],
+            )
+
+            yaw_gt = torch.atan2(
+                gt[2],
+                gt[3],
+            )
+
+            delta_yaw = torch.atan2(
+                torch.sin(yaw_pred - yaw_gt),
+                torch.cos(yaw_pred - yaw_gt),
+            )
+
+            yaw_error = abs(
+                torch.rad2deg(delta_yaw).item()
+            )
+
+            translation_errors.append(t_error)
+            yaw_errors.append(yaw_error)
+
+    t = np.asarray(translation_errors)
+    yaw = np.asarray(yaw_errors)
+
+    def stat(values, fn):
+        return fn(values) if len(values) else float("nan")
+
+    print("CAMERA POSE PERFORMANCE")
+    print("=" * 60)
+
+    print(f"\nTest pairs:             {total}")
+    print(f"Successful poses:       {len(t)}")
+    print(f"Prediction failures:    {failures}")
+    print(f"Success rate:           {len(t) / max(total, 1):.3f}")
+
+    print("\nTRANSLATION DIRECTION ERROR")
+    print("-" * 40)
+    print(f"Mean:                   {stat(t, np.mean):.2f}°")
+    print(f"Median:                 {stat(t, np.median):.2f}°")
+    print(f"P90:                    {stat(t, lambda x: np.percentile(x, 90)):.2f}°")
+
+    print("\nYAW ERROR")
+    print("-" * 40)
+    print(f"Mean:                   {stat(yaw, np.mean):.2f}°")
+    print(f"Median:                 {stat(yaw, np.median):.2f}°")
+    print(f"P90:                    {stat(yaw, lambda x: np.percentile(x, 90)):.2f}°")
+
+    print("\nACCURACY THRESHOLDS")
+    print("-" * 40)
+
+    for threshold in [5, 10, 20, 30]:
+        t_acc = stat(t, lambda x: np.mean(x < threshold))
+        yaw_acc = stat(yaw, lambda x: np.mean(x < threshold))
+
+        print(
+            f"< {threshold:2d}°: "
+            f"T={100*t_acc:5.1f}% | "
+            f"Yaw={100*yaw_acc:5.1f}%"
+        )
+
+    return {
+        "translation_errors": t,
+        "yaw_errors": yaw,
+        "failures": failures,
+        "total": total,
+
+        "translation_mean": stat(t, np.mean),
+        "translation_median": stat(t, np.median),
+        "translation_p90": stat(t, lambda x: np.percentile(x, 90)),
+
+        "yaw_mean": stat(yaw, np.mean),
+        "yaw_median": stat(yaw, np.median),
+        "yaw_p90": stat(yaw, lambda x: np.percentile(x, 90)),
+    }
