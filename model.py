@@ -256,7 +256,7 @@ class CylinderDecoder(nn.Module):
         # Cylinder angle -> image x
         x = (
             0.5
-            - 0.5
+            + 0.5
             * torch.tan(theta)
             / torch.tan(0.5 * fov)
         )
@@ -539,7 +539,7 @@ class RansacPoseEstimator(nn.Module):
             for ia in active_a:
                 theta_a = theta[ia]
 
-                x_a = 0.5 - 0.5 * torch.tan(theta_a) / torch.tan(0.5 * fov)
+                x_a = 0.5 + 0.5 * torch.tan(theta_a) / torch.tan(0.5 * fov)
                 col_a = torch.clamp((x_a * 16).long(), 0, 15)
 
                 # Coarse visual match
@@ -548,7 +548,8 @@ class RansacPoseEstimator(nn.Module):
                 # Coarse B column -> cylinder-bin neighbourhood
                 x_b = (col_b.to(dtype) + 0.5) / 16.0
                 theta_b = torch.atan(
-                    (1.0 - 2.0 * x_b) * torch.tan(0.5 * fov)
+                    (2.0 * x_b - 1.0)
+                    * torch.tan(0.5 * fov)
                 )
 
                 center = torch.round(
