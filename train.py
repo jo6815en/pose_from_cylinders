@@ -228,7 +228,7 @@ def main():
     parser.add_argument("--lambda-radius", type=float, default=10.0)
     parser.add_argument("--occ-thresh", type=float, default=0.5)
     parser.add_argument("--lambda-corr", type=float, default=1.0)
-    parser.add_argument("--lambda-depth-delta", type=float, default=0.5)
+    parser.add_argument("--lambda-depth-delta", type=float, default=0.35)
     parser.add_argument("--lambda-width", type=float, default=0.1)
 
     parser.add_argument(
