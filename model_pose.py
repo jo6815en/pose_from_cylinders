@@ -69,16 +69,31 @@ class PairImageCylinderModel(nn.Module):
             grid_h=self.backbone.patch_embed.grid_h,
             grid_w=self.backbone.patch_embed.grid_w, output_cols=16,
         )
-        self.pose_head = RelativePoseHead(embed_dim, dropout)
-
+        #self.pose_head = RelativePoseHead(embed_dim, dropout)
+        # Skapa posehuvudet utan att ändra slumpsekvensen
+        # för resten av träningskörningen.
+        with torch.random.fork_rng(devices=[]):
+            self.pose_head = RelativePoseHead(embed_dim, dropout)
+            
     def forward(self, img_a, img_b, return_attention=False,
-                return_corr=False, return_features=False):
+                return_corr=False, return_features=False, compute_pose=True,):
         backbone_out = self.backbone(img_a, img_b,
                                      return_attention=return_attention)
         camera_a, camera_b, patches_a, patches_b = backbone_out[:4]
         vision_a, feat_a = self.vision_head(patches_a, return_features=True)
         vision_b, feat_b = self.vision_head(patches_b, return_features=True)
-        pose_ab = self.pose_head(camera_a, camera_b, patches_a, patches_b)
+        
+        pose_ab = None
+
+        if compute_pose:
+            pose_ab = self.pose_head(
+                camera_a,
+                camera_b,
+                patches_a,
+                patches_b,
+            )
+        #pose_ab = self.pose_head(camera_a, camera_b, patches_a, patches_b)
+        
         outputs = (vision_a, vision_b, pose_ab)
         if return_corr:
             outputs += self.corr_decoder(patches_a, patches_b)

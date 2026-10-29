@@ -86,6 +86,7 @@ def train_one_epoch(
                 img_a,
                 img_b,
                 return_corr=True,
+                compute_pose=(lambda_pose != 0),
             )
 
             vis_a, *_ = vision_loss(pred_vision_a, vision_a, occ_thresh=occ_thresh, lambda_occ=lambda_occ,
@@ -103,7 +104,14 @@ def train_one_epoch(
 
             depth_delta_loss = matched_depth_delta_loss(pred_vision_a, vision_a, pred_vision_b, vision_b, occ_thresh)
 
-            pose_total, t_loss, r_loss = pose_loss(pred_pose, pose_ab)
+            if lambda_pose != 0:
+                pose_total, t_loss, r_loss = pose_loss(pred_pose, pose_ab)
+            else:
+                pose_total = vision_loss_total.new_zeros(())
+                t_loss = vision_loss_total.new_zeros(())
+                r_loss = vision_loss_total.new_zeros(())
+
+            #pose_total, t_loss, r_loss = pose_loss(pred_pose, pose_ab)
 
             loss = (
                 vision_loss_total
@@ -174,6 +182,7 @@ def validate(
             img_a,
             img_b,
             return_corr=True,
+            compute_pose=(lambda_pose != 0),
         )
 
         vis_a, *_ = vision_loss(pred_vision_a, vision_a, occ_thresh=occ_thresh, lambda_occ=lambda_occ,
@@ -191,7 +200,14 @@ def validate(
 
         depth_delta_loss = matched_depth_delta_loss(pred_vision_a, vision_a, pred_vision_b, vision_b, occ_thresh)
 
-        pose_total, t_loss, r_loss = pose_loss(pred_pose, pose_ab)
+        # pose_total, t_loss, r_loss = pose_loss(pred_pose, pose_ab)
+
+        if lambda_pose != 0:
+            pose_total, t_loss, r_loss = pose_loss(pred_pose, pose_ab)
+        else:
+            pose_total = vision_loss_total.new_zeros(())
+            t_loss = vision_loss_total.new_zeros(())
+            r_loss = vision_loss_total.new_zeros(())
         
         total_loss = (
             vision_loss_total
@@ -473,6 +489,23 @@ def main():
                 )
 
                 log += f" | BEST (val_tot={best_val_loss:.4f})"
+
+            if epoch in (10, 20):
+                torch.save(
+                    {
+                        "epoch": epoch,
+                        "model_state_dict": raw_model.state_dict(),
+                        "optimizer_state_dict": optimizer.state_dict(),
+                        "args": vars(args),
+                        "history": history,
+                        "best_val_loss": best_val_loss,
+                    },
+                    os.path.join(
+                        args.output_dir,
+                        "checkpoints",
+                        f"epoch_{epoch:03d}.pt",
+                    ),
+                )
 
         epoch_time = time.perf_counter() - epoch_start
         log += f" | time={epoch_time:.1f}s"

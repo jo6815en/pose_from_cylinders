@@ -426,6 +426,23 @@ def main():
 
                 log += f" | BEST (val_tot={best_val_loss:.4f})"
 
+            if epoch in (10, 20):
+                torch.save(
+                    {
+                        "epoch": epoch,
+                        "model_state_dict": raw_model.state_dict(),
+                        "optimizer_state_dict": optimizer.state_dict(),
+                        "args": vars(args),
+                        "history": history,
+                        "best_val_loss": best_val_loss,
+                    },
+                    os.path.join(
+                        args.output_dir,
+                        "checkpoints",
+                        f"epoch_{epoch:03d}.pt",
+                    ),
+                )
+
         epoch_time = time.perf_counter() - epoch_start
         log += f" | time={epoch_time:.1f}s"
         print(log, flush=True)
