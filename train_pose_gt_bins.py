@@ -18,26 +18,13 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 from dataset import SceneTwoPairsDataset
+from losses import relative_pose_loss_2d
 from augmentations import build_train_transform, build_eval_transform
 from model_pose import PairImageCylinderModel
 
 
 def move_batch_to_device(batch, device):
     return tuple(x.to(device, non_blocking=True) for x in batch)
-
-
-def pose_loss(pred, target):
-    """Same direction and yaw supervision as train_pose.ipynb."""
-    target = target.float()
-    valid_t = target[:, :2].norm(dim=-1) > 1e-6
-    if valid_t.any():
-        gt_t = F.normalize(target[valid_t, :2], dim=-1)
-        translation = (1.0 - (pred[valid_t, :2] * gt_t).sum(-1)).mean()
-    else:
-        translation = pred[:, :2].sum() * 0.0
-    gt_yaw = F.normalize(target[:, 2:], dim=-1)
-    rotation = (1.0 - (pred[:, 2:] * gt_yaw).sum(-1)).mean()
-    return translation + rotation, translation, rotation
 
 
 def gt_bins_to_input(vision, image_size):
@@ -88,7 +75,7 @@ def train_one_epoch(
                             enabled=(device.type == "cuda")):
             pred_pose = predict_pose_from_gt_bins(model, vision_a, vision_b)
             
-            pose_total, t_loss, r_loss = pose_loss(pred_pose, pose_ab)
+            pose_total, t_loss, r_loss = relative_pose_loss_2d(pred_pose, pose_ab, t_weight=1.0,r_weight=1.0)
             
             loss = pose_total
         
@@ -124,8 +111,11 @@ def validate(
     
     for batch in loader:
         img_a, vision_a, img_b, vision_b, pose_ab = move_batch_to_device(batch, device)
+        
         pred_pose = predict_pose_from_gt_bins(model, vision_a, vision_b)
-        pose_total, t_loss, r_loss = pose_loss(pred_pose, pose_ab)
+
+        pose_total, t_loss, r_loss = relative_pose_loss_2d(pred_pose, pose_ab, t_weight=1.0, r_weight=1.0)
+        
         totals["total"] += pose_total.item()
         totals["pose"] += pose_total.item()
         totals["translation"] += t_loss.item()
