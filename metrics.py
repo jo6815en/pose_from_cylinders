@@ -253,7 +253,7 @@ def evaluate_vision(
     print("\nVISION PERFORMANCE")
     print("=" * 78)
 
-    print("\nOCCUPANCY")
+    print("\nOCCUPANCY, occ_threshold=%.2f" % occ_threshold)
     print("-" * 78)
     print(
         f"{'Accuracy':>10}"

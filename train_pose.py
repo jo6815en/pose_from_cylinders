@@ -82,11 +82,10 @@ def train_one_epoch(
             dtype=torch.float16,
             enabled=(device.type == "cuda"),
         ):
-            pred_vision_a, pred_vision_b, pred_pose, corr_a, corr_b, feat_a, feat_b = model(
+            pred_vision_a, pred_vision_b, pred_pose, corr_a, corr_b= model(
                 img_a,
                 img_b,
                 return_corr=True,
-                return_features=True,
             )
 
             vis_a, *_ = vision_loss(pred_vision_a, vision_a, occ_thresh=occ_thresh, lambda_occ=lambda_occ,
@@ -171,11 +170,10 @@ def validate(
             pose_ab,
         ) = move_batch_to_device(batch, device)
 
-        pred_vision_a, pred_vision_b, pred_pose, corr_a, corr_b, feat_a, feat_b = model(
+        pred_vision_a, pred_vision_b, pred_pose, corr_a, corr_b = model(
             img_a,
             img_b,
             return_corr=True,
-            return_features=True,
         )
 
         vis_a, *_ = vision_loss(pred_vision_a, vision_a, occ_thresh=occ_thresh, lambda_occ=lambda_occ,
