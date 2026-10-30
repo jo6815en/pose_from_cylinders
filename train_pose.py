@@ -18,7 +18,8 @@ from losses import (
     patch_correspondence_loss,
     relative_depth_structure_loss,
     matched_depth_delta_loss,
-    relative_pose_loss_2d
+    relative_pose_loss_2d,
+    masked_relative_pose_loss_2d
 )
 
 
@@ -69,12 +70,9 @@ def train_one_epoch(
             dtype=torch.float16,
             enabled=(device.type == "cuda"),
         ):
-            pred_vision_a, pred_vision_b, pred_pose, corr_a, corr_b= model(
-                img_a,
-                img_b,
-                return_corr=True,
-                compute_pose=(lambda_pose != 0),
-            )
+            pred_vision_a, pred_vision_b, pred_pose, corr_a, corr_b, pose_info = model(
+                    img_a, img_b, return_corr=True, compute_pose=(lambda_pose != 0),
+                    target_vision_a=vision_a, target_vision_b=vision_b, return_pose_inputs=True, occ_thresh=occ_thresh)
 
             vis_a, *_ = vision_loss(pred_vision_a, vision_a, occ_thresh=occ_thresh, lambda_occ=lambda_occ,
                 lambda_radius=lambda_radius, lambda_depth=1.0, lambda_width=lambda_width)
@@ -92,9 +90,10 @@ def train_one_epoch(
             depth_delta_loss = matched_depth_delta_loss(pred_vision_a, vision_a, pred_vision_b, vision_b, occ_thresh)
 
             if lambda_pose != 0:
-                pose_total, t_loss, r_loss = relative_pose_loss_2d(
+                pose_total, t_loss, r_loss = masked_relative_pose_loss_2d(
                     pred_pose,
                     pose_ab,
+                    pose_info["pose_valid"],
                     t_weight=1.0,
                     r_weight=1.0,
                 )
@@ -170,12 +169,9 @@ def validate(
             pose_ab,
         ) = move_batch_to_device(batch, device)
 
-        pred_vision_a, pred_vision_b, pred_pose, corr_a, corr_b = model(
-            img_a,
-            img_b,
-            return_corr=True,
-            compute_pose=(lambda_pose != 0),
-        )
+        pred_vision_a, pred_vision_b, pred_pose, corr_a, corr_b, pose_info = model(
+                img_a, img_b, return_corr=True, compute_pose=(lambda_pose != 0),
+                target_vision_a=vision_a, target_vision_b=vision_b, return_pose_inputs=True, occ_thresh=occ_thresh)
 
         vis_a, *_ = vision_loss(pred_vision_a, vision_a, occ_thresh=occ_thresh, lambda_occ=lambda_occ,
             lambda_radius=lambda_radius, lambda_depth=1.0, lambda_width=lambda_width)
@@ -195,9 +191,10 @@ def validate(
         # pose_total, t_loss, r_loss = pose_loss(pred_pose, pose_ab)
 
         if lambda_pose != 0:
-            pose_total, t_loss, r_loss = relative_pose_loss_2d(
+            pose_total, t_loss, r_loss = masked_relative_pose_loss_2d(
                 pred_pose,
                 pose_ab,
+                pose_info["pose_valid"],
                 t_weight=1.0,
                 r_weight=1.0,
             )
@@ -361,10 +358,6 @@ def main():
     # Keep a reference to the normal, uncompiled model.
     # Use this for direct attribute access and checkpoint saving.
     raw_model = model
-
-    # Compile the model used for forward/backward.
-    if device.type == "cuda":
-        model = torch.compile(model)
 
     optimizer = torch.optim.AdamW(
         model.parameters(),

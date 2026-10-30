@@ -924,3 +924,72 @@ def gt_correspondence_probs(target_a, target_b, occ_thresh=0.5):
             prob_ba[b, ib[0], ia[0]] = 1.0
 
     return prob_ab, prob_ba
+
+
+
+def masked_relative_pose_loss_2d(pred_pose, target_pose, pose_valid,
+                                t_weight=1., r_weight=1.):
+    valid = pose_valid & (target_pose[:, :2].float().norm(dim=-1) > 1e-6)
+    if not valid.any():
+        zero = pred_pose.sum() * 0.
+        return zero, zero, zero
+    return relative_pose_loss_2d(pred_pose[valid].float(), target_pose[valid].float(),
+                                 t_weight=t_weight, r_weight=r_weight)
+
+
+def pose_depth_consistency_loss(pair_tokens, pair_mask, pred_pose, target_pose,
+                                pose_valid=None, beta=1.):
+    """Camera-pose convention: p_A = R(yaw_AB) p_B + position_B_in_A.
+
+    The point coordinates use depth*[cos(bin_angle), sin(bin_angle)]. Because
+    the model predicts translation direction only, its translation magnitude
+    is supplied by target_pose[:,:2].norm(), NOT assumed to be one unit.
+
+    This requires the GT camera translation/yaw to use those same coordinate
+    axes. Check gt_geometry_reference_loss on your data before enabling this
+    term. Bin quantization can produce a small nonzero GT reference residual.
+
+    Gradients propagate to BOTH predicted depths and predicted pose. Fixed GT
+    matches/angles do not receive gradients; occupancy/matching still need
+    their own training losses. Each eligible sample has equal loss weight.
+    """
+    x = pair_tokens.float()
+    pred = pred_pose.float()
+    baseline = target_pose[:, :2].float().norm(dim=-1)
+    eligible = (pair_mask.sum(dim=-1) >= 2) & (baseline > 1e-6)
+    if pose_valid is not None:
+        eligible = eligible & pose_valid
+    if not eligible.any():
+        return (x.sum() + pred.sum()) * 0.
+
+    angle_a, depth_a, angle_b, depth_b = x[..., 0], x[..., 2], x[..., 3], x[..., 5]
+    point_a = torch.stack((depth_a * angle_a.cos(), depth_a * angle_a.sin()), dim=-1)
+    point_b = torch.stack((depth_b * angle_b.cos(), depth_b * angle_b.sin()), dim=-1)
+    rotation = F.normalize(pred[:, 2:], dim=-1, eps=1e-6)
+    sin_yaw, cos_yaw = rotation[:, 0:1], rotation[:, 1:2]
+    translation = F.normalize(pred[:, :2], dim=-1, eps=1e-6) * baseline.unsqueeze(-1)
+    # Rotate B-frame points into A; then add camera B's A-frame position.
+    rotated_b = torch.stack((
+        cos_yaw * point_b[..., 0] - sin_yaw * point_b[..., 1],
+        sin_yaw * point_b[..., 0] + cos_yaw * point_b[..., 1],
+    ), dim=-1)
+    reconstructed_a = rotated_b + translation.unsqueeze(1)
+    errors = F.smooth_l1_loss(reconstructed_a, point_a, reduction='none', beta=beta).mean(-1)
+    weights = pair_mask.to(errors.dtype)
+    per_sample = (errors * weights).sum(-1) / weights.sum(-1).clamp_min(1)
+    return per_sample[eligible].mean()
+
+
+@torch.no_grad()
+def gt_geometry_reference_loss(target_a, target_b, target_pose,
+                               fov_degrees=90., occ_thresh=0.5):
+    """Run the same geometry loss with GT inputs/pose to check conventions.
+
+    Print this on several GT batches, before enabling geometric consistency.
+    A large residual needs investigation of axes, pose convention, or depth
+    definition; do not tune its weight to compensate for a wrong convention.
+    """
+    from model_pose import gt_bin_matches, pack_matched_pairs
+    matches = gt_bin_matches(target_a, target_b, occ_thresh)
+    tokens, mask, _ = pack_matched_pairs(target_a, target_b, matches, fov_degrees)
+    return pose_depth_consistency_loss(tokens, mask, target_pose, target_pose)
