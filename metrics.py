@@ -1,6 +1,7 @@
 import torch
 import torch.nn.functional as F
 import numpy as np
+import inspect
 
 @torch.no_grad()
 def pose_errors(pred_pose, gt_pose):
@@ -100,6 +101,13 @@ def evaluate_vision(
 ):
     model.eval()
 
+    # Kontrollera originalmodellen även om torch.compile används.
+    base_model = getattr(model, "_orig_mod", model)
+
+    supports_compute_pose = (
+        "compute_pose" in inspect.signature(base_model.forward).parameters
+    )
+
     occ_gt_all = []
     occ_pred_all = []
 
@@ -115,7 +123,10 @@ def evaluate_vision(
             for x in batch
         ]
 
-        pred_a, pred_b, _ = model(img_a, img_b)
+        if supports_compute_pose:
+            pred_a, pred_b, _ = model(img_a, img_b, compute_pose=False)
+        else:
+            pred_a, pred_b, _ = model(img_a, img_b)
 
         # Evaluate both views
         for pred, gt in [
@@ -361,223 +372,104 @@ def evaluate_vision(
         "depth_corr": depth_corr,
     }
 
+
 @torch.no_grad()
-def evaluate_pose(
-    model,
-    loader,
-    device,
-):
+def evaluate_pose(model, loader, device, gt_occ_threshold=0.5):
     model.eval()
+
+    base_model = getattr(model, "_orig_mod", model)
+    parameters = inspect.signature(base_model.forward).parameters
+
+    uses_gt_matches = all(
+        name in parameters
+        for name in (
+            "target_vision_a",
+            "target_vision_b",
+            "return_pose_inputs",
+        )
+    )
+
+    if uses_gt_matches:
+        method = "Learned pose with GT matches"
+    elif callable(getattr(base_model, "predict_pose_ransac", None)):
+        method = "RANSAC"
+    else:
+        method = "Direct learned pose"
 
     translation_errors = []
     yaw_errors = []
 
     failures = 0
     total = 0
+    excluded_gt_pairs = 0
 
     for batch in loader:
-        img_a, _, img_b, _, pose_gt = [
+        img_a, vision_a, img_b, vision_b, pose_gt = [
             x.to(device, non_blocking=True)
             for x in batch
         ]
 
-        _, _, pose_pred = model.predict_pose_ransac(
-            img_a,
-            img_b,
+        # GT translation direction and yaw must be defined.
+        eligible = (
+            torch.isfinite(pose_gt).all(dim=-1)
+            & (pose_gt[:, :2].norm(dim=-1) > 1e-6)
+            & (pose_gt[:, 2:].norm(dim=-1) > 1e-8)
         )
 
-        for pred, gt in zip(pose_pred, pose_gt):
+        if uses_gt_matches:
+            _, _, pose_pred, pose_info = model(
+                img_a,
+                img_b,
+                target_vision_a=vision_a,
+                target_vision_b=vision_b,
+                return_pose_inputs=True,
+                occ_thresh=gt_occ_threshold,
+            )
+            eligible &= pose_info["pose_valid"]
+
+        elif method == "RANSAC":
+            _, _, pose_pred = base_model.predict_pose_ransac(
+                img_a,
+                img_b,
+            )
+
+        else:
+            _, _, pose_pred = model(img_a, img_b)
+
+        if pose_pred is None:
+            raise ValueError("Modellen returnerade ingen pose.")
+
+        excluded_gt_pairs += (~eligible).sum().item()
+
+        for index in torch.where(eligible)[0].tolist():
+            pred = pose_pred[index].float()
+            gt = pose_gt[index].float()
             total += 1
 
-            # RANSAC failure / zero pose
-            if torch.linalg.vector_norm(pred[:2]) < 1e-8:
-                failures += 1
-                continue
-
-            # ------------------------------------------
-            # Translation direction error
-            # ------------------------------------------
-
-            t_pred = torch.nn.functional.normalize(
-                pred[:2],
-                dim=0,
-            )
-
-            t_gt = torch.nn.functional.normalize(
-                gt[:2],
-                dim=0,
-            )
-
-            cos_t = torch.clamp(
-                torch.dot(t_pred, t_gt),
-                -1.0,
-                1.0,
-            )
-
-            t_error = torch.rad2deg(
-                torch.acos(cos_t)
-            ).item()
-
-            # ------------------------------------------
-            # Yaw error
-            # pose = [tx, ty, sin(yaw), cos(yaw)]
-            # ------------------------------------------
-
-            yaw_pred = torch.atan2(
-                pred[2],
-                pred[3],
-            )
-
-            yaw_gt = torch.atan2(
-                gt[2],
-                gt[3],
-            )
-
-            delta_yaw = torch.atan2(
-                torch.sin(yaw_pred - yaw_gt),
-                torch.cos(yaw_pred - yaw_gt),
-            )
-
-            yaw_error = abs(
-                torch.rad2deg(delta_yaw).item()
-            )
-
-            translation_errors.append(t_error)
-            yaw_errors.append(yaw_error)
-
-    t = np.asarray(translation_errors)
-    yaw = np.asarray(yaw_errors)
-
-    print("CAMERA POSE PERFORMANCE")
-    print("=" * 60)
-
-    print(f"\nTest pairs:             {total}")
-    print(f"Successful poses:       {len(t)}")
-    print(f"RANSAC failures:        {failures}")
-    print(f"Success rate:           {len(t) / max(total, 1):.3f}")
-
-    print("\nTRANSLATION DIRECTION ERROR")
-    print("-" * 40)
-    print(f"Mean:                   {t.mean():.2f}°")
-    print(f"Median:                 {np.median(t):.2f}°")
-    print(f"P90:                    {np.percentile(t, 90):.2f}°")
-
-    print("\nYAW ERROR")
-    print("-" * 40)
-    print(f"Mean:                   {yaw.mean():.2f}°")
-    print(f"Median:                 {np.median(yaw):.2f}°")
-    print(f"P90:                    {np.percentile(yaw, 90):.2f}°")
-
-    print("\nACCURACY THRESHOLDS")
-    print("-" * 40)
-
-    for threshold in [5, 10, 20, 30]:
-        t_acc = np.mean(t < threshold)
-        yaw_acc = np.mean(yaw < threshold)
-
-        print(
-            f"< {threshold:2d}°: "
-            f"T={100*t_acc:5.1f}% | "
-            f"Yaw={100*yaw_acc:5.1f}%"
-        )
-
-    return {
-        "translation_errors": t,
-        "yaw_errors": yaw,
-        "failures": failures,
-        "total": total,
-
-        "translation_mean": t.mean(),
-        "translation_median": np.median(t),
-        "translation_p90": np.percentile(t, 90),
-
-        "yaw_mean": yaw.mean(),
-        "yaw_median": np.median(yaw),
-        "yaw_p90": np.percentile(yaw, 90),
-    }
-
-import numpy as np
-import torch
-import torch.nn.functional as F
-
-
-@torch.no_grad()
-def evaluate_pose_pose(model, loader, device):
-    model.eval()
-
-    translation_errors = []
-    yaw_errors = []
-
-    failures = 0
-    total = 0
-
-    for batch in loader:
-        img_a, _, img_b, _, pose_gt = [
-            x.to(device, non_blocking=True)
-            for x in batch
-        ]
-
-        _, _, pose_pred = model(img_a, img_b)
-
-        for pred, gt in zip(pose_pred, pose_gt):
-            total += 1
-
-            # Ogiltig prediktion eller odefinierad translationsriktning
             if (
                 not torch.isfinite(pred).all()
-                or torch.linalg.vector_norm(pred[:2]) < 1e-8
-                or torch.linalg.vector_norm(gt[:2]) < 1e-8
+                or pred[:2].norm() < 1e-8
+                or pred[2:].norm() < 1e-8
             ):
                 failures += 1
                 continue
 
-            # ------------------------------------------
             # Translation direction error
-            # ------------------------------------------
+            t_pred = F.normalize(pred[:2], dim=0)
+            t_gt = F.normalize(gt[:2], dim=0)
 
-            t_pred = torch.nn.functional.normalize(
-                pred[:2],
-                dim=0,
-            )
+            cos_t = torch.dot(t_pred, t_gt).clamp(-1.0, 1.0)
+            t_error = torch.rad2deg(torch.acos(cos_t)).item()
 
-            t_gt = torch.nn.functional.normalize(
-                gt[:2],
-                dim=0,
-            )
-
-            cos_t = torch.clamp(
-                torch.dot(t_pred, t_gt),
-                -1.0,
-                1.0,
-            )
-
-            t_error = torch.rad2deg(
-                torch.acos(cos_t)
-            ).item()
-
-            # ------------------------------------------
-            # Yaw error
-            # pose = [tx, ty, sin(yaw), cos(yaw)]
-            # ------------------------------------------
-
-            yaw_pred = torch.atan2(
-                pred[2],
-                pred[3],
-            )
-
-            yaw_gt = torch.atan2(
-                gt[2],
-                gt[3],
-            )
+            # Wrapped yaw error
+            yaw_pred = torch.atan2(pred[2], pred[3])
+            yaw_gt = torch.atan2(gt[2], gt[3])
 
             delta_yaw = torch.atan2(
                 torch.sin(yaw_pred - yaw_gt),
                 torch.cos(yaw_pred - yaw_gt),
             )
-
-            yaw_error = abs(
-                torch.rad2deg(delta_yaw).item()
-            )
+            yaw_error = torch.rad2deg(delta_yaw).abs().item()
 
             translation_errors.append(t_error)
             yaw_errors.append(yaw_error)
@@ -585,28 +477,45 @@ def evaluate_pose_pose(model, loader, device):
     t = np.asarray(translation_errors)
     yaw = np.asarray(yaw_errors)
 
-    def stat(values, fn):
-        return fn(values) if len(values) else float("nan")
+    def stat(values, function):
+        return (
+            float(function(values))
+            if len(values)
+            else float("nan")
+        )
 
     print("CAMERA POSE PERFORMANCE")
     print("=" * 60)
+    print(f"Pose method:            {method}")
 
     print(f"\nTest pairs:             {total}")
     print(f"Successful poses:       {len(t)}")
-    print(f"Prediction failures:    {failures}")
+
+    failure_label = (
+        "RANSAC failures:" if method == "RANSAC"
+        else "Prediction failures:"
+    )
+    print(f"{failure_label:24s}{failures}")
     print(f"Success rate:           {len(t) / max(total, 1):.3f}")
+    print(f"Excluded GT pairs:      {excluded_gt_pairs}")
 
     print("\nTRANSLATION DIRECTION ERROR")
     print("-" * 40)
     print(f"Mean:                   {stat(t, np.mean):.2f}°")
     print(f"Median:                 {stat(t, np.median):.2f}°")
-    print(f"P90:                    {stat(t, lambda x: np.percentile(x, 90)):.2f}°")
+    print(
+        f"P90:                    "
+        f"{stat(t, lambda x: np.percentile(x, 90)):.2f}°"
+    )
 
     print("\nYAW ERROR")
     print("-" * 40)
     print(f"Mean:                   {stat(yaw, np.mean):.2f}°")
     print(f"Median:                 {stat(yaw, np.median):.2f}°")
-    print(f"P90:                    {stat(yaw, lambda x: np.percentile(x, 90)):.2f}°")
+    print(
+        f"P90:                    "
+        f"{stat(yaw, lambda x: np.percentile(x, 90)):.2f}°"
+    )
 
     print("\nACCURACY THRESHOLDS")
     print("-" * 40)
@@ -626,12 +535,18 @@ def evaluate_pose_pose(model, loader, device):
         "yaw_errors": yaw,
         "failures": failures,
         "total": total,
+        "excluded_gt_pairs": excluded_gt_pairs,
+        "method": method,
 
         "translation_mean": stat(t, np.mean),
         "translation_median": stat(t, np.median),
-        "translation_p90": stat(t, lambda x: np.percentile(x, 90)),
+        "translation_p90": stat(
+            t, lambda x: np.percentile(x, 90)
+        ),
 
         "yaw_mean": stat(yaw, np.mean),
         "yaw_median": stat(yaw, np.median),
-        "yaw_p90": stat(yaw, lambda x: np.percentile(x, 90)),
+        "yaw_p90": stat(
+            yaw, lambda x: np.percentile(x, 90)
+        ),
     }

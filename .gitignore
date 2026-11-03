@@ -14,10 +14,4 @@ logs/
 runs/
 arrhenius_runs/
 papers/
-best_model.pt
-latest_model.pt
-best_pose.pt
-best_total.pt
-best_translation.pt
-best_pose_total.pt
-latest_pose_model.pt
+*.pt
