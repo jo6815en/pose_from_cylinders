@@ -9,9 +9,10 @@ slask_data/
 testdataset/
 valdataset/
 forestdataset/
-forestdataset_torpa/
+forest_torpa/
 logs/
 runs/
 arrhenius_runs/
 papers/
 *.pt
+*.png

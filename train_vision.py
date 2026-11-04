@@ -278,12 +278,12 @@ def main():
     parser.add_argument("--num-bins", type=int, default=128)
     parser.add_argument("--dropout", type=float, default=0.1)
 
+    parser.add_argument("--occ-thresh", type=float, default=0.5)
     parser.add_argument("--lambda-occ", type=float, default=10.0)
     parser.add_argument("--lambda-radius", type=float, default=10.0)
-    parser.add_argument("--occ-thresh", type=float, default=0.5)
+    parser.add_argument("--lambda-width", type=float, default=0.1)
     parser.add_argument("--lambda-corr", type=float, default=1.0)
     parser.add_argument("--lambda-depth-delta", type=float, default=0.35)
-    parser.add_argument("--lambda-width", type=float, default=0.1)
 
     parser.add_argument("--output-dir", default=None)
     parser.add_argument("--stage", choices=("full", "occupancy", "geometry"), default="full",

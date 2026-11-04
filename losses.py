@@ -801,7 +801,6 @@ def matched_feature_consistency_loss(
 
     return (1.0 - (fa * fb).sum(dim=-1)).mean()
 
-
 def compute_forest_loss(
     pred_vision_a, pred_vision_b, pred_pose, occ_thresh,
     lambda_radius, lambda_reproj, lambda_sparsity,
@@ -925,8 +924,6 @@ def gt_correspondence_probs(target_a, target_b, occ_thresh=0.5):
 
     return prob_ab, prob_ba
 
-
-
 def masked_relative_pose_loss_2d(pred_pose, target_pose, pose_valid,
                                 t_weight=1., r_weight=1.):
     valid = pose_valid & (target_pose[:, :2].float().norm(dim=-1) > 1e-6)
@@ -935,7 +932,6 @@ def masked_relative_pose_loss_2d(pred_pose, target_pose, pose_valid,
         return zero, zero, zero
     return relative_pose_loss_2d(pred_pose[valid].float(), target_pose[valid].float(),
                                  t_weight=t_weight, r_weight=r_weight)
-
 
 def pose_depth_consistency_loss(pair_tokens, pair_mask, pred_pose, target_pose,
                                 pose_valid=None, beta=1.):
@@ -978,7 +974,6 @@ def pose_depth_consistency_loss(pair_tokens, pair_mask, pred_pose, target_pose,
     weights = pair_mask.to(errors.dtype)
     per_sample = (errors * weights).sum(-1) / weights.sum(-1).clamp_min(1)
     return per_sample[eligible].mean()
-
 
 @torch.no_grad()
 def gt_geometry_reference_loss(target_a, target_b, target_pose,

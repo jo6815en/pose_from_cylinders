@@ -85,17 +85,23 @@ def run_epoch(model, loader, device, optimizer=None):
     n = 0
     for pairs, valid, target, _ in loader:
         pairs, valid, target = pairs.to(device), valid.to(device), target.to(device)
+        
         if optimizer is not None:
             optimizer.zero_grad(set_to_none=True)
+        
         with torch.set_grad_enabled(optimizer is not None):
             pred = model(pairs, valid)
             loss, t_loss, r_loss = relative_pose_loss_2d(pred, target)
+            
             if not torch.isfinite(loss):
                 raise RuntimeError('Nonfinite pose loss')
+            
             if optimizer is not None:
                 loss.backward()
                 optimizer.step()
+        
         n += len(target)
+        
         for key, value in zip(totals, (loss, t_loss, r_loss)):
             totals[key] += value.detach().item() * len(target)
     return {key: value / n for key, value in totals.items()}
@@ -230,10 +236,12 @@ def main():
         start = time.perf_counter()
         train = run_epoch(model, train_loader, device, optimizer)
         history['epoch'].append(epoch)
+        
         for key, value in train.items():
             history[key].append(value)
         log = f'Epoch {epoch}: ' + ' | '.join(f'{k}={v:.4f}' for k, v in train.items())
         improved = False
+        
         if epoch == 1 or epoch % args.val_interval == 0 or epoch == args.epochs:
             val = run_epoch(model, val_loader, device)
             history['val_epoch'].append(epoch)
@@ -244,11 +252,13 @@ def main():
             if improved:
                 best = val['pose']
                 log += ' | BEST'
+        
         state = dict(epoch=epoch, model_state_dict=model.state_dict(),
                      optimizer_state_dict=optimizer.state_dict(), model_config=config,
                      args=vars(args), history=history, best_val_loss=best,
                      training_stage='pose_only_gt')
         torch.save(state, ckpt_dir / 'latest.pt')
+        
         if improved:
             torch.save(state, ckpt_dir / 'best.pt')
         if epoch % args.save_every == 0:

@@ -90,4 +90,11 @@ class ColmapPairDataset(Dataset):
 
         T_ab = torch.tensor(item["T_ab"], dtype=torch.float32)
 
+        if "T_ab" in item:
+            pose = item["T_ab"]
+        else:
+            # Current export_dataset.py and batch_rectify.py use this clearer
+            # name. It has the same convention: camera A -> camera B.
+            pose = item["T_a_to_b"]
+
         return image_a, image_b, T_ab

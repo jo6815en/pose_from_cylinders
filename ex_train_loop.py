@@ -4,7 +4,7 @@ from torchvision import transforms
 from colmap_pair_dataset import ColmapPairDataset
 
 dataset = ColmapPairDataset(
-    dataset_dir="forestdataset",
+    dataset_dir="forest_torpa",
      image_size=128
      )
 
