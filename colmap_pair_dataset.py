@@ -8,67 +8,29 @@ from torchvision import transforms
 
 
 class ColmapPairDataset(Dataset):
-    def __init__(
-        self,
-        dataset_dir,
-        image_size=128,
-        transform=None,
-    ):
+    def __init__(self, dataset_dir, transform=None, return_names=False):
         """
-        dataset_dir ska normalt innehålla:
+        dataset_dir ska innehålla:
             images/
-            relative_poses.json  (valfri)
-
-        Args:
-            dataset_dir: sökväg till datasetet
-            image_size: slutlig bildstorlek (image_size x image_size)
+            relative_poses.json
 
         Returnerar:
-            image_a: Tensor [3, image_size, image_size]
-            image_b: Tensor [3, image_size, image_size]
+            image_a: Tensor [3,H,W]
+            image_b: Tensor [3,H,W]
             T_ab:    Tensor [4,4]
 
         T_ab mappar punkter från kamera/frame a till kamera/frame b.
         """
         self.dataset_dir = Path(dataset_dir)
         self.image_dir = self.dataset_dir / "images"
-        if not self.image_dir.is_dir():
-            raise FileNotFoundError(
-                f"Kunde inte hitta bildmappen: {self.image_dir}"
-            )
+        self.return_names = return_names
 
-        pose_file = self.dataset_dir / "relative_poses.json"
-        if pose_file.exists():
-            with open(pose_file, "r", encoding="utf-8") as f:
-                self.pairs = json.load(f)
-        else:
-            # Utan posefil används konsekutiva bildpar. T_ab är bara en
-            # platshållare; forest-träningen använder inte COLMAP-posen.
-            image_paths = sorted(
-                path for path in self.image_dir.iterdir()
-                if path.is_file()
-                and path.suffix.lower() in {".jpg", ".jpeg", ".png", ".bmp"}
-            )
-            if len(image_paths) < 2:
-                raise ValueError(
-                    f"Minst två bilder krävs i {self.image_dir} "
-                    "när relative_poses.json saknas."
-                )
-
-            identity = torch.eye(4, dtype=torch.float32).tolist()
-            self.pairs = [
-                {
-                    "from_image": image_paths[i].name,
-                    "to_image": image_paths[i + 1].name,
-                    "T_ab": identity,
-                }
-                for i in range(len(image_paths) - 1)
-            ]
+        with open(self.dataset_dir / "relative_poses.json", "r") as f:
+            self.pairs = json.load(f)
 
         if transform is None:
             self.transform = transforms.Compose([
-                transforms.Resize((image_size, image_size)),
-                transforms.ToTensor(),
+                transforms.ToTensor()
             ])
         else:
             self.transform = transform
@@ -88,13 +50,32 @@ class ColmapPairDataset(Dataset):
         image_a = self.transform(image_a)
         image_b = self.transform(image_b)
 
-        T_ab = torch.tensor(item["T_ab"], dtype=torch.float32)
-
         if "T_ab" in item:
             pose = item["T_ab"]
-        else:
+        elif "T_a_to_b" in item:
             # Current export_dataset.py and batch_rectify.py use this clearer
             # name. It has the same convention: camera A -> camera B.
             pose = item["T_a_to_b"]
+        else:
+            raise KeyError(
+                "Relative-pose item contains neither 'T_ab' nor 'T_a_to_b'"
+            )
+
+        T_ab = torch.tensor(pose, dtype=torch.float32)
+
+        sample = {
+            "image_a": image_a,
+            "image_b": image_b,
+            "T_ab": T_ab,
+        }
+
+        if self.return_names:
+            return {
+                "image_a": image_a,
+                "image_b": image_b,
+                "T_ab": T_ab,
+                "image_a_name": item["from_image"],
+                "image_b_name": item["to_image"],
+            }
 
         return image_a, image_b, T_ab

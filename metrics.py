@@ -53,7 +53,6 @@ def pose_errors(pred_pose, gt_pose):
         yaw_error_deg.mean(),
     )
 
-
 def relative_cylinder_errors(pred_vision, target_vision, occ_thresh=0.5, fov_degrees=90.0):
     B, N, _ = target_vision.shape
     mask = target_vision[..., 0] > occ_thresh
@@ -78,7 +77,6 @@ def relative_cylinder_errors(pred_vision, target_vision, occ_thresh=0.5, fov_deg
     zero = pred_vision.sum() * 0.0
     return zero, zero
 
-
 def relative_pose_vector_errors(pred_pose, target_pose):
     pred_t, gt_t = pred_pose[:, :2], target_pose[:, :2]
     pred_r, gt_r = pred_pose[:, 2:], target_pose[:, 2:]
@@ -87,10 +85,6 @@ def relative_pose_vector_errors(pred_pose, target_pose):
     rotation_err = torch.linalg.vector_norm(pred_r - gt_r, dim=-1) / torch.linalg.vector_norm(gt_r, dim=-1).clamp_min(1e-6)
 
     return translation_err.mean(), rotation_err.mean()
-
-import numpy as np
-import torch
-
 
 @torch.no_grad()
 def evaluate_vision(
@@ -372,35 +366,46 @@ def evaluate_vision(
         "depth_corr": depth_corr,
     }
 
-
 @torch.no_grad()
-def evaluate_pose(model, loader, device, gt_occ_threshold=0.5):
-    model.eval()
+def evaluate_pose(
+    model,
+    loader,
+    device,
+    gt_occ_threshold=0.5,
+    matching_mode="predicted",
+    pred_occ_threshold=0.2,
+):
+    """
+    matching_mode:
+        "gt"        : GT-bin och GT-matchningar.
+        "gt_bins"   : GT-bin, men skattade matchningar.
+        "predicted" : Skattade bin och skattade matchningar.
 
-    base_model = getattr(model, "_orig_mod", model)
-    parameters = inspect.signature(base_model.forward).parameters
+    Radie och djup är förutsagda i alla tre testerna.
+    Avsedd för den uppdaterade modellen från model_pose.py.
+    """
+    from model_pose import predicted_bin_matches, pack_matched_pairs
 
-    uses_gt_matches = all(
-        name in parameters
-        for name in (
-            "target_vision_a",
-            "target_vision_b",
-            "return_pose_inputs",
+    methods = {
+        "gt": "Learned pose with GT bins and GT matches",
+        "gt_bins": "Learned pose with GT bins and predicted matches",
+        "predicted": "Learned pose with predicted bins and matches",
+    }
+    if matching_mode not in methods:
+        raise ValueError(
+            "matching_mode måste vara 'gt', 'gt_bins' eller 'predicted'."
         )
-    )
 
-    if uses_gt_matches:
-        method = "Learned pose with GT matches"
-    elif callable(getattr(base_model, "predict_pose_ransac", None)):
-        method = "RANSAC"
-    else:
-        method = "Direct learned pose"
+    model.eval()
+    base_model = getattr(model, "_orig_mod", model)
+    method = methods[matching_mode]
 
     translation_errors = []
     yaw_errors = []
 
-    failures = 0
+    seen_pairs = 0
     total = 0
+    failures = 0
     excluded_gt_pairs = 0
 
     for batch in loader:
@@ -408,114 +413,383 @@ def evaluate_pose(model, loader, device, gt_occ_threshold=0.5):
             x.to(device, non_blocking=True)
             for x in batch
         ]
+        pose_gt = pose_gt.float()
+        seen_pairs += len(pose_gt)
 
-        # GT translation direction and yaw must be defined.
+        # Endast GT-kameraposen avgör om felet går att beräkna.
         eligible = (
             torch.isfinite(pose_gt).all(dim=-1)
             & (pose_gt[:, :2].norm(dim=-1) > 1e-6)
             & (pose_gt[:, 2:].norm(dim=-1) > 1e-8)
         )
 
-        if uses_gt_matches:
+        excluded_gt_pairs += (~eligible).sum().item()
+        total += eligible.sum().item()
+
+        if not eligible.any():
+            continue
+
+        img_a = img_a[eligible]
+        img_b = img_b[eligible]
+        vision_a = vision_a[eligible]
+        vision_b = vision_b[eligible]
+        pose_gt = pose_gt[eligible]
+
+        if matching_mode == "gt":
+            # Explicit GT-läge behövs eftersom auto använder
+            # skattade matchningar när modellen är i eval().
             _, _, pose_pred, pose_info = model(
                 img_a,
                 img_b,
+                matching_mode="gt",
                 target_vision_a=vision_a,
                 target_vision_b=vision_b,
-                return_pose_inputs=True,
                 occ_thresh=gt_occ_threshold,
+                return_pose_inputs=True,
             )
-            eligible &= pose_info["pose_valid"]
+            pose_valid = pose_info["pose_valid"]
 
-        elif method == "RANSAC":
-            _, _, pose_pred = base_model.predict_pose_ransac(
+        elif matching_mode == "predicted":
+            # Ingen GT-cylinderdata skickas till modellen.
+            _, _, pose_pred, pose_info = model(
                 img_a,
                 img_b,
+                matching_mode="predicted",
+                pred_occ_thresh=pred_occ_threshold,
+                return_pose_inputs=True,
             )
+            pose_valid = pose_info["pose_valid"]
 
         else:
-            _, _, pose_pred = model(img_a, img_b)
+            # GT-bin, men modellen får själv skatta kopplingarna.
+            pred_a, pred_b, _, corr_a, corr_b = model(
+                img_a,
+                img_b,
+                compute_pose=False,
+                return_corr=True,
+            )
+
+            # Matcharen får GT-occupancy som kandidaturval.
+            # Radie och djup behålls från prediktionerna.
+            selection_a = pred_a.clone()
+            selection_b = pred_b.clone()
+            selection_a[..., 0] = vision_a[..., 0]
+            selection_b[..., 0] = vision_b[..., 0]
+
+            matches = predicted_bin_matches(
+                selection_a,
+                selection_b,
+                corr_a,
+                corr_b,
+                fov_degrees=base_model.fov_degrees,
+                occ_thresh=gt_occ_threshold,
+                # Behåll alla GT-kandidatbin utan NMS eller top-k.
+                nms_radius=0,
+                max_candidates=max(
+                    2, vision_a.shape[1], vision_b.shape[1]
+                ),
+            )
+
+            # Posehuvudet får originalprediktionernas geometri.
+            tokens, pair_mask, _ = pack_matched_pairs(
+                pred_a,
+                pred_b,
+                matches,
+                base_model.fov_degrees,
+            )
+            pose_valid = pair_mask.sum(dim=1) >= 2
+
+            safe_mask = pair_mask.clone()
+            safe_mask[~safe_mask.any(dim=1), 0] = True
+
+            pose_pred = base_model.pose_head(tokens, safe_mask)
+            pose_pred = torch.where(
+                pose_valid.unsqueeze(-1),
+                pose_pred,
+                torch.zeros_like(pose_pred),
+            )
 
         if pose_pred is None:
             raise ValueError("Modellen returnerade ingen pose.")
 
-        excluded_gt_pairs += (~eligible).sum().item()
+        pose_pred = pose_pred.float()
 
-        for index in torch.where(eligible)[0].tolist():
-            pred = pose_pred[index].float()
-            gt = pose_gt[index].float()
-            total += 1
+        valid = (
+            pose_valid
+            & torch.isfinite(pose_pred).all(dim=-1)
+            & (pose_pred[:, :2].norm(dim=-1) >= 1e-8)
+            & (pose_pred[:, 2:].norm(dim=-1) >= 1e-8)
+        )
 
-            if (
-                not torch.isfinite(pred).all()
-                or pred[:2].norm() < 1e-8
-                or pred[2:].norm() < 1e-8
-            ):
-                failures += 1
-                continue
+        # För få matchningar är ett prediktionsfel,
+        # inte ett ogiltigt GT-par.
+        failures += (~valid).sum().item()
 
-            # Translation direction error
-            t_pred = F.normalize(pred[:2], dim=0)
-            t_gt = F.normalize(gt[:2], dim=0)
+        pred = pose_pred[valid]
+        gt = pose_gt[valid]
 
-            cos_t = torch.dot(t_pred, t_gt).clamp(-1.0, 1.0)
-            t_error = torch.rad2deg(torch.acos(cos_t)).item()
+        t_pred = F.normalize(pred[:, :2], dim=-1)
+        t_gt = F.normalize(gt[:, :2], dim=-1)
 
-            # Wrapped yaw error
-            yaw_pred = torch.atan2(pred[2], pred[3])
-            yaw_gt = torch.atan2(gt[2], gt[3])
+        cos_t = (t_pred * t_gt).sum(dim=-1).clamp(-1.0, 1.0)
+        translation_errors.extend(
+            torch.rad2deg(torch.acos(cos_t)).cpu().tolist()
+        )
 
-            delta_yaw = torch.atan2(
-                torch.sin(yaw_pred - yaw_gt),
-                torch.cos(yaw_pred - yaw_gt),
-            )
-            yaw_error = torch.rad2deg(delta_yaw).abs().item()
+        yaw_pred = torch.atan2(pred[:, 2], pred[:, 3])
+        yaw_gt = torch.atan2(gt[:, 2], gt[:, 3])
+        delta_yaw = yaw_pred - yaw_gt
 
-            translation_errors.append(t_error)
-            yaw_errors.append(yaw_error)
+        yaw_errors.extend(
+            torch.rad2deg(
+                torch.atan2(
+                    torch.sin(delta_yaw),
+                    torch.cos(delta_yaw),
+                )
+            ).abs().cpu().tolist()
+        )
 
-    t = np.asarray(translation_errors)
-    yaw = np.asarray(yaw_errors)
+    t = np.asarray(translation_errors, dtype=float)
+    yaw = np.asarray(yaw_errors, dtype=float)
 
     def stat(values, function):
-        return (
-            float(function(values))
-            if len(values)
-            else float("nan")
+        return float(function(values)) if len(values) else float("nan")
+
+    metrics = {
+        "translation_errors": t,
+        "yaw_errors": yaw,
+        "seen_pairs": seen_pairs,
+        "failures": failures,
+        "total": total,
+        "excluded_gt_pairs": excluded_gt_pairs,
+        "method": method,
+        "matching_mode": matching_mode,
+        "success_rate": len(t) / total if total else float("nan"),
+    }
+
+    for name, values in (("translation", t), ("yaw", yaw)):
+        metrics[name + "_mean"] = stat(values, np.mean)
+        metrics[name + "_median"] = stat(values, np.median)
+        metrics[name + "_p90"] = stat(
+            values, lambda x: np.percentile(x, 90)
         )
 
     print("CAMERA POSE PERFORMANCE")
     print("=" * 60)
     print(f"Pose method:            {method}")
-
-    print(f"\nTest pairs:             {total}")
+    print(f"\nSeen pairs:             {seen_pairs}")
+    print(f"Test pairs:             {total}")
     print(f"Successful poses:       {len(t)}")
-
-    failure_label = (
-        "RANSAC failures:" if method == "RANSAC"
-        else "Prediction failures:"
-    )
-    print(f"{failure_label:24s}{failures}")
-    print(f"Success rate:           {len(t) / max(total, 1):.3f}")
+    print(f"Prediction failures:    {failures}")
+    print(f"Success rate:           {metrics['success_rate']:.3f}")
     print(f"Excluded GT pairs:      {excluded_gt_pairs}")
 
-    print("\nTRANSLATION DIRECTION ERROR")
-    print("-" * 40)
-    print(f"Mean:                   {stat(t, np.mean):.2f}°")
-    print(f"Median:                 {stat(t, np.median):.2f}°")
-    print(
-        f"P90:                    "
-        f"{stat(t, lambda x: np.percentile(x, 90)):.2f}°"
-    )
+    for title, name in (
+        ("TRANSLATION DIRECTION ERROR", "translation"),
+        ("YAW ERROR", "yaw"),
+    ):
+        print("\n" + title)
+        print("-" * 40)
+        print(f"Mean:                   {metrics[name + '_mean']:.2f}°")
+        print(f"Median:                 {metrics[name + '_median']:.2f}°")
+        print(f"P90:                    {metrics[name + '_p90']:.2f}°")
 
-    print("\nYAW ERROR")
+    print("\nACCURACY THRESHOLDS — successful poses only")
     print("-" * 40)
-    print(f"Mean:                   {stat(yaw, np.mean):.2f}°")
-    print(f"Median:                 {stat(yaw, np.median):.2f}°")
-    print(
-        f"P90:                    "
-        f"{stat(yaw, lambda x: np.percentile(x, 90)):.2f}°"
-    )
+
+    for threshold in [5, 10, 20, 30]:
+        t_acc = stat(t, lambda x: np.mean(x < threshold))
+        yaw_acc = stat(yaw, lambda x: np.mean(x < threshold))
+
+        print(
+            f"< {threshold:2d}°: "
+            f"T={100*t_acc:5.1f}% | "
+            f"Yaw={100*yaw_acc:5.1f}%"
+        )
+
+    return metrics
+
+@torch.no_grad()
+def evaluate_pose_forest(model, loader, device, predict_pose=None):
+    """
+    loader returnerar (img_a, img_b, T_ab), där T_ab är [B, 4, 4]
+    och mappar kamera A -> kamera B.
+
+    Förutsagd pose: [forward, right, sin(yaw), cos(yaw)].
+
+    predict_pose är valfri:
+        predict_pose(model, img_a, img_b) -> (pose, pose_valid)
+
+    pose_valid: bool-tensor [B]. Ogiltiga prediktioner räknas som
+    failures, även bildpar med för få matchningar.
+    """
+    model.eval()
+    base_model = getattr(model, "_orig_mod", model)
+    parameters = inspect.signature(base_model.forward).parameters
+
+    if predict_pose is not None:
+        method = "Custom forest pose prediction"
+    elif callable(getattr(base_model, "predict_pose_ransac", None)):
+        method = "RANSAC"
+    elif all(
+        name in parameters
+        for name in (
+            "target_vision_a",
+            "target_vision_b",
+            "return_pose_inputs",
+        )
+    ):
+        raise ValueError(
+            "Modellen kräver cylinderbinmatchningar för pose. "
+            "Forest-datan innehåller endast kamerornas relativa poser. "
+            "Ange predict_pose som beräknar pose från bilderna med "
+            "oberoende skattade matchningar."
+        )
+    else:
+        method = "Direct learned pose"
+
+    translation_errors = []
+    yaw_errors = []
+    total = 0
+    failures = 0
+    excluded_gt_pairs = 0
+
+    for batch in loader:
+        img_a, img_b, target_T = [
+            x.to(device, non_blocking=True)
+            for x in batch
+        ]
+        target_T = target_T.float()
+
+        if target_T.ndim != 3 or target_T.shape[1:] != (4, 4):
+            raise ValueError("Forest GT måste ha format [B, 4, 4].")
+
+        rotation = target_T[:, :3, :3]
+
+        # Samma omvandling som relative_pose_loss_forest:
+        # translation = [framåt (Z), höger (X)].
+        pose_gt = torch.stack(
+            [
+                target_T[:, 2, 3],
+                target_T[:, 0, 3],
+                0.5 * (rotation[:, 0, 2] - rotation[:, 2, 0]),
+                0.5 * (rotation[:, 0, 0] + rotation[:, 2, 2]),
+            ],
+            dim=-1,
+        )
+
+        eligible = (
+            torch.isfinite(target_T).all(dim=-1).all(dim=-1)
+            & (pose_gt[:, :2].norm(dim=-1) > 1e-6)
+            & (pose_gt[:, 2:].norm(dim=-1) > 1e-8)
+        )
+
+        excluded_gt_pairs += (~eligible).sum().item()
+        total += eligible.sum().item()
+
+        if not eligible.any():
+            continue
+
+        img_a = img_a[eligible]
+        img_b = img_b[eligible]
+        pose_gt = pose_gt[eligible]
+
+        if predict_pose is not None:
+            pose_pred, pose_valid = predict_pose(model, img_a, img_b)
+        else:
+            if method == "RANSAC":
+                _, _, pose_pred = base_model.predict_pose_ransac(
+                    img_a, img_b
+                )
+            else:
+                _, _, pose_pred = model(img_a, img_b)
+
+            pose_valid = torch.ones(
+                len(pose_gt), dtype=torch.bool, device=device
+            )
+
+        if pose_pred is None or pose_pred.shape != pose_gt.shape:
+            raise ValueError("Förutsagd pose måste ha format [B, 4].")
+
+        pose_pred = pose_pred.to(device=device, dtype=torch.float32)
+        pose_valid = torch.as_tensor(pose_valid, device=device)
+
+        if (
+            pose_valid.dtype != torch.bool
+            or pose_valid.shape != (len(pose_gt),)
+        ):
+            raise ValueError("pose_valid måste vara en bool-tensor [B].")
+
+        valid = (
+            pose_valid
+            & torch.isfinite(pose_pred).all(dim=-1)
+            & (pose_pred[:, :2].norm(dim=-1) >= 1e-8)
+            & (pose_pred[:, 2:].norm(dim=-1) >= 1e-8)
+        )
+
+        failures += (~valid).sum().item()
+        pred = pose_pred[valid]
+        gt = pose_gt[valid]
+
+        t_pred = F.normalize(pred[:, :2], dim=-1)
+        t_gt = F.normalize(gt[:, :2], dim=-1)
+        cos_t = (t_pred * t_gt).sum(dim=-1).clamp(-1.0, 1.0)
+
+        translation_errors.extend(
+            torch.rad2deg(torch.acos(cos_t)).cpu().tolist()
+        )
+
+        yaw_pred = torch.atan2(pred[:, 2], pred[:, 3])
+        yaw_gt = torch.atan2(gt[:, 2], gt[:, 3])
+        delta = yaw_pred - yaw_gt
+
+        yaw_errors.extend(
+            torch.rad2deg(
+                torch.atan2(torch.sin(delta), torch.cos(delta))
+            ).abs().cpu().tolist()
+        )
+
+    t = np.asarray(translation_errors, dtype=float)
+    yaw = np.asarray(yaw_errors, dtype=float)
+
+    def stat(values, function):
+        return float(function(values)) if len(values) else float("nan")
+
+    metrics = {
+        "translation_errors": t,
+        "yaw_errors": yaw,
+        "failures": failures,
+        "total": total,
+        "excluded_gt_pairs": excluded_gt_pairs,
+        "method": method,
+        "success_rate": len(t) / total if total else float("nan"),
+    }
+
+    for name, values in (("translation", t), ("yaw", yaw)):
+        metrics[name + "_mean"] = stat(values, np.mean)
+        metrics[name + "_median"] = stat(values, np.median)
+        metrics[name + "_p90"] = stat(
+            values, lambda x: np.percentile(x, 90)
+        )
+
+    print("FOREST CAMERA POSE PERFORMANCE")
+    print("=" * 60)
+    print(f"Pose method:            {method}")
+    print(f"\nTest pairs:             {total}")
+    print(f"Successful poses:       {len(t)}")
+    print(f"Prediction failures:    {failures}")
+    print(f"Success rate:           {metrics['success_rate']:.3f}")
+    print(f"Excluded GT pairs:      {excluded_gt_pairs}")
+
+    for title, name in (
+        ("TRANSLATION DIRECTION ERROR", "translation"),
+        ("YAW ERROR", "yaw"),
+    ):
+        print("\n" + title)
+        print("-" * 40)
+        print(f"Mean:                   {metrics[name + '_mean']:.2f}°")
+        print(f"Median:                 {metrics[name + '_median']:.2f}°")
+        print(f"P90:                    {metrics[name + '_p90']:.2f}°")
 
     print("\nACCURACY THRESHOLDS")
     print("-" * 40)
@@ -530,23 +804,4 @@ def evaluate_pose(model, loader, device, gt_occ_threshold=0.5):
             f"Yaw={100*yaw_acc:5.1f}%"
         )
 
-    return {
-        "translation_errors": t,
-        "yaw_errors": yaw,
-        "failures": failures,
-        "total": total,
-        "excluded_gt_pairs": excluded_gt_pairs,
-        "method": method,
-
-        "translation_mean": stat(t, np.mean),
-        "translation_median": stat(t, np.median),
-        "translation_p90": stat(
-            t, lambda x: np.percentile(x, 90)
-        ),
-
-        "yaw_mean": stat(yaw, np.mean),
-        "yaw_median": stat(yaw, np.median),
-        "yaw_p90": stat(
-            yaw, lambda x: np.percentile(x, 90)
-        ),
-    }
+    return metrics
