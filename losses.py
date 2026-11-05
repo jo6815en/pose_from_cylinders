@@ -669,3 +669,49 @@ def masked_relative_pose_loss_2d(pred_pose, target_pose, pose_valid,
         return zero, zero, zero
     return relative_pose_loss_2d(pred_pose[valid].float(), target_pose[valid].float(),
                                  t_weight=t_weight, r_weight=r_weight)
+
+def relative_pose_loss_forest(pred_pose, target_T, t_weight=1.0, r_weight=1.0):
+    """
+    pred_pose: [B, 4]
+        [translation_forward, translation_right, sin(yaw), cos(yaw)]
+
+    target_T: [B, 4, 4]
+        T_a_to_b från relative_poses.json.
+
+    Ignorerar translation i Y-led samt pitch och roll.
+    """
+
+    target_translation = target_T[:, :3, 3]
+    target_rotation = target_T[:, :3, :3]
+
+    # Samma koordinatordning som används av forest-funktionerna:
+    # [framåt (Z), åt höger (X)]
+    target_forward = target_translation[:, 2]
+    target_right = target_translation[:, 0]
+
+    # Extrahera endast yaw runt Y-axeln
+    sin_yaw = 0.5 * (
+        target_rotation[:, 0, 2]
+        - target_rotation[:, 2, 0]
+    )
+    cos_yaw = 0.5 * (
+        target_rotation[:, 0, 0]
+        + target_rotation[:, 2, 2]
+    )
+
+    target_pose_2d = torch.stack(
+        [
+            target_forward,
+            target_right,
+            sin_yaw,
+            cos_yaw,
+        ],
+        dim=-1,
+    )
+
+    return relative_pose_loss_2d(
+        pred_pose,
+        target_pose_2d,
+        t_weight=t_weight,
+        r_weight=r_weight,
+    )
