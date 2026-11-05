@@ -93,9 +93,11 @@ def train_one_epoch(
                         pred_vision_a[..., 0].float().clamp(1e-6, 1.0 - 1e-6), vision_a[..., 0].float())
                     occ_b = F.binary_cross_entropy(
                         pred_vision_b[..., 0].float().clamp(1e-6, 1.0 - 1e-6), vision_b[..., 0].float())
+               
                 vision_loss_total = lambda_occ * 0.5 * (occ_a + occ_b)
                 rad_a = rad_b = dep_a = dep_b = width_a = width_b = vision_loss_total.new_zeros(())
                 corr_loss = depth_structure_loss = depth_delta_loss = vision_loss_total.new_zeros(())
+            
             else:
                 vis_a, occ_a, rad_a, dep_a, width_a = vision_loss(pred_vision_a, vision_a, occ_thresh=occ_thresh, lambda_occ=lambda_occ,
                     lambda_radius=lambda_radius, lambda_depth=1.0, lambda_width=lambda_width)

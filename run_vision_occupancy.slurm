@@ -38,8 +38,6 @@ python --version
 echo "Starting occupancy training..."
 srun python -u train_vision.py \
     --stage occupancy \
-    --data-dir /nobackup/proj/disk/midlevel_representations/personal/johanna/data \
-    --lambda-depth-delta 0.35 \
     --epochs 200 \
     --batch-size 16 \
     --lr 5e-5 \
