@@ -335,7 +335,7 @@ def main():
     print("Seed: ", args.seed)
 
     train_dataset = SceneTwoPairsDataset(
-        root_dir=os.path.join(args.data_dir, "dataset"),
+        root_dir=os.path.join(args.data_dir, "big_dataset"),
         image_size=args.img_size,
         debug=False,
         return_two_pairs=False,
