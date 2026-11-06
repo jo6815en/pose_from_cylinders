@@ -6,8 +6,8 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --gpus=1
-#SBATCH -t 24:00:00
-#SBATCH -J vision_geometry
+#SBATCH -t 6:00:00
+#SBATCH -J vision_geometry_org
 #SBATCH -o logs/%x-%j.out
 #SBATCH -e logs/%x-%j.err
 
@@ -19,10 +19,9 @@ cd /nobackup/proj/disk/midlevel_representations/personal/johanna/pose_from_cylin
 
 mkdir -p "runs/slurm_${SLURM_JOB_NAME}_${SLURM_JOB_ID}/evaluation"
 
-module load Miniforge/26.3.2-2-eb
-
+module load GPU/Miniforge/26.9.4-1-eb
 eval "$(conda shell.bash hook)"
-conda activate pose_cylinders
+conda activate /home/johanna/.conda-hpc/el9_gh200/envs/pose_cylinders
 
 echo "Host: $(hostname)"
 echo "Job ID: $SLURM_JOB_ID"

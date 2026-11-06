@@ -7,7 +7,7 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --gpus=1
 #SBATCH -t 24:00:00
-#SBATCH -J long_run_pose
+#SBATCH -J long_run_gt_bins_corr
 
 #SBATCH -o logs/%x-%j.out
 #SBATCH -e logs/%x-%j.err
@@ -33,11 +33,13 @@ python --version
 
 echo "Starting training..."
 
-srun python train_pose.py \
+srun python train_pose_gt_bins_corr.py \
     --epochs 200 \
     --batch-size 16 \
     --lr 5e-5\
     --num-workers 8\
+    --lambda-pose 2.0 \
+    --seed 0 \
     --output-dir runs/slurm_${SLURM_JOB_NAME}
 
 echo "Training finished."

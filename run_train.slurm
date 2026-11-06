@@ -7,7 +7,7 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --gpus=1
 #SBATCH -t 24:00:00
-#SBATCH -J long_run_flipped
+#SBATCH -J long_run_flipped_occ_40
 
 #SBATCH -o logs/%x-%j.out
 #SBATCH -e logs/%x-%j.err
@@ -34,11 +34,12 @@ python --version
 echo "Starting training..."
 
 srun python train.py \
-    --lambda-depth-delta 0.35 \
     --epochs 200 \
     --batch-size 16 \
     --lr 5e-5\
     --num-workers 8\
+    --seed 0 \
+    --lambda-occ 40.0 \
     --output-dir runs/slurm_${SLURM_JOB_NAME}
 
 echo "Training finished."
