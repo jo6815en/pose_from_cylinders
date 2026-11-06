@@ -17,12 +17,6 @@ set -eo pipefail
 
 cd /nobackup/proj/disk/midlevel_representations/personal/johanna/pose_from_cylinders
 
-# First argument: checkpoint from the occupancy run.
-if [[ ! -f "$1" ]]; then
-    echo "Occupancy checkpoint not found. Pass its path after the script name." >&2
-    exit 1
-fi
-
 mkdir -p "runs/slurm_${SLURM_JOB_NAME}_${SLURM_JOB_ID}/evaluation"
 
 module load GPU/Miniforge/26.3.2-2-eb
@@ -44,8 +38,13 @@ python --version
 echo "Starting geometry training..."
 srun python -u train_vision.py \
     --stage geometry \
-    --init-checkpoint "$1" \
+    --init-checkpoint runs/slurm_vision_occupancy_lr5e4_4877772/checkpoints/best_vision.pt \
     --data-dir /nobackup/proj/disk/midlevel_representations/personal/johanna/data \
+    --lambda-occ 10.0 \
+    --lambda--radius 10.0 \
+    --lambda-width 0.1\
+    --lambda-corr 1.0 \
+    --lambda-depth-struct 0.5\
     --lambda-depth-delta 0.35 \
     --epochs 200 \
     --batch-size 16 \

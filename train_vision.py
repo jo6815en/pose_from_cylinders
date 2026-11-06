@@ -46,6 +46,7 @@ def train_one_epoch(
     lambda_occ,
     lambda_radius,
     lambda_corr,
+    lambda_depth_struct,
     lambda_depth_delta,
     lambda_width,
     scaler,
@@ -118,7 +119,7 @@ def train_one_epoch(
             loss = (
                 vision_loss_total
                 + lambda_corr * corr_loss
-                + 0.5 * depth_structure_loss
+                + lambda_depth_struct * depth_structure_loss
                 + lambda_depth_delta * depth_delta_loss
             )
 
@@ -150,6 +151,7 @@ def validate(
     lambda_occ,
     lambda_radius,
     lambda_corr,
+    lambda_depth_struct,
     lambda_depth_delta,
     lambda_width,
     occupancy_only=False,
@@ -217,7 +219,7 @@ def validate(
         total_loss = (
             vision_loss_total
             + lambda_corr * corr_loss
-            + 0.5 * depth_structure_loss
+            + lambda_depth_struct * depth_structure_loss
             + lambda_depth_delta * depth_delta_loss
         )
 
@@ -286,6 +288,8 @@ def main():
     parser.add_argument("--lambda-width", type=float, default=0.1)
     parser.add_argument("--lambda-corr", type=float, default=1.0)
     parser.add_argument("--lambda-depth-delta", type=float, default=0.35)
+    parser.add_argument("--lambda-depth-struct", type=float, default=0.5)
+
 
     parser.add_argument("--output-dir", default=None)
     parser.add_argument("--stage", choices=("full", "occupancy", "geometry"), default="full",
@@ -466,6 +470,7 @@ def main():
             args.lambda_occ,
             args.lambda_radius,
             args.lambda_corr,
+            args.lambda_depth_struct,
             args.lambda_depth_delta,
             args.lambda_width,
             scaler,
@@ -512,6 +517,7 @@ def main():
                 args.lambda_occ,
                 args.lambda_radius,
                 args.lambda_corr,
+                args.lambda_depth_struct,
                 args.lambda_depth_delta,
                 args.lambda_width,
                 occupancy_only=args.occupancy_only,
