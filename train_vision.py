@@ -45,6 +45,7 @@ def train_one_epoch(
     occ_thresh,
     lambda_occ,
     lambda_radius,
+    lambda_depth,
     lambda_corr,
     lambda_depth_struct,
     lambda_depth_delta,
@@ -101,10 +102,10 @@ def train_one_epoch(
             
             else:
                 vis_a, occ_a, rad_a, dep_a, width_a = vision_loss(pred_vision_a, vision_a, occ_thresh=occ_thresh, lambda_occ=lambda_occ,
-                    lambda_radius=lambda_radius, lambda_depth=1.0, lambda_width=lambda_width)
+                    lambda_radius=lambda_radius, lambda_depth=lambda_depth, lambda_width=lambda_width)
 
                 vis_b, occ_b, rad_b, dep_b, width_b = vision_loss(pred_vision_b, vision_b, occ_thresh=occ_thresh, lambda_occ=lambda_occ,
-                    lambda_radius=lambda_radius, lambda_depth=1.0, lambda_width=lambda_width)
+                    lambda_radius=lambda_radius, lambda_depth=lambda_depth, lambda_width=lambda_width)
 
                 vision_loss_total = 0.5 * ( vis_a + vis_b)
 
@@ -150,6 +151,7 @@ def validate(
     occ_thresh,
     lambda_occ,
     lambda_radius,
+    lambda_depth,
     lambda_corr,
     lambda_depth_struct,
     lambda_depth_delta,
@@ -200,9 +202,9 @@ def validate(
             corr_loss = depth_structure_loss = depth_delta_loss = vision_loss_total.new_zeros(())
         else:
             vis_a, occ_a, rad_a, dep_a, width_a = vision_loss(pred_vision_a, vision_a, occ_thresh=occ_thresh, lambda_occ=lambda_occ,
-                lambda_radius=lambda_radius, lambda_depth=1.0, lambda_width=lambda_width)
+                lambda_radius=lambda_radius, lambda_depth=lambda_depth, lambda_width=lambda_width)
             vis_b, occ_b, rad_b, dep_b, width_b = vision_loss(pred_vision_b, vision_b, occ_thresh=occ_thresh, lambda_occ=lambda_occ,
-                lambda_radius=lambda_radius, lambda_depth=1.0, lambda_width=lambda_width)
+                lambda_radius=lambda_radius, lambda_depth=lambda_depth, lambda_width=lambda_width)
             vision_loss_total = 0.5 * (vis_a + vis_b)
 
             corr_loss = patch_correspondence_loss(corr_a, vision_a, corr_b, vision_b)
@@ -285,6 +287,7 @@ def main():
     parser.add_argument("--occ-thresh", type=float, default=0.5)
     parser.add_argument("--lambda-occ", type=float, default=10.0)
     parser.add_argument("--lambda-radius", type=float, default=10.0)
+    parser.add_argument("--lambda-depth", type=float, default=1.0)
     parser.add_argument("--lambda-width", type=float, default=0.1)
     parser.add_argument("--lambda-corr", type=float, default=1.0)
     parser.add_argument("--lambda-depth-delta", type=float, default=0.35)
@@ -335,7 +338,7 @@ def main():
     print("Seed: ", args.seed)
 
     train_dataset = SceneTwoPairsDataset(
-        root_dir=os.path.join(args.data_dir, "big_dataset"),
+        root_dir=os.path.join(args.data_dir, "dataset"),
         image_size=args.img_size,
         debug=False,
         return_two_pairs=False,
