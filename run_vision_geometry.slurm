@@ -19,7 +19,7 @@ cd /nobackup/proj/disk/midlevel_representations/personal/johanna/pose_from_cylin
 
 mkdir -p "runs/slurm_${SLURM_JOB_NAME}_${SLURM_JOB_ID}/evaluation"
 
-module load GPU/Miniforge/26.3.2-2-eb
+module load Miniforge/26.3.2-2-eb
 
 eval "$(conda shell.bash hook)"
 conda activate pose_cylinders
@@ -41,7 +41,7 @@ srun python -u train_vision.py \
     --init-checkpoint runs/slurm_vision_occupancy_lr5e4_4877772/checkpoints/best_vision.pt \
     --data-dir /nobackup/proj/disk/midlevel_representations/personal/johanna/data \
     --lambda-occ 10.0 \
-    --lambda--radius 10.0 \
+    --lambda-radius 10.0 \
     --lambda-width 0.1\
     --lambda-corr 1.0 \
     --lambda-depth-struct 0.5\
