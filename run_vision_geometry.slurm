@@ -38,7 +38,6 @@ echo "Starting geometry training..."
 srun python -u train_vision.py \
     --stage geometry \
     --init-checkpoint runs/slurm_vision_occupancy_lr5e4_4877772/checkpoints/best_vision.pt \
-    --data-dir /nobackup/proj/disk/midlevel_representations/personal/johanna/data \
     --lambda-occ 10.0 \
     --lambda-radius 10.0 \
     --lambda-width 0.1\
@@ -56,7 +55,6 @@ srun python -u train_vision.py \
 echo "Training finished. Evaluating best_vision.pt on testdataset..."
 srun python -u eval_vision.py \
     --checkpoint "runs/slurm_${SLURM_JOB_NAME}_${SLURM_JOB_ID}/checkpoints/best_vision.pt" \
-    --data-dir /nobackup/proj/disk/midlevel_representations/personal/johanna/data \
     --split testdataset \
     --batch-size 16 \
     --num-workers 8 \
