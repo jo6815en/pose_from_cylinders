@@ -6,8 +6,8 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --gpus=1
-#SBATCH -t 6:00:00
-#SBATCH -J vision_geometry_org
+#SBATCH -t 12:00:00
+#SBATCH -J vision_geometry_d5_w05
 #SBATCH -o logs/%x-%j.out
 #SBATCH -e logs/%x-%j.err
 
@@ -37,10 +37,11 @@ python --version
 echo "Starting geometry training..."
 srun python -u train_vision.py \
     --stage geometry \
-    --init-checkpoint runs/slurm_vision_occupancy_lr5e4_4877772/checkpoints/best_vision.pt \
+    --init-checkpoint runs/slurm_vision_occupancy_org_5125793/checkpoints/best_vision.pt \
     --lambda-occ 10.0 \
     --lambda-radius 10.0 \
-    --lambda-width 0.1\
+    --lambda-depth 5.0 \
+    --lambda-width 0.5\
     --lambda-corr 1.0 \
     --lambda-depth-struct 0.5\
     --lambda-depth-delta 0.35 \

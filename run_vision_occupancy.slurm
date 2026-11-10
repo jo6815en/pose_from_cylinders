@@ -7,7 +7,7 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --gpus=1
 #SBATCH -t 4:00:00
-#SBATCH -J vision_occupancy_lr4e4_2
+#SBATCH -J vision_occupancy_big
 #SBATCH -o logs/%x-%j.out
 #SBATCH -e logs/%x-%j.err
 
@@ -19,10 +19,9 @@ cd /nobackup/proj/disk/midlevel_representations/personal/johanna/pose_from_cylin
 
 mkdir -p "runs/slurm_${SLURM_JOB_NAME}_${SLURM_JOB_ID}/evaluation"
 
-module load GPU/Miniforge/26.3.2-2-eb
-
+module load GPU/Miniforge/26.9.4-1-eb
 eval "$(conda shell.bash hook)"
-conda activate pose_cylinders
+conda activate /home/johanna/.conda-hpc/el9_gh200/envs/pose_cylinders
 
 echo "Host: $(hostname)"
 echo "Job ID: $SLURM_JOB_ID"
@@ -41,7 +40,7 @@ srun python -u train_vision.py \
     --epochs 200 \
     --batch-size 16 \
     --lr 5e-4 \
-    --num-workers 8 \
+    --num-workers 4 \
     --seed 0 \
     --output-dir "runs/slurm_${SLURM_JOB_NAME}_${SLURM_JOB_ID}" \
     2>&1 | tee "runs/slurm_${SLURM_JOB_NAME}_${SLURM_JOB_ID}/train.log"

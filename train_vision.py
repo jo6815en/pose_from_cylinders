@@ -216,8 +216,6 @@ def validate(
 
             depth_delta_loss = matched_depth_delta_loss(pred_vision_a, vision_a, pred_vision_b, vision_b, occ_thresh)
 
-
-        
         total_loss = (
             vision_loss_total
             + lambda_corr * corr_loss
