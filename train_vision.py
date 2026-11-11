@@ -1,4 +1,4 @@
-"""Vision pretraining in two stages, using the existing joint model_pose.
+"""Vision pretraining in two stages, using the existing joint model.
 
 --stage occupancy: train backbone/shared cylinder features + occupancy head
 from scratch, BCE only. Radius/depth/width heads, corr decoder and pose are frozen.
@@ -23,7 +23,7 @@ from torch.utils.data import DataLoader
 
 from dataset import SceneTwoPairsDataset
 from augmentations import build_train_transform, build_eval_transform
-from model_pose import PairImageCylinderModel
+from model import PairImageCylinderModel
 from metrics import relative_cylinder_errors
 from losses import (
     vision_loss,

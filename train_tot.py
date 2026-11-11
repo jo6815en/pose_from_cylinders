@@ -1,4 +1,4 @@
-"""Two-stage fine-tuning of the existing joint model_pose.
+"""Two-stage fine-tuning of the existing joint model.
 
 --epochs includes the adaptation phase. Example: --epochs 100 --adapt-epochs 10
 means 10 epochs pose-only adaptation, followed by 90 jointly trained epochs.
@@ -24,7 +24,7 @@ from torch.utils.data import DataLoader
 
 from dataset import SceneTwoPairsDataset
 from augmentations import build_train_transform, build_eval_transform
-from model_pose import PairImageCylinderModel
+from model import PairImageCylinderModel
 from metrics import relative_cylinder_errors
 from losses import (
     vision_loss,

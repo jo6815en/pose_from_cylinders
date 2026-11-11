@@ -8,7 +8,7 @@ from torch.utils.data import DataLoader
 
 from dataset import SceneTwoPairsDataset
 from metrics import evaluate_vision
-from model_pose import PairImageCylinderModel
+from model import PairImageCylinderModel
 
 
 class VisionOnlyModel(PairImageCylinderModel):

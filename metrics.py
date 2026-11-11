@@ -382,9 +382,9 @@ def evaluate_pose(
         "predicted" : Skattade bin och skattade matchningar.
 
     Radie och djup är förutsagda i alla tre testerna.
-    Avsedd för den uppdaterade modellen från model_pose.py.
+    Avsedd för den uppdaterade modellen från model.py.
     """
-    from model_pose import predicted_bin_matches, pack_matched_pairs
+    from model import predicted_bin_matches, pack_matched_pairs
 
     methods = {
         "gt": "Learned pose with GT bins and GT matches",

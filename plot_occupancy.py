@@ -1,6 +1,6 @@
 """Plot occupancy probabilities and ground truth for validation image pairs.
 
-Place beside dataset.py, augmentations.py, model_pose.py, model.py and
+Place beside dataset.py, augmentations.py, model.py, model.py and
 matched_pair_pose.py. Uses the checkpoint format written by train_vision.py.
 """
 import argparse
@@ -77,7 +77,7 @@ def main():
     import torch
     from augmentations import build_eval_transform
     from dataset import SceneTwoPairsDataset
-    from model_pose import PairImageCylinderModel
+    from model import PairImageCylinderModel
 
     device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
     # Load only your own trusted training checkpoints.

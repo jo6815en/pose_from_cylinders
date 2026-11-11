@@ -1,4 +1,4 @@
-"""Evaluate a joint model_pose checkpoint with the existing metrics.evaluate_pose."""
+"""Evaluate a joint model checkpoint with the existing metrics.evaluate_pose."""
 
 import argparse
 import math
@@ -9,7 +9,7 @@ from torch.utils.data import DataLoader
 
 from dataset import SceneTwoPairsDataset
 from metrics import evaluate_pose
-from model_pose import PairImageCylinderModel
+from model import PairImageCylinderModel
 
 
 def main():
@@ -31,7 +31,7 @@ def main():
     cfg = checkpoint.get("args", {})
     state = checkpoint["model_state_dict"]
     if "pose_head.token_mlp.0.weight" not in state:
-        parser.error("Select a checkpoint from the joint model_pose (e.g. train_tot.py)")
+        parser.error("Select a checkpoint from the joint model (e.g. train_tot.py)")
 
     scale = state["pose_head.input_scale"]
     pose_depth = len({

@@ -11,7 +11,7 @@ from torch.utils.data import DataLoader
 
 from dataset import SceneTwoPairsDataset
 from augmentations import build_train_transform, build_eval_transform
-from model_pose import PairImageCylinderModel
+from model import PairImageCylinderModel
 from metrics import relative_cylinder_errors
 from losses import (
     vision_loss,
