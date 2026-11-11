@@ -197,45 +197,49 @@ def evaluate_vision(
     )[0, 1]
 
     # --------------------------------------------------
-    # Occupancy tolerance in bins
+    # Occupancy F1 with a one-bin tolerance. Match detections one to one
+    # within each view, so a single prediction cannot explain multiple GTs.
     # --------------------------------------------------
 
-    def occupancy_recall_with_tolerance(gt, pred, threshold, tol):
-        gt_bin = gt > threshold
-        pred_bin = pred > threshold
+    def occupancy_counts_with_tolerance(gt, pred, threshold, tol):
+        gt_binary = gt > threshold
+        pred_binary = pred > threshold
+        tp_tol = 0
 
-        hits = 0
-        total = gt_bin.sum()
+        for gt_row, pred_row in zip(gt_binary, pred_binary):
+            gt_indices = np.flatnonzero(gt_row)
+            pred_indices = np.flatnonzero(pred_row)
+            # Maximum-cardinality bipartite matching (augmenting paths).
+            matched_gt_for_pred = {}
 
-        for offset in range(-tol, tol + 1):
-            if offset < 0:
-                hits_mask = gt_bin[:, -offset:] & pred_bin[:, :offset]
-            elif offset > 0:
-                hits_mask = gt_bin[:, :-offset] & pred_bin[:, offset:]
-            else:
-                hits_mask = gt_bin & pred_bin
+            def assign(pred_index, seen):
+                for gt_index in gt_indices:
+                    if abs(int(gt_index) - int(pred_index)) > tol or gt_index in seen:
+                        continue
+                    seen.add(gt_index)
+                    if (gt_index not in matched_gt_for_pred
+                            or assign(matched_gt_for_pred[gt_index], seen)):
+                        matched_gt_for_pred[gt_index] = pred_index
+                        return True
+                return False
 
-            # mark GT cylinders hit by any allowed offset
-            if offset == -tol:
-                matched = np.zeros_like(gt_bin, dtype=bool)
+            for pred_index in pred_indices:
+                assign(pred_index, set())
+            tp_tol += len(matched_gt_for_pred)
 
-            if offset < 0:
-                matched[:, -offset:] |= hits_mask
-            elif offset > 0:
-                matched[:, :-offset] |= hits_mask
-            else:
-                matched |= hits_mask
+        fp_tol = int(pred_binary.sum()) - tp_tol
+        fn_tol = int(gt_binary.sum()) - tp_tol
+        return tp_tol, fp_tol, fn_tol
 
-        return matched.sum() / max(total, 1)
-
-
-    occ_recall_1bin = occupancy_recall_with_tolerance(
+    tp_1bin, fp_1bin, fn_1bin = occupancy_counts_with_tolerance(
         occ_gt, occ_pred, occ_threshold, 1
     )
-
-    occ_recall_2bin = occupancy_recall_with_tolerance(
-        occ_gt, occ_pred, occ_threshold, 2
+    precision_1bin = tp_1bin / max(tp_1bin + fp_1bin, 1)
+    recall_1bin = tp_1bin / max(tp_1bin + fn_1bin, 1)
+    f1_1bin = 2 * precision_1bin * recall_1bin / max(
+        precision_1bin + recall_1bin, 1e-12
     )
+    f1_1bin_delta = f1_1bin - f1
 
     # Radius tolerance
     radius_err = np.abs(radius_pred - radius_gt)
@@ -250,7 +254,6 @@ def evaluate_vision(
     depth_05m = np.mean(depth_err <= 0.5)
     depth_1m  = np.mean(depth_err <= 1.0)
     depth_2m  = np.mean(depth_err <= 2.0)
-    depth_5m  = np.mean(depth_err <= 5.0)
 
     # --------------------------------------------------
     # Print
@@ -265,16 +268,14 @@ def evaluate_vision(
         f"{'Precision':>12}"
         f"{'Recall':>10}"
         f"{'F1':>10}"
-        f"{'Recall ±1':>12}"
-        f"{'Recall ±2':>12}"
+        f"{'F1 ±1 bin':>12}"
     )
     print(
         f"{occ_accuracy:10.3f}"
         f"{precision:12.3f}"
         f"{recall:10.3f}"
         f"{f1:10.3f}"
-        f"{occ_recall_1bin:12.3f}"
-        f"{occ_recall_2bin:12.3f}"
+        f"{f1_1bin:12.3f}"
     )
 
 
@@ -282,7 +283,6 @@ def evaluate_vision(
     print("-" * 78)
     print(
         f"{'':<10}"
-        f"{'N':>8}"
         f"{'MAE':>10}"
         f"{'RMSE':>10}"
         f"{'Bias':>10}"
@@ -293,7 +293,6 @@ def evaluate_vision(
 
     print(
         f"{'Radius':<10}"
-        f"{len(radius_gt):8d}"
         f"{radius_mae:10.3f}"
         f"{radius_rmse:10.3f}"
         f"{radius_bias:10.3f}"
@@ -304,7 +303,6 @@ def evaluate_vision(
 
     print(
         f"{'Depth':<10}"
-        f"{len(depth_gt):8d}"
         f"{depth_mae:10.3f}"
         f"{depth_rmse:10.3f}"
         f"{depth_bias:10.3f}"
@@ -338,7 +336,6 @@ def evaluate_vision(
         f"{'±0.5 m':>12}"
         f"{'±1.0 m':>12}"
         f"{'±2.0 m':>12}"
-        f"{'±5.0 m':>12}"
     )
 
     print(
@@ -346,7 +343,6 @@ def evaluate_vision(
         f"{depth_05m:12.3f}"
         f"{depth_1m:12.3f}"
         f"{depth_2m:12.3f}"
-        f"{depth_5m:12.3f}"
     )
 
     return {
@@ -354,6 +350,10 @@ def evaluate_vision(
         "occupancy_precision": precision,
         "occupancy_recall": recall,
         "occupancy_f1": f1,
+        "occupancy_precision_1bin": precision_1bin,
+        "occupancy_recall_1bin": recall_1bin,
+        "occupancy_f1_1bin": f1_1bin,
+        "occupancy_f1_1bin_delta": f1_1bin_delta,
 
         "radius_mae": radius_mae,
         "radius_rmse": radius_rmse,
