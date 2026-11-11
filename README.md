@@ -5,11 +5,14 @@ This repository trains an image-pair model that uses cylinders in a scene as geo
 - a `vision` representation for each image: `[occupancy, radius, depth]` per horizontal bin
 - a relative 2D pose between the images: `[tx, ty, sin(yaw), cos(yaw)]`
 
-The main workflow lives in `train.ipynb`. It creates the datasets, model, losses, training loops, validation plots, inference views, and visualizations of predicted cylinders.
+Training is organized as scripts: `train_vision.py` pretrains the vision model, `train_pose_only.py` pretrains the pose head, and `train_tot.py` combines and fine-tunes them. `train_all_from_start.py` is an alternate joint-training route from scratch.
 
 ## Repository Overview
 
-- `train.ipynb`: main notebook for training, validation, inference, and plotting.
+- `train_vision.py`: occupancy and geometry vision pretraining.
+- `train_pose_only.py`: standalone pose-head pretraining.
+- `train_tot.py`: staged adaptation and joint fine-tuning.
+- `train_all_from_start.py`: joint training from scratch.
 - `analyze_dataset.ipynb`: dataset and camera-pose analysis/debugging.
 - `model.py`: pair model with patch embedding, Transformer backbone, vision head, and pose head.
 - `dataset.py`: dataset class for synthetic cylinder scenes with `labels.json` annotations.
@@ -96,7 +99,7 @@ Install dependencies:
 pip install -r working_requirements.txt
 ```
 
-Start Jupyter and open `train.ipynb`:
+Run a training script with its command-line options, or open the corresponding notebook for an interactive workflow:
 
 ```bash
 jupyter notebook
@@ -110,26 +113,14 @@ pip install notebook
 
 ## Training
 
-The recommended workflow is to run `train.ipynb` from top to bottom:
+The staged workflow is:
 
-1. Import dependencies and create `device`.
-2. Create `PairImageCylinderModel`.
-3. Create `train_loader`, `val_loader`, and `forest_loader`.
-4. Run the training cell.
-5. Run the plotting cells for loss curves and inference.
+1. Run `train_vision.py --stage occupancy`.
+2. Run `train_vision.py --stage geometry --init-checkpoint PATH` with the occupancy checkpoint.
+3. Run `train_pose_only.py` to train the pose head from matched GT cylinders.
+4. Run `train_tot.py --vision-checkpoint PATH --pose-checkpoint PATH` to adapt and jointly fine-tune.
 
-The notebook currently uses a configuration like:
-
-```python
-PairImageCylinderModel(
-    img_size=128,
-    patch_size=8,
-    embed_dim=384,
-    depth=6,
-    num_heads=6,
-    num_bins=128,
-)
-```
+Use `train_all_from_start.py` when training the full image-pair model jointly from scratch. The `run_vision_occupancy.slurm`, `run_vision_geometry.slurm`, and `run_train_all_from_start.slurm` files provide cluster launch examples.
 
 The main loss terms are:
 
@@ -149,7 +140,7 @@ plot_estimated_cylinders_on_images(images, visions, occ_threshold=0.6, flip_x=Tr
 
 It draws predicted cylinders as vertical overlay bands on top of the images. `flip_x=True` is used because the vision-bin direction is mirrored relative to the image x-coordinate.
 
-`train.ipynb` includes cells for:
+The training notebooks include cells for:
 
 - plotting ground-truth vs predicted `occupancy`, `radius`, and `depth`
 - plotting predicted cylinders on synthetic test images
@@ -164,12 +155,6 @@ Check that the Python files compile:
 venv/bin/python -m py_compile model.py dataset.py colmap_pair_dataset.py losses.py utils.py debugger.py
 ```
 
-Check that the notebook is valid JSON:
-
-```bash
-python3 -c "import json; json.load(open('train.ipynb')); print('notebook json ok')"
-```
-
 ## License
 
 This project is licensed under the MIT License. See `LICENSE` for details.
@@ -177,5 +162,4 @@ This project is licensed under the MIT License. See `LICENSE` for details.
 ## Notes
 
 - Data directories are not versioned according to `.gitignore`.
-- `train.ipynb` is the active experiment workflow and may contain executed cell outputs.
 - The forest data has no cylinder ground truth; it uses model predictions and geometric consistency between views.
