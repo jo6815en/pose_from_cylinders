@@ -1,7 +1,7 @@
 """Plot occupancy probabilities and ground truth for validation image pairs.
 
 Place beside dataset.py, augmentations.py, model.py, model.py and
-matched_pair_pose.py. Uses the checkpoint format written by train_vision.py.
+model.py. Uses the checkpoint format written by train_vision.py.
 """
 import argparse
 import os

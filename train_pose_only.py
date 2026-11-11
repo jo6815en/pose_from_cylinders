@@ -1,6 +1,6 @@
 """Pose-only pretraining on matched GT cylinders for the joint model.
 
-Place beside the existing matched_pair_pose.py, dataset.py and losses.py.
+Place beside the existing model.py, dataset.py and losses.py.
 Only MatchedPairPoseModel is constructed. No RGB images are opened.
 Tokens contain GT angles/radii/depths paired by GT cylinder ID.
 Training starts from scratch; --eval-only evaluates a saved pose checkpoint.
@@ -20,7 +20,7 @@ from torch.nn.utils.rnn import pad_sequence
 
 from dataset import SceneTwoPairsDataset
 from losses import relative_pose_loss_2d
-from matched_pair_pose import MatchedPairPoseModel, matched_tokens, has_distinct_centers
+from model import MatchedPairPoseModel, matched_tokens, has_distinct_centers
 
 
 class MatchedCylinderDataset(Dataset):
