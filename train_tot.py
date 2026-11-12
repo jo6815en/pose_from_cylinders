@@ -321,7 +321,6 @@ def main():
                         help="First N of --epochs: adapt pose while vision is frozen")
     parser.add_argument("--vision-checkpoint", required=True)
     parser.add_argument("--pose-checkpoint", required=True)
-    parser.add_argument("--save-every", type=int, default=10)
     parser.add_argument("--val-interval", type=int, default=10)
     parser.add_argument("--num-workers", type=int, default=8)
     parser.add_argument("--seed", type=int, default=0)
@@ -351,7 +350,7 @@ def main():
     if min(args.lr, args.adapt_lr, args.lambda_pose) <= 0:
         parser.error("Learning rates and --lambda-pose must be positive")
     args.pose_lr = args.lr if args.pose_lr is None else args.pose_lr
-    if args.pose_lr <= 0 or min(args.val_interval, args.save_every, args.batch_size) < 1:
+    if args.pose_lr <= 0 or min(args.val_interval, args.batch_size) < 1:
         parser.error("Pose learning rate, intervals and batch size must be positive")
     pose_saved = torch.load(args.pose_checkpoint, map_location="cpu", weights_only=False)
     if "model_config" not in pose_saved:
@@ -581,8 +580,6 @@ def main():
             torch.save(state, os.path.join(args.output_dir, "checkpoints", "best.pt"))
         if improved_adapt:
             torch.save(state, os.path.join(args.output_dir, "checkpoints", "best_adapt.pt"))
-        if epoch % args.save_every == 0 or epoch == args.adapt_epochs:
-            torch.save(state, os.path.join(args.output_dir, "checkpoints", f"epoch_{epoch:03d}.pt"))
         with open(os.path.join(args.output_dir, "history.json"), "w", encoding="utf-8") as f:
             json.dump(history, f, indent=2)
         print(log + f" | time={time.perf_counter() - epoch_start:.1f}s", flush=True)

@@ -165,7 +165,6 @@ def main():
     parser.add_argument('--lr', type=float, default=1e-4)
     parser.add_argument('--seed', type=int, default=0)
     parser.add_argument('--val-interval', type=int, default=5)
-    parser.add_argument('--save-every', type=int, default=10)
     parser.add_argument('--embed-dim', type=int, default=128)
     parser.add_argument('--num-heads', type=int, default=4)
     parser.add_argument('--depth', type=int, default=2)
@@ -180,7 +179,7 @@ def main():
     args = parser.parse_args()
     if args.checkpoint and not args.eval_only:
         parser.error('--checkpoint is for --eval-only; training starts from scratch')
-    if min(args.epochs, args.batch_size, args.val_interval, args.save_every) < 1:
+    if min(args.epochs, args.batch_size, args.val_interval) < 1:
         parser.error('Epochs, batch size and intervals must be positive')
     random.seed(args.seed)
     np.random.seed(args.seed)
@@ -261,8 +260,6 @@ def main():
         
         if improved:
             torch.save(state, ckpt_dir / 'best.pt')
-        if epoch % args.save_every == 0:
-            torch.save(state, ckpt_dir / f'epoch_{epoch:03d}.pt')
         with (output / 'history.json').open('w') as f:
             json.dump(history, f, indent=2)
         print(log + f' | time={time.perf_counter() - start:.1f}s', flush=True)

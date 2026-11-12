@@ -578,24 +578,6 @@ def main():
 
                 log += f" | BEST (val_tot={best_val_loss:.4f})"
 
-            if epoch in (10, 20):
-                torch.save(
-                    {
-                        "epoch": epoch,
-                        "model_state_dict": raw_model.state_dict(),
-                        "optimizer_state_dict": optimizer.state_dict(),
-                        "args": vars(args),
-                        "training_stage": "vision_" + args.stage,
-                        "history": history,
-                        "best_val_loss": best_val_loss,
-                    },
-                    os.path.join(
-                        args.output_dir,
-                        "checkpoints",
-                        f"epoch_{epoch:03d}.pt",
-                    ),
-                )
-
             if val_metrics["vision"] < best_val_vision:
                 best_val_vision = val_metrics["vision"]
                 torch.save(

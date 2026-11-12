@@ -11,8 +11,7 @@ valdataset/
 forestdataset/
 forest_torpa/
 logs/
-runs/
-arrhenius_runs/
+*runs/
 papers/
 *.pt
 *.png
