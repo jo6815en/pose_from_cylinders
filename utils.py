@@ -184,7 +184,7 @@ def plot_estimated_cylinders_on_images(
     titles=None,
     occ_threshold=0.4,
     fov_degrees=90.0,
-    flip_x=True,
+    flip_x=False,
     color="tab:orange",
     alpha=0.22,
     line_width=1.8,
@@ -199,7 +199,8 @@ def plot_estimated_cylinders_on_images(
     images: en bild (C,H,W) eller lista med bilder.
     visions: motsvarande vision tensor/array med shape (N,3) eller (N,4):
         [occupancy, radius, depth, optional_id].
-    flip_x: True när bin 0 ligger till höger i kamerabilden.
+    flip_x: True om bin-indexeringen är spegelvänd så att bin 0 ligger till höger.
+             Modellens standardindexering har bin 0 till vänster.
     """
     if not isinstance(images, (list, tuple)):
         images = [images]
