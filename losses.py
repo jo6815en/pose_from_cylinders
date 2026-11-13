@@ -607,7 +607,7 @@ def patch_correspondence_loss(
     occ_thresh=0.5,
     fov_degrees=90.0,
     temperature=0.1,
-    flip_x=True,
+    flip_x=False,
     **kwargs,
 ):
     B, N, D = corr_a.shape
