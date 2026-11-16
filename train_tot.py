@@ -177,6 +177,7 @@ def validate(
     lambda_pose,
     lambda_width,
     pose_only=False,
+    matching_mode="predicted",
 ):
     model.eval()
 
@@ -196,6 +197,8 @@ def validate(
         "rotation": 0.0,
         "cylinder_radius_rel_l2": 0.0,
         "cylinder_position_rel_l2": 0.0,
+        "pose_valid_samples": 0.0,
+        "pose_samples": 0.0,
     }
 
     num_batches = 0
@@ -211,7 +214,8 @@ def validate(
 
         pred_vision_a, pred_vision_b, pred_pose, corr_a, corr_b, pose_info = model(
                 img_a, img_b, return_corr=True, compute_pose=(lambda_pose != 0),
-                target_vision_a=vision_a, target_vision_b=vision_b, return_pose_inputs=True, occ_thresh=occ_thresh)
+                target_vision_a=vision_a, target_vision_b=vision_b, return_pose_inputs=True, occ_thresh=occ_thresh,
+                matching_mode=matching_mode)
 
         vis_a, occ_a, rad_a, dep_a, width_a = vision_loss(pred_vision_a, vision_a, occ_thresh=occ_thresh, lambda_occ=lambda_occ,
             lambda_radius=lambda_radius, lambda_depth=1.0, lambda_width=lambda_width)
@@ -270,6 +274,8 @@ def validate(
         totals["depth_structure"] += depth_structure_loss.item()
         totals["depth_delta"] += depth_delta_loss.item()
         totals["pose"] += pose_total.item()
+        totals["pose_valid_samples"] += pose_info["pose_valid"].sum().item()
+        totals["pose_samples"] += pose_ab.shape[0]
         totals["translation"] += t_loss.item()
         totals["rotation"] += r_loss.item()
         totals["cylinder_radius_rel_l2"] += (
@@ -288,17 +294,19 @@ def validate(
         for key, value in totals.items()
     }
 
+    metrics["pose_valid_fraction"] = totals["pose_valid_samples"] / max(totals["pose_samples"], 1.0)
     return metrics
 
 
-def set_training_stage(model, optimizer, pose_only, args):
-    """Freeze vision weights for adaptation; unfreeze all for joint fine-tuning."""
+def set_training_stage(model, optimizer, pose_only, args, freeze_vision=False):
+    """Freeze vision during pose adaptation and final pose refinement."""
+    frozen = pose_only or freeze_vision
     for module in (model.backbone, model.vision_head, model.corr_decoder):
-        module.requires_grad_(not pose_only)
+        module.requires_grad_(not frozen)
     model.pose_head.requires_grad_(True)
     for group in optimizer.param_groups:
         if group["name"] == "vision":
-            group["lr"] = 0.0 if pose_only else args.lr
+            group["lr"] = 0.0 if frozen else args.lr
         elif group["name"] == "pose":
             group["lr"] = args.adapt_lr if pose_only else args.pose_lr
 
@@ -310,8 +318,15 @@ def main():
         "--data-dir",
         default="/nobackup/proj/disk/midlevel_representations/personal/johanna/data",
     )
-    parser.add_argument("--epochs", type=int, default=100)
-    parser.add_argument("--batch-size", type=int, default=16)
+    parser.add_argument("--epochs", type=int, default=200)
+    parser.add_argument("--freeze-vision-epoch", type=int, default=50,
+                        help="Train vision through this epoch, then freeze it for pose refinement")
+    parser.add_argument("--pred-match-ramp-epochs", type=int, default=None,
+                        help="Epochs to ramp from GT to predicted matching; defaults to freeze epoch minus adaptation epochs")
+    parser.add_argument("--pred-match-max-prob", type=float, default=1.0)
+    parser.add_argument("--resume-training", action="store_true")
+    parser.add_argument("--resume-checkpoint", default=None)
+    parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--lr", type=float, default=1e-5,
                         help="Vision learning rate during joint fine-tuning")
     parser.add_argument("--pose-lr", type=float, default=None,
@@ -322,7 +337,7 @@ def main():
     parser.add_argument("--vision-checkpoint", required=True)
     parser.add_argument("--pose-checkpoint", required=True)
     parser.add_argument("--val-interval", type=int, default=10)
-    parser.add_argument("--num-workers", type=int, default=8)
+    parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--seed", type=int, default=0)
 
     parser.add_argument("--img-size", type=int, default=128)
@@ -342,11 +357,15 @@ def main():
     parser.add_argument("--lambda-depth-delta", type=float, default=0.35)
     parser.add_argument("--lambda-pose", type=float, default=2.0)
 
-    parser.add_argument("--output-dir", default="runs/total_finetune")
+    parser.add_argument("--output-dir", default="runs/total_finetune_new_corr")
 
     args = parser.parse_args()
-    if not 0 <= args.adapt_epochs < args.epochs:
-        parser.error("Require 0 <= --adapt-epochs < --epochs (total epoch count)")
+    if not 0 <= args.adapt_epochs < args.freeze_vision_epoch < args.epochs:
+        parser.error("Require 0 <= --adapt-epochs < --freeze-vision-epoch < --epochs")
+    args.pred_match_ramp_epochs = (args.freeze_vision_epoch - args.adapt_epochs
+                                   if args.pred_match_ramp_epochs is None else args.pred_match_ramp_epochs)
+    if args.pred_match_ramp_epochs < 1 or not 0 <= args.pred_match_max_prob <= 1:
+        parser.error("Match ramp must be positive and maximum match probability must be in [0, 1]")
     if min(args.lr, args.adapt_lr, args.lambda_pose) <= 0:
         parser.error("Learning rates and --lambda-pose must be positive")
     args.pose_lr = args.lr if args.pose_lr is None else args.pose_lr
@@ -477,112 +496,347 @@ def main():
     )
     scaler = torch.amp.GradScaler("cuda", enabled=(device.type == "cuda"))
 
-    metric_names = (
-        "vision_occupancy", "vision_radius", "vision_depth", "vision_width",
+    best_pose_path = os.path.join(args.output_dir, "checkpoints", "best_pose.pt")
+    resume_checkpoint = None
+    START_EPOCH = 0
+    if args.resume_training:
+        resume_path = args.resume_checkpoint or os.path.join(args.output_dir, "checkpoints", "latest.pt")
+        if not os.path.exists(resume_path):
+            raise FileNotFoundError(f"Resume checkpoint not found: {resume_path}")
+        resume_checkpoint = torch.load(resume_path, map_location=device, weights_only=False)
+        for key in ("model_state_dict", "optimizer_state_dict", "epoch", "history"):
+            if key not in resume_checkpoint:
+                raise ValueError(f"Checkpoint is missing required resume field: {key}")
+        raw_model.load_state_dict(resume_checkpoint["model_state_dict"], strict=True)
+        optimizer.load_state_dict(resume_checkpoint["optimizer_state_dict"])
+        if "scaler_state_dict" in resume_checkpoint:
+            scaler.load_state_dict(resume_checkpoint["scaler_state_dict"])
+        START_EPOCH = int(resume_checkpoint["epoch"])
+        rng_state = resume_checkpoint.get("rng_state")
+        if rng_state is not None:
+            random.setstate(rng_state["python"])
+            np.random.set_state(rng_state["numpy"])
+            torch.set_rng_state(rng_state["torch"].cpu())
+            if device.type == "cuda" and rng_state.get("cuda") is not None:
+                torch.cuda.set_rng_state_all([state.cpu() for state in rng_state["cuda"]])
+        if START_EPOCH >= args.epochs:
+            raise ValueError(f"Checkpoint is already at epoch {START_EPOCH}; --epochs is {args.epochs}.")
+        print(f"Resuming from epoch {START_EPOCH}; next epoch is {START_EPOCH + 1}.")
+    else:
+        print("Starting from the supplied vision and GT-pose checkpoints.")
+
+    metric_names = ("vision_occupancy", "vision_radius", "vision_depth", "vision_width")
+    history = {
+        key: []
+        for key in (
+            "epoch",
+            "stage",
+            "vision_lr",
+            "pose_lr",
+            "pred_match_probability",
+            "train_pred_match_batch_fraction",
+            "objective",
+            "loss",
+            "vision_loss",
+            "correspondence_loss",
+            "depth_structure_loss",
+            "depth_delta_loss",
+            "pose_loss",
+            "translation_loss",
+            "rotation_loss",
+            "val_epoch",
+            "val_stage",
+            "val_objective",
+            "val_total",
+            "val_vision",
+            "val_correspondence",
+            "val_depth_structure",
+            "val_depth_delta",
+            "val_pose",
+            "val_gt_pose",
+            "val_pred_pose",
+            "val_gt_pose_valid_fraction",
+            "val_pred_pose_valid_fraction",
+            "val_translation",
+            "val_rotation",
+        )
+    }
+    weights = dict(
+        vision_occupancy=args.lambda_occ, vision_radius=args.lambda_radius, vision_depth=1.0, vision_width=args.lambda_width
     )
-    history = {key: [] for key in (
-        "epoch", "stage", "vision_lr", "pose_lr", "objective", "loss", "vision_loss",
-        "correspondence_loss", "depth_structure_loss", "depth_delta_loss",
-        "pose_loss", "translation_loss", "rotation_loss",
-        "val_epoch", "val_stage", "val_objective", "val_total", "val_vision",
-        "val_correspondence", "val_depth_structure", "val_depth_delta",
-        "val_pose", "val_translation", "val_rotation",
-    )}
-    weights = dict(vision_occupancy=args.lambda_occ, vision_radius=args.lambda_radius,
-                   vision_depth=1.0, vision_width=args.lambda_width)
     for component in metric_names:
         for prefix in ("", "val_"):
             history[prefix + component] = []
             history[prefix + component + "_weighted"] = []
-    best_val_loss = float("inf")  # Joint stage only.
+    best_val_loss = float("inf")
     best_adapt_pose = float("inf")
+    best_pose_loss = float("inf")
+    if resume_checkpoint is not None:
+        history = resume_checkpoint["history"]
+        required_history = (
+            "epoch", "pred_match_probability", "train_pred_match_batch_fraction",
+            "val_epoch", "val_gt_pose", "val_pred_pose",
+            "val_gt_pose_valid_fraction", "val_pred_pose_valid_fraction",
+        )
+        missing_history = [key for key in required_history if key not in history]
+        if missing_history:
+            raise ValueError(
+                "Resume checkpoint is incompatible with this notebook version; missing history keys: "
+                + ", ".join(missing_history)
+            )
+        best_val_loss = resume_checkpoint.get("best_val_loss", float("inf"))
+        best_adapt_pose = resume_checkpoint.get("best_adapt_pose", float("inf"))
+        best_pose_loss = resume_checkpoint.get(
+            "best_pose_loss", min(history["val_pred_pose"], default=float("inf"))
+        )
+        print(f"Restored history through epoch {START_EPOCH}.")
     previous_stage = None
-    for epoch in range(1, args.epochs + 1):
+    for epoch in range(START_EPOCH + 1, args.epochs + 1):
         epoch_start = time.perf_counter()
         pose_only = epoch <= args.adapt_epochs
-        stage = "pose_adapt" if pose_only else "joint"
-        set_training_stage(model, optimizer, pose_only, args)
-        if stage != previous_stage:
-            print(f"\nStage: {stage}; vision lr={optimizer.param_groups[0]['lr']:g}; "
-                  f"pose lr={optimizer.param_groups[1]['lr']:g}", flush=True)
-            previous_stage = stage
-        train_metrics = train_one_epoch(
-            model, train_loader, optimizer, device, args.occ_thresh,
-            args.lambda_occ, args.lambda_radius, args.lambda_corr,
-            args.lambda_depth_delta, args.lambda_pose, args.lambda_width,
-            scaler, pose_only=pose_only,
+        freeze_vision = epoch > args.freeze_vision_epoch
+        stage = "pose_adapt" if pose_only else ("pose_refine" if freeze_vision else "joint")
+        pose_objective_only = pose_only or freeze_vision
+        joint_epochs_elapsed = max(0, epoch - args.adapt_epochs)
+        ramp_fraction = min(joint_epochs_elapsed / max(args.pred_match_ramp_epochs, 1), 1.0)
+        pred_match_probability = (
+            0.0 if pose_only else (1.0 if freeze_vision else args.pred_match_max_prob * ramp_fraction)
         )
+        set_training_stage(model, optimizer, pose_only, args, freeze_vision=freeze_vision)
+        if stage != previous_stage:
+            print(
+                f"\nStage: {stage}; vision lr={optimizer.param_groups[0]['lr']:g}; "
+                f"pose lr={optimizer.param_groups[1]['lr']:g}",
+                flush=True,
+            )
+            previous_stage = stage
+        model.train()
+        if pose_objective_only:
+            model.backbone.eval()
+            model.vision_head.eval()
+            model.corr_decoder.eval()
+        pred_match_batches = 0
+        train_totals = {
+            "total": 0.0,
+            "vision": 0.0,
+            "vision_occupancy": 0.0,
+            "vision_radius": 0.0,
+            "vision_depth": 0.0,
+            "vision_width": 0.0,
+            "objective": 0.0,
+            "correspondence": 0.0,
+            "depth_structure": 0.0,
+            "depth_delta": 0.0,
+            "pose": 0.0,
+            "translation": 0.0,
+            "rotation": 0.0,
+        }
+        for batch in train_loader:
+            matching_mode = "predicted" if random.random() < pred_match_probability else "gt"
+            pred_match_batches += int(matching_mode == "predicted")
+            img_a, vision_a, img_b, vision_b, pose_ab = move_batch_to_device(batch, device)
+            optimizer.zero_grad(set_to_none=True)
+            with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=device.type == "cuda"):
+                pred_vision_a, pred_vision_b, pred_pose, corr_a, corr_b, pose_info = model(
+                    img_a,
+                    img_b,
+                    return_corr=True,
+                    compute_pose=args.lambda_pose != 0,
+                    target_vision_a=vision_a,
+                    target_vision_b=vision_b,
+                    return_pose_inputs=True,
+                    occ_thresh=args.occ_thresh,
+                    matching_mode=matching_mode,
+                )
+                vis_a, occ_a, rad_a, dep_a, width_a = vision_loss(
+                    pred_vision_a,
+                    vision_a,
+                    occ_thresh=args.occ_thresh,
+                    lambda_occ=args.lambda_occ,
+                    lambda_radius=args.lambda_radius,
+                    lambda_depth=1.0,
+                    lambda_width=args.lambda_width,
+                )
+                vis_b, occ_b, rad_b, dep_b, width_b = vision_loss(
+                    pred_vision_b,
+                    vision_b,
+                    occ_thresh=args.occ_thresh,
+                    lambda_occ=args.lambda_occ,
+                    lambda_radius=args.lambda_radius,
+                    lambda_depth=1.0,
+                    lambda_width=args.lambda_width,
+                )
+                vision_loss_total = 0.5 * (vis_a + vis_b)
+                corr_loss = patch_correspondence_loss(corr_a, vision_a, corr_b, vision_b)
+                depth_structure_loss = 0.5 * (
+                    relative_depth_structure_loss(pred_vision_a, vision_a, args.occ_thresh)
+                    + relative_depth_structure_loss(pred_vision_b, vision_b, args.occ_thresh)
+                )
+                depth_delta_loss = matched_depth_delta_loss(
+                    pred_vision_a, vision_a, pred_vision_b, vision_b, args.occ_thresh
+                )
+                if args.lambda_pose != 0:
+                    pose_total, t_loss, r_loss = masked_relative_pose_loss_2d(
+                        pred_pose, pose_ab, pose_info["pose_valid"], t_weight=1.0, r_weight=1.0
+                    )
+                else:
+                    pose_total = vision_loss_total.new_zeros(())
+                    t_loss = vision_loss_total.new_zeros(())
+                    r_loss = vision_loss_total.new_zeros(())
+                loss = (
+                    vision_loss_total
+                    + args.lambda_corr * corr_loss
+                    + 0.5 * depth_structure_loss
+                    + args.lambda_depth_delta * depth_delta_loss
+                    + args.lambda_pose * pose_total
+                )
+            objective = args.lambda_pose * pose_total if pose_objective_only else loss
+            valid_pose = pose_info["pose_valid"] & (pose_ab[:, :2].norm(dim=-1) > 1e-06)
+            
+            if not pose_objective_only or valid_pose.any():
+                scaler.scale(objective).backward()
+                scaler.step(optimizer)
+                scaler.update()
+            
+            train_totals["objective"] += objective.item()
+            train_totals["total"] += loss.item()
+            train_totals["vision"] += vision_loss_total.item()
+            train_totals["vision_occupancy"] += (0.5 * (occ_a + occ_b)).item()
+            train_totals["vision_radius"] += (0.5 * (rad_a + rad_b)).item()
+            train_totals["vision_depth"] += (0.5 * (dep_a + dep_b)).item()
+            train_totals["vision_width"] += (0.5 * (width_a + width_b)).item()
+            train_totals["correspondence"] += corr_loss.item()
+            train_totals["depth_structure"] += depth_structure_loss.item()
+            train_totals["depth_delta"] += depth_delta_loss.item()
+            train_totals["pose"] += pose_total.item()
+            train_totals["translation"] += t_loss.item()
+            train_totals["rotation"] += r_loss.item()
+        
+        train_metrics = {key: value / len(train_loader) for key, value in train_totals.items()}
+        
         history["epoch"].append(epoch)
         history["stage"].append(stage)
         history["vision_lr"].append(optimizer.param_groups[0]["lr"])
         history["pose_lr"].append(optimizer.param_groups[1]["lr"])
+        history["pred_match_probability"].append(pred_match_probability)
+        history["train_pred_match_batch_fraction"].append(pred_match_batches / max(len(train_loader), 1))
         train_mapping = {
-            "objective": "objective", "loss": "total", "vision_loss": "vision",
-            "correspondence_loss": "correspondence", "depth_structure_loss": "depth_structure",
-            "depth_delta_loss": "depth_delta", "pose_loss": "pose",
-            "translation_loss": "translation", "rotation_loss": "rotation",
+            "objective": "objective",
+            "loss": "total",
+            "vision_loss": "vision",
+            "correspondence_loss": "correspondence",
+            "depth_structure_loss": "depth_structure",
+            "depth_delta_loss": "depth_delta",
+            "pose_loss": "pose",
+            "translation_loss": "translation",
+            "rotation_loss": "rotation",
         }
         for key, metric in train_mapping.items():
             history[key].append(train_metrics[metric])
         for component, weight in weights.items():
             history[component].append(train_metrics[component])
             history[component + "_weighted"].append(weight * train_metrics[component])
+        
         log = (
-            f"Epoch {epoch} [{stage}]: obj={train_metrics['objective']:.4f} | "
-            f"tot={train_metrics['total']:.4f} | vis={train_metrics['vision']:.4f} | "
-            f"occ={train_metrics['vision_occupancy']:.4f} | rad={train_metrics['vision_radius']:.4f} | "
-            f"depth={train_metrics['vision_depth']:.4f} | width={train_metrics['vision_width']:.4f} | "
-            f"corr={train_metrics['correspondence']:.4f} | struct={train_metrics['depth_structure']:.4f} | "
-            f"delta={train_metrics['depth_delta']:.4f} | pose={train_metrics['pose']:.4f}"
+            f"Epoch {epoch} [{stage}]: obj={train_metrics['objective']:.4f} "
+            f"| tot={train_metrics['total']:.4f} | vis={train_metrics['vision']:.4f} "
+            f"| occ={train_metrics['vision_occupancy']:.4f} | rad={train_metrics['vision_radius']:.4f} "
+            f"| depth={train_metrics['vision_depth']:.4f} | width={train_metrics['vision_width']:.4f} "
+            f"| corr={train_metrics['correspondence']:.4f} | struct={train_metrics['depth_structure']:.4f} "
+            f"| delta={train_metrics['depth_delta']:.4f} | pose={train_metrics['pose']:.4f} "
+            f"| pred-match p={pred_match_probability:.2f} (actual {pred_match_batches / max(len(train_loader), 1):.2f})"
         )
-        improved = improved_adapt = False
-        should_validate = (epoch == 1 or epoch % args.val_interval == 0
-                           or epoch in (args.adapt_epochs, args.adapt_epochs + 1, args.epochs))
+        
+        improved = improved_adapt = improved_pose = False
+        should_validate = (
+            epoch == 1 or epoch % args.val_interval == 0 or epoch in (args.adapt_epochs, args.adapt_epochs + 1, args.freeze_vision_epoch, args.freeze_vision_epoch + 1, args.epochs)
+        )
         if should_validate:
-            val_metrics = validate(
+            val_gt_metrics = validate(
                 model, val_loader, device, args.occ_thresh, args.lambda_occ,
                 args.lambda_radius, args.lambda_corr, args.lambda_depth_delta,
-                args.lambda_pose, args.lambda_width, pose_only=pose_only,
+                args.lambda_pose, args.lambda_width, pose_only=pose_objective_only, matching_mode="gt",
             )
+            val_pred_metrics = validate(
+                model, val_loader, device, args.occ_thresh, args.lambda_occ,
+                args.lambda_radius, args.lambda_corr, args.lambda_depth_delta,
+                args.lambda_pose, args.lambda_width, pose_only=pose_objective_only, matching_mode="predicted",
+            )
+            # The primary val_* series and best_pose checkpoint track predicted matching.
+            val_metrics = val_pred_metrics
             history["val_epoch"].append(epoch)
             history["val_stage"].append(stage)
+            history["val_gt_pose"].append(val_gt_metrics["pose"])
+            history["val_pred_pose"].append(val_pred_metrics["pose"])
+            history["val_gt_pose_valid_fraction"].append(val_gt_metrics["pose_valid_fraction"])
+            history["val_pred_pose_valid_fraction"].append(val_pred_metrics["pose_valid_fraction"])
             for key, metric in {
-                "val_objective": "objective", "val_total": "total", "val_vision": "vision",
-                "val_correspondence": "correspondence", "val_depth_structure": "depth_structure",
-                "val_depth_delta": "depth_delta", "val_pose": "pose",
-                "val_translation": "translation", "val_rotation": "rotation",
+                "val_objective": "objective",
+                "val_total": "total",
+                "val_vision": "vision",
+                "val_correspondence": "correspondence",
+                "val_depth_structure": "depth_structure",
+                "val_depth_delta": "depth_delta",
+                "val_pose": "pose",
+                "val_translation": "translation",
+                "val_rotation": "rotation",
             }.items():
                 history[key].append(val_metrics[metric])
             for component, weight in weights.items():
                 history["val_" + component].append(val_metrics[component])
                 history["val_" + component + "_weighted"].append(weight * val_metrics[component])
-            log += (f" | val_tot={val_metrics['total']:.4f} | val_vis={val_metrics['vision']:.4f}"
-                    f" | val_occ={val_metrics['vision_occupancy']:.4f} | val_rad={val_metrics['vision_radius']:.4f}"
-                    f" | val_depth={val_metrics['vision_depth']:.4f} | val_width={val_metrics['vision_width']:.4f}"
-                    f" | val_pose={val_metrics['pose']:.4f}")
+            log += (
+                f" | val_tot={val_metrics['total']:.4f} | val_vis={val_metrics['vision']:.4f} "
+                f"| val_occ={val_metrics['vision_occupancy']:.4f} | val_rad={val_metrics['vision_radius']:.4f} "
+                f"| val_depth={val_metrics['vision_depth']:.4f} | val_width={val_metrics['vision_width']:.4f} "
+                f"| val_pose_GTmatch={val_gt_metrics['pose']:.4f} "
+                f"(valid {val_gt_metrics['pose_valid_fraction']:.2f}) "
+                f"| val_pose_Predmatch={val_pred_metrics['pose']:.4f} "
+                f"(valid {val_pred_metrics['pose_valid_fraction']:.2f})"
+            )
+            improved_pose = val_metrics["pose"] < best_pose_loss
+            best_pose_loss = min(best_pose_loss, val_metrics["pose"])
             if pose_only:
                 improved_adapt = val_metrics["pose"] < best_adapt_pose
                 best_adapt_pose = min(best_adapt_pose, val_metrics["pose"])
-            else:
+            elif stage == "joint":
                 improved = val_metrics["total"] < best_val_loss
                 best_val_loss = min(best_val_loss, val_metrics["total"])
+            if improved_pose:
+                log += " | BEST POSE"
             if improved or improved_adapt:
                 log += " | BEST ADAPT" if pose_only else " | BEST JOINT"
         state = {
-            "epoch": epoch, "training_stage": stage,
+            "epoch": epoch,
+            "training_stage": stage,
             "model_state_dict": raw_model.state_dict(),
-            "optimizer_state_dict": optimizer.state_dict(), "scaler_state_dict": scaler.state_dict(),
-            "args": vars(args), "history": history,
-            "best_val_loss": best_val_loss, "best_adapt_pose": best_adapt_pose,
+            "optimizer_state_dict": optimizer.state_dict(),
+            "scaler_state_dict": scaler.state_dict(),
+            "args": vars(args),
+            "history": history,
+            "best_val_loss": best_val_loss,
+            "best_adapt_pose": best_adapt_pose,
+            "best_pose_loss": best_pose_loss,
+            "rng_state": {
+                "python": random.getstate(),
+                "numpy": np.random.get_state(),
+                "torch": torch.get_rng_state(),
+                "cuda": torch.cuda.get_rng_state_all() if device.type == "cuda" else None,
+            },
         }
         torch.save(state, os.path.join(args.output_dir, "checkpoints", "latest.pt"))
         if improved:
             torch.save(state, os.path.join(args.output_dir, "checkpoints", "best.pt"))
         if improved_adapt:
             torch.save(state, os.path.join(args.output_dir, "checkpoints", "best_adapt.pt"))
+        if improved_pose:
+            torch.save(state, best_pose_path)
         with open(os.path.join(args.output_dir, "history.json"), "w", encoding="utf-8") as f:
             json.dump(history, f, indent=2)
         print(log + f" | time={time.perf_counter() - epoch_start:.1f}s", flush=True)
+
+    # Keep final weights available to the notebook's inference cells.
+    latest_model_state_dict = {key: value.detach().cpu().clone() for key, value in raw_model.state_dict().items()}
 
 
 if __name__ == "__main__":

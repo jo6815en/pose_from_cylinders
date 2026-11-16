@@ -374,6 +374,8 @@ def evaluate_pose(
     gt_occ_threshold=0.5,
     matching_mode="predicted",
     pred_occ_threshold=0.2,
+    debug=False,
+    max_debug_examples=20,
 ):
     """
     matching_mode:
@@ -407,6 +409,10 @@ def evaluate_pose(
     total = 0
     failures = 0
     excluded_gt_pairs = 0
+    debug_match_counts = []
+    debug_failure_reasons = {"too_few_matches": 0, "nonfinite_pose": 0,
+                             "near_zero_translation": 0, "near_zero_yaw": 0}
+    debug_examples = []
 
     for batch in loader:
         img_a, vision_a, img_b, vision_b, pose_gt = [
@@ -414,6 +420,7 @@ def evaluate_pose(
             for x in batch
         ]
         pose_gt = pose_gt.float()
+        pair_indices = torch.arange(len(pose_gt), device=device) + seen_pairs
         seen_pairs += len(pose_gt)
 
         # Endast GT-kameraposen avgör om felet går att beräkna.
@@ -434,6 +441,8 @@ def evaluate_pose(
         vision_a = vision_a[eligible]
         vision_b = vision_b[eligible]
         pose_gt = pose_gt[eligible]
+        eligible_pair_indices = pair_indices[eligible]
+        eligible_vision_a, eligible_vision_b = vision_a, vision_b
 
         if matching_mode == "gt":
             # Explicit GT-läge behövs eftersom auto använder
@@ -448,6 +457,7 @@ def evaluate_pose(
                 return_pose_inputs=True,
             )
             pose_valid = pose_info["pose_valid"]
+            num_matches = pose_info["num_matches"]
 
         elif matching_mode == "predicted":
             # Ingen GT-cylinderdata skickas till modellen.
@@ -459,6 +469,7 @@ def evaluate_pose(
                 return_pose_inputs=True,
             )
             pose_valid = pose_info["pose_valid"]
+            num_matches = pose_info["num_matches"]
 
         else:
             # GT-bin, men modellen får själv skatta kopplingarna.
@@ -498,6 +509,7 @@ def evaluate_pose(
                 base_model.fov_degrees,
             )
             pose_valid = pair_mask.sum(dim=1) >= 2
+            num_matches = pair_mask.sum(dim=1)
 
             safe_mask = pair_mask.clone()
             safe_mask[~safe_mask.any(dim=1), 0] = True
@@ -520,6 +532,44 @@ def evaluate_pose(
             & (pose_pred[:, :2].norm(dim=-1) >= 1e-8)
             & (pose_pred[:, 2:].norm(dim=-1) >= 1e-8)
         )
+
+        if debug:
+            counts = num_matches.detach().cpu().tolist()
+            debug_match_counts.extend(counts)
+            finite = torch.isfinite(pose_pred).all(dim=-1)
+            nonzero_t = pose_pred[:, :2].norm(dim=-1) >= 1e-8
+            nonzero_yaw = pose_pred[:, 2:].norm(dim=-1) >= 1e-8
+            for j in range(len(pose_gt)):
+                reasons = []
+                if num_matches[j] < 2:
+                    reasons.append("too_few_matches")
+                if not finite[j]:
+                    reasons.append("nonfinite_pose")
+                if finite[j] and not nonzero_t[j]:
+                    reasons.append("near_zero_translation")
+                if finite[j] and not nonzero_yaw[j]:
+                    reasons.append("near_zero_yaw")
+                if reasons:
+                    for reason in reasons:
+                        debug_failure_reasons[reason] += 1
+                    if len(debug_examples) < max_debug_examples:
+                        ids = []
+                        if matching_mode == "gt":
+                            va = eligible_vision_a[j]
+                            vb = eligible_vision_b[j]
+                            ids_a = va[va[:, 0] > gt_occ_threshold, 3].round().long()
+                            ids_b = vb[vb[:, 0] > gt_occ_threshold, 3].round().long()
+                            common = []
+                            for cid in ids_a.unique():
+                                if (ids_a == cid).sum() == 1 and (ids_b == cid).sum() == 1:
+                                    common.append(int(cid.item()))
+                            ids = common
+                        debug_examples.append({
+                            "pair_index": int(eligible_pair_indices[j].item()),
+                            "num_matches": int(num_matches[j].item()),
+                            "matched_gt_ids": ids,
+                            "reasons": reasons,
+                        })
 
         # För få matchningar är ett prediktionsfel,
         # inte ett ogiltigt GT-par.
@@ -566,6 +616,12 @@ def evaluate_pose(
         "matching_mode": matching_mode,
         "success_rate": len(t) / total if total else float("nan"),
     }
+    if debug:
+        metrics["debug_match_count_histogram"] = {
+            int(k): int(v) for k, v in zip(*np.unique(debug_match_counts, return_counts=True))
+        }
+        metrics["debug_failure_reasons"] = debug_failure_reasons
+        metrics["debug_failure_examples"] = debug_examples
 
     for name, values in (("translation", t), ("yaw", yaw)):
         metrics[name + "_mean"] = stat(values, np.mean)
@@ -583,6 +639,16 @@ def evaluate_pose(
     print(f"Prediction failures:    {failures}")
     print(f"Success rate:           {metrics['success_rate']:.3f}")
     print(f"Excluded GT pairs:      {excluded_gt_pairs}")
+
+    if debug:
+        print("\nDEBUG: matched pairs per eligible sample")
+        print("-" * 40)
+        print(metrics["debug_match_count_histogram"])
+        print("Failure reason counts (a sample may have multiple reasons):")
+        print(debug_failure_reasons)
+        print(f"First {len(debug_examples)} failure examples:")
+        for example in debug_examples:
+            print(example)
 
     for title, name in (
         ("TRANSLATION DIRECTION ERROR", "translation"),
