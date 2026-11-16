@@ -732,12 +732,21 @@ def evaluate_pose_forest(model, loader, device, predict_pose=None):
 
         rotation = target_T[:, :3, :3]
 
-        # Samma omvandling som relative_pose_loss_forest:
-        # translation = [framåt (Z), höger (X)].
+        # T_a_to_b maps points from camera A coordinates to camera B:
+        # p_b = R_ab @ p_a + t_ab. Its translation column is not the
+        # displacement of camera B relative to A. That displacement, in
+        # camera A coordinates, is -R_ab.T @ t_ab.
+        camera_b_in_a = -torch.matmul(
+            rotation.transpose(1, 2), target_T[:, :3, 3].unsqueeze(-1)
+        ).squeeze(-1)
+
+        # Training uses [forward, left] in its cam1-normalized XY frame.
+        # COLMAP camera X points right, so convert camera-A X to model-left
+        # with a sign change. Camera Z points forward.
         pose_gt = torch.stack(
             [
-                target_T[:, 2, 3],
-                target_T[:, 0, 3],
+                camera_b_in_a[:, 2],
+                -camera_b_in_a[:, 0],
                 0.5 * (rotation[:, 0, 2] - rotation[:, 2, 0]),
                 0.5 * (rotation[:, 0, 0] + rotation[:, 2, 2]),
             ],
