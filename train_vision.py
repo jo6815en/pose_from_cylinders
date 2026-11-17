@@ -47,6 +47,7 @@ def train_one_epoch(
     lambda_radius,
     lambda_depth,
     lambda_corr,
+    temperature,
     lambda_depth_struct,
     lambda_depth_delta,
     lambda_width,
@@ -109,7 +110,7 @@ def train_one_epoch(
 
                 vision_loss_total = 0.5 * ( vis_a + vis_b)
 
-                corr_loss = patch_correspondence_loss(corr_a, vision_a, corr_b, vision_b)
+                corr_loss = patch_correspondence_loss(corr_a, vision_a, corr_b, vision_b, temperature=temperature)
 
                 depth_structure_loss = 0.5 * (relative_depth_structure_loss(pred_vision_a, vision_a,  occ_thresh)
                     + relative_depth_structure_loss(pred_vision_b, vision_b, occ_thresh))
@@ -153,6 +154,7 @@ def validate(
     lambda_radius,
     lambda_depth,
     lambda_corr,
+    temperature,
     lambda_depth_struct,
     lambda_depth_delta,
     lambda_width,
@@ -207,7 +209,7 @@ def validate(
                 lambda_radius=lambda_radius, lambda_depth=lambda_depth, lambda_width=lambda_width)
             vision_loss_total = 0.5 * (vis_a + vis_b)
 
-            corr_loss = patch_correspondence_loss(corr_a, vision_a, corr_b, vision_b)
+            corr_loss = patch_correspondence_loss(corr_a, vision_a, corr_b, vision_b, temperature=temperature)
 
             depth_structure_loss = 0.5 * (
                 relative_depth_structure_loss(pred_vision_a, vision_a, occ_thresh)
@@ -288,6 +290,7 @@ def main():
     parser.add_argument("--lambda-depth", type=float, default=1.0)
     parser.add_argument("--lambda-width", type=float, default=0.1)
     parser.add_argument("--lambda-corr", type=float, default=1.0)
+    parser.add_argument("--temperature", type=float, default=0.1)
     parser.add_argument("--lambda-depth-delta", type=float, default=0.35)
     parser.add_argument("--lambda-depth-struct", type=float, default=0.5)
 
@@ -472,6 +475,7 @@ def main():
             args.lambda_radius,
             args.lambda_depth,
             args.lambda_corr,
+            args.temperature,
             args.lambda_depth_struct,
             args.lambda_depth_delta,
             args.lambda_width,
@@ -520,6 +524,7 @@ def main():
                 args.lambda_radius,
                 args.lambda_depth,
                 args.lambda_corr,
+                args.temperature,
                 args.lambda_depth_struct,
                 args.lambda_depth_delta,
                 args.lambda_width,
