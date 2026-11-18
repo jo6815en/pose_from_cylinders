@@ -4,11 +4,8 @@ __pycache__/
 venv/
 .venv/
 data/
-dataset/
+*dataset/
 slask_data/
-testdataset/
-valdataset/
-forestdataset/
 forest_torpa/
 logs/
 *runs/
