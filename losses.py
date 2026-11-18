@@ -34,11 +34,20 @@ def match_sinkhorn_between_views(
         y = depth * torch.sin(theta).view(1, N)
         return torch.stack([x, y], dim=-1)
 
-    def sinkhorn(log_alpha, n_iters):
+    def sinkhorn(log_alpha, log_mu, log_nu, n_iters):
+        """Normalize scores to the requested row and column marginals."""
+        u = torch.zeros_like(log_mu)
+        v = torch.zeros_like(log_nu)
+
         for _ in range(n_iters):
-            log_alpha = log_alpha - torch.logsumexp(log_alpha, dim=1, keepdim=True)
-            log_alpha = log_alpha - torch.logsumexp(log_alpha, dim=0, keepdim=True)
-        return log_alpha.exp()
+            u = log_mu - torch.logsumexp(
+                log_alpha + v.unsqueeze(0), dim=1
+            )
+            v = log_nu - torch.logsumexp(
+                log_alpha + u.unsqueeze(1), dim=0
+            )
+
+        return (log_alpha + u.unsqueeze(1) + v.unsqueeze(0)).exp()
 
     pts_a = vision_points_2d(vision_a)
     pts_b = vision_points_2d(vision_b)
@@ -82,7 +91,11 @@ def match_sinkhorn_between_views(
 
         R = torch.stack([torch.stack([c, -s]), torch.stack([s, c])])
 
-        xa_in_b = xa @ R.T + t[b]
+        # pose_ab stores B's origin relative to A and B's yaw relative to A.
+        # Convert point coordinates from A to B:
+        # x_b = R(-yaw) @ (x_a - t_ab).
+        # With row-vector points this is (x_a - t_ab) @ R(yaw).
+        xa_in_b = (xa - t[b]) @ R
 
         pos_cost = torch.cdist(xa_in_b, xb, p=2)
 
@@ -99,7 +112,26 @@ def match_sinkhorn_between_views(
         cost_ext[:n_a, :n_b] = cost
 
         log_alpha = -cost_ext / temperature
-        P_ext = sinkhorn(log_alpha, sinkhorn_iters)
+
+        # Partial assignment marginals (SuperGlue-style): each real row/column
+        # has mass 1/(n_a+n_b); dustbins absorb the opposite side's unmatched
+        # mass. Scaling the resulting transport plan by n_a+n_b gives unit
+        # mass to every real row and real column.
+        total_mass = n_a + n_b
+        log_total_mass = torch.log(
+            torch.tensor(total_mass, device=device, dtype=dtype)
+        )
+        log_mu = torch.cat([
+            -log_total_mass.expand(n_a),
+            torch.tensor([n_b], device=device, dtype=dtype).log() - log_total_mass,
+        ])
+        log_nu = torch.cat([
+            -log_total_mass.expand(n_b),
+            torch.tensor([n_a], device=device, dtype=dtype).log() - log_total_mass,
+        ])
+
+        P_ext = sinkhorn(log_alpha, log_mu, log_nu, sinkhorn_iters)
+        P_ext = P_ext * total_mass
 
         P_real = P_ext[:n_a, :n_b]
         P_dustbin_col = P_ext[:n_a, n_b]
@@ -337,6 +369,7 @@ def matched_reprojection_loss_2d(
     occ_thresh=0.5,
     fov_degrees=90.0,
     matching_mode="gt",
+    return_match_count=False,
 ):
     if relative_pose_pred is None:
         raise ValueError("relative_pose_pred krävs för matched_reprojection_loss_2d")
@@ -383,6 +416,7 @@ def matched_reprojection_loss_2d(
     cos_yaw = yaw_vec[:, 1]
 
     losses = []
+    match_count = 0
 
     for batch_i in range(B):
         if matching_mode == "sinkhorn":
@@ -394,6 +428,7 @@ def matched_reprojection_loss_2d(
             if idx_a.numel() == 0 or idx_b.numel() == 0:
                 continue
 
+            match_count += idx_a.numel()
             pairs = zip(idx_a, idx_b)
 
         else:
@@ -420,6 +455,8 @@ def matched_reprojection_loss_2d(
 
                 pairs.append((pred_idx_a[pos_a[0]], pred_idx_b[pos_b[0]]))
 
+            match_count += len(pairs)
+
         s = sin_yaw[batch_i]
         c = cos_yaw[batch_i]
 
@@ -429,14 +466,17 @@ def matched_reprojection_loss_2d(
             x_a = pts_a[batch_i, ia]
             x_b = pts_b[batch_i, ib]
 
-            x_b_pred = R @ x_a + t[batch_i]
+            # Keep the same A-to-B convention as the Sinkhorn matcher.
+            x_b_pred = R.T @ (x_a - t[batch_i])
 
             losses.append(F.smooth_l1_loss(x_b_pred, x_b, reduction="mean"))
 
     if len(losses) == 0:
-        return pred_vision_a.sum() * 0.0
+        loss = pred_vision_a.sum() * 0.0
+        return (loss, match_count) if return_match_count else loss
 
-    return torch.stack(losses).mean()
+    loss = torch.stack(losses).mean()
+    return (loss, match_count) if return_match_count else loss
 
 def vision_loss(
     pred_vision, target_vision, occ_thresh=0.5, lambda_occ=1.0,
