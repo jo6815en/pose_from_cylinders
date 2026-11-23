@@ -12,26 +12,25 @@ def build_train_transform(image_size: int = 128) -> transforms.Compose:
     return transforms.Compose(
         [
             transforms.Resize((image_size, image_size)),
-            # Mild blur: occasionally simulate defocus / motion softness.
+            # Simulate more noticeable defocus / motion softness.
             transforms.RandomApply(
-                [transforms.GaussianBlur(kernel_size=5, sigma=(0.1, 1.5))],
-                p=0.20,
+                [transforms.GaussianBlur(kernel_size=7, sigma=(0.2, 2.0))],
+                p=0.35,
             ),
-            # Randomly change brightness, contrast and saturation.
-            # Hue is kept off initially because it is often more aggressive.
+            # Stronger random changes to brightness, contrast, saturation and hue.
             transforms.RandomApply(
                 [
                     transforms.ColorJitter(
-                        brightness=0.20,
-                        contrast=0.20,
-                        saturation=0.20,
-                        hue=0.0,
+                        brightness=0.40,
+                        contrast=0.40,
+                        saturation=0.40,
+                        hue=0.08,
                     )
                 ],
-                p=0.50,
+                p=0.80,
             ),
-            # Occasionally remove most/all color information.
-            transforms.RandomGrayscale(p=0.15),
+            # More often remove color information entirely.
+            transforms.RandomGrayscale(p=0.25),
             transforms.ToTensor(),
         ]
     )
