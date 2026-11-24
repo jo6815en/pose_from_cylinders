@@ -376,6 +376,7 @@ def evaluate_pose(
     pred_occ_threshold=0.2,
     debug=False,
     max_debug_examples=20,
+    predict_batch=None,
 ):
     """
     matching_mode:
@@ -383,8 +384,10 @@ def evaluate_pose(
         "gt_bins"   : GT-bin, men skattade matchningar.
         "predicted" : Skattade bin och skattade matchningar.
 
-    Radie och djup är förutsagda i alla tre testerna.
-    Avsedd för den uppdaterade modellen från model.py.
+    Radie och djup är förutsagda i alla tre standardlägena.
+    Avsedd för den uppdaterade modellen från model.py. För andra batchformat
+    kan predict_batch(model, batch, device) returnera (pred_pose, gt_pose,
+    sample_indices); då används samma gemensamma pose-mått och rapportering.
     """
     from model import predicted_bin_matches, pack_matched_pairs
 
@@ -393,14 +396,15 @@ def evaluate_pose(
         "gt_bins": "Learned pose with GT bins and predicted matches",
         "predicted": "Learned pose with predicted bins and matches",
     }
-    if matching_mode not in methods:
+    if predict_batch is None and matching_mode not in methods:
         raise ValueError(
             "matching_mode måste vara 'gt', 'gt_bins' eller 'predicted'."
         )
 
     model.eval()
     base_model = getattr(model, "_orig_mod", model)
-    method = methods[matching_mode]
+    method = ("Custom batch pose prediction" if predict_batch is not None
+              else methods[matching_mode])
 
     translation_errors = []
     yaw_errors = []
@@ -413,8 +417,51 @@ def evaluate_pose(
     debug_failure_reasons = {"too_few_matches": 0, "nonfinite_pose": 0,
                              "near_zero_translation": 0, "near_zero_yaw": 0}
     debug_examples = []
+    sample_indices = []
 
     for batch in loader:
+        if predict_batch is not None:
+            pose_pred, pose_gt, batch_indices = predict_batch(model, batch, device)
+            pose_pred = pose_pred.to(device=device, dtype=torch.float32)
+            pose_gt = pose_gt.to(device=device, dtype=torch.float32)
+            batch_indices = torch.as_tensor(batch_indices).cpu().tolist()
+            seen_pairs += len(pose_gt)
+
+            eligible = (
+                torch.isfinite(pose_gt).all(dim=-1)
+                & (pose_gt[:, :2].norm(dim=-1) > 1e-6)
+                & (pose_gt[:, 2:].norm(dim=-1) > 1e-8)
+            )
+            excluded_gt_pairs += (~eligible).sum().item()
+            total += eligible.sum().item()
+            valid = (
+                eligible
+                & torch.isfinite(pose_pred).all(dim=-1)
+                & (pose_pred[:, :2].norm(dim=-1) >= 1e-8)
+                & (pose_pred[:, 2:].norm(dim=-1) >= 1e-8)
+            )
+            failures += (eligible & ~valid).sum().item()
+
+            pred = pose_pred[valid]
+            gt = pose_gt[valid]
+            if len(pred):
+                t_pred = F.normalize(pred[:, :2], dim=-1)
+                t_gt = F.normalize(gt[:, :2], dim=-1)
+                cos_t = (t_pred * t_gt).sum(dim=-1).clamp(-1.0, 1.0)
+                translation_errors.extend(torch.rad2deg(torch.acos(cos_t)).cpu().tolist())
+
+                yaw_pred = torch.atan2(pred[:, 2], pred[:, 3])
+                yaw_gt = torch.atan2(gt[:, 2], gt[:, 3])
+                delta_yaw = yaw_pred - yaw_gt
+                yaw_errors.extend(torch.rad2deg(torch.atan2(
+                    torch.sin(delta_yaw), torch.cos(delta_yaw)
+                )).abs().cpu().tolist())
+                sample_indices.extend(
+                    index for index, is_valid in zip(batch_indices, valid.cpu().tolist())
+                    if is_valid
+                )
+            continue
+
         img_a, vision_a, img_b, vision_b, pose_gt = [
             x.to(device, non_blocking=True)
             for x in batch
@@ -613,9 +660,11 @@ def evaluate_pose(
         "total": total,
         "excluded_gt_pairs": excluded_gt_pairs,
         "method": method,
-        "matching_mode": matching_mode,
+        "matching_mode": "custom" if predict_batch is not None else matching_mode,
         "success_rate": len(t) / total if total else float("nan"),
     }
+    if predict_batch is not None:
+        metrics["sample_indices"] = np.asarray(sample_indices, dtype=int)
     if debug:
         metrics["debug_match_count_histogram"] = {
             int(k): int(v) for k, v in zip(*np.unique(debug_match_counts, return_counts=True))

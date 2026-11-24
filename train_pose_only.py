@@ -20,6 +20,7 @@ from torch.nn.utils.rnn import pad_sequence
 
 from dataset import SceneTwoPairsDataset
 from losses import relative_pose_loss_2d
+from metrics import evaluate_pose
 from model import MatchedPairPoseModel, matched_tokens, has_distinct_centers
 
 
@@ -107,47 +108,10 @@ def run_epoch(model, loader, device, optimizer=None):
     return {key: value / n for key, value in totals.items()}
 
 
-@torch.no_grad()
-def evaluate_pose(model, loader, device):
-    model.eval()
-    t_errors, yaw_errors, indices = [], [], []
-    total = failures = 0
-    for pairs, valid, target, original_indices in loader:
-        pred = model(pairs.to(device), valid.to(device)).cpu()
-        for p, gt, index in zip(pred, target, original_indices):
-            total += 1
-            if (not torch.isfinite(p).all() or p[:2].norm() < 1e-8
-                    or p[2:].norm() < 1e-8):
-                failures += 1
-                continue
-            t_pred = torch.nn.functional.normalize(p[:2], dim=0)
-            t_gt = torch.nn.functional.normalize(gt[:2], dim=0)
-            t_errors.append(torch.rad2deg(torch.acos((t_pred * t_gt).sum().clamp(-1, 1))).item())
-            delta = torch.atan2(p[2], p[3]) - torch.atan2(gt[2], gt[3])
-            yaw_errors.append(torch.rad2deg(torch.atan2(delta.sin(), delta.cos())).abs().item())
-            indices.append(index.item())
-    t, yaw = np.asarray(t_errors), np.asarray(yaw_errors)
-    def stat(x, fn):
-        return float(fn(x)) if len(x) else float('nan')
-    print('CAMERA POSE PERFORMANCE\n' + '=' * 60)
-    print(f'\nTest pairs:             {total}')
-    print(f'Successful poses:       {len(t)}')
-    print(f'Prediction failures:    {failures}')
-    print(f'Success rate:           {len(t) / max(total, 1):.3f}')
-    result = dict(total=total, failures=failures)
-    for prefix, label, values in [('translation', 'TRANSLATION DIRECTION ERROR', t),
-                                  ('yaw', 'YAW ERROR', yaw)]:
-        print('\n' + label + '\n' + '-' * 40)
-        for key, title, fn in [('mean', 'Mean', np.mean), ('median', 'Median', np.median),
-                               ('p90', 'P90', lambda x: np.percentile(x, 90))]:
-            result[f'{prefix}_{key}'] = stat(values, fn)
-            print(f'{title + ":":24s}{result[f"{prefix}_{key}"]:.2f}°')
-    print('\nACCURACY THRESHOLDS\n' + '-' * 40)
-    for threshold in (5, 10, 20, 30):
-        ta = stat(t, lambda x: np.mean(x < threshold))
-        ya = stat(yaw, lambda x: np.mean(x < threshold))
-        print(f'< {threshold:2d}°: T={100*ta:5.1f}% | Yaw={100*ya:5.1f}%')
-    return result, dict(translation_errors=t, yaw_errors=yaw, sample_indices=np.asarray(indices))
+def predict_pose_only_batch(model, batch, device):
+    pairs, valid, target, original_indices = batch
+    pred = model(pairs.to(device, non_blocking=True), valid.to(device, non_blocking=True))
+    return pred, target, original_indices
 
 
 def model_config(args):
@@ -218,10 +182,12 @@ def main():
         model.load_state_dict(checkpoint['model_state_dict'], strict=True)
         print('Checkpoint epoch:', checkpoint['epoch'])
         loader = make_loader(args.split, False)
-        result, arrays = evaluate_pose(model, loader, device)
+        result = evaluate_pose(
+            model, loader, device, predict_batch=predict_pose_only_batch
+        )
         with (output / 'pose_metrics.json').open('w') as f:
-            json.dump(result, f, indent=2)
-        np.savez(output / 'pose_errors.npz', **arrays)
+            json.dump({key: value for key, value in result.items()
+                       if not isinstance(value, np.ndarray)}, f, indent=2)
         return
 
     train_loader, val_loader = make_loader('dataset', True), make_loader('valdataset', False)
