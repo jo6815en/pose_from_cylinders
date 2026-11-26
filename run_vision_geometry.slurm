@@ -7,7 +7,7 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --gpus=1
 #SBATCH -t 12:00:00
-#SBATCH -J vision_geometry_d5_w05
+#SBATCH -J vision_geometry_224_2
 #SBATCH -o logs/%x-%j.out
 #SBATCH -e logs/%x-%j.err
 
@@ -37,18 +37,20 @@ python --version
 echo "Starting geometry training..."
 srun python -u train_vision.py \
     --stage geometry \
-    --init-checkpoint runs/slurm_vision_occupancy_org_5125793/checkpoints/best_vision.pt \
+    --init-checkpoint runs/slurm_vision_occupancy_224_2_5654301/checkpoints/best_vision.pt \
     --lambda-occ 10.0 \
     --lambda-radius 10.0 \
     --lambda-depth 5.0 \
-    --lambda-width 0.5\
+    --lambda-width 0.1\
     --lambda-corr 1.0 \
+    --temperature 0.1 \
     --lambda-depth-struct 0.5\
     --lambda-depth-delta 0.35 \
-    --epochs 200 \
+    --epochs 400 \
     --batch-size 16 \
-    --lr 5e-5 \
-    --num-workers 8 \
+    --lr 5e-4 \
+    --img-size 224 \
+    --num-workers 4 \
     --seed 0 \
     --output-dir "runs/slurm_${SLURM_JOB_NAME}_${SLURM_JOB_ID}" \
     2>&1 | tee "runs/slurm_${SLURM_JOB_NAME}_${SLURM_JOB_ID}/train.log"

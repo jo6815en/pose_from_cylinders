@@ -39,10 +39,10 @@ echo "Starting total fine-tuning..."
 srun python -u train_tot.py \
     --data-dir /nobackup/proj/disk/midlevel_representations/personal/johanna/data \
     --vision-checkpoint runs/slurm_vision_geometry_new_corr_org_5248241/checkpoints/best_vision.pt \
-    --pose-checkpoint runs/pose_only/checkpoints/best.pt \
+    --pose-checkpoint runs/slurm_pose_only_5352176/checkpoints/best.pt \
     --epochs 200 \
     --adapt-epochs 10 \
-    --freeze-vision-epoch 50 \
+    --freeze-vision-epoch 70 \
     --pred-match-ramp-epochs 40 \
     --pred-match-max-prob 1.0 \
     --batch-size 32 \

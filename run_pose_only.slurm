@@ -7,7 +7,7 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --gpus=1
 #SBATCH -t 4:00:00
-#SBATCH -J pose_only
+#SBATCH -J pose_only_new_2
 #SBATCH -o logs/%x-%j.out
 #SBATCH -e logs/%x-%j.err
 
@@ -39,7 +39,7 @@ python --version
 echo "Starting pose-only training..."
 srun python -u train_pose_only.py \
     --data-dir /nobackup/proj/disk/midlevel_representations/personal/johanna/data \
-    --epochs 100 \
+    --epochs 200 \
     --batch-size 16 \
     --lr 1e-4 \
     --val-interval 5 \

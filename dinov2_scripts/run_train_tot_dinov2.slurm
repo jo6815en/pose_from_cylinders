@@ -17,18 +17,9 @@ set -eo pipefail
 cd /nobackup/proj/disk/midlevel_representations/personal/johanna/pose_from_cylinders
 
 RUN_DIR="runs/slurm_${SLURM_JOB_NAME}_${SLURM_JOB_ID}"
-VISION_JOB_ID="REPLACE_WITH_DINOV2_GEOMETRY_JOB_ID"
-VISION_CHECKPOINT="runs/slurm_vision_geometry_dinov2_d5_w05_${VISION_JOB_ID}/checkpoints/best_vision.pt"
-POSE_CHECKPOINT="runs/pose_only/checkpoints/best.pt"
-
-if [[ "$VISION_JOB_ID" == "REPLACE_WITH_DINOV2_GEOMETRY_JOB_ID" || ! -f "$VISION_CHECKPOINT" ]]; then
-    echo "Set VISION_JOB_ID to the completed DINOv2 geometry job ID; expected checkpoint: $VISION_CHECKPOINT" >&2
-    exit 1
-fi
-if [[ ! -f "$POSE_CHECKPOINT" ]]; then
-    echo "Pose checkpoint not found: $POSE_CHECKPOINT" >&2
-    exit 1
-fi
+VISION_JOB_ID="slurm_vision_occupancy_dinov2_5690832"
+VISION_CHECKPOINT="runs/${VISION_JOB_ID}/checkpoints/best_vision.pt"
+POSE_CHECKPOINT="runs/slurm_pose_only_new_2_5654299/checkpoints/best.pt"
 
 mkdir -p "$RUN_DIR"
 
@@ -57,10 +48,10 @@ srun python -u train_tot_dinov2.py \
     --img-size 224 \
     --epochs 200 \
     --adapt-epochs 10 \
-    --freeze-vision-epoch 50 \
-    --pred-match-ramp-epochs 40 \
+    --freeze-vision-epoch 90 \
+    --pred-match-ramp-epochs 60 \
     --pred-match-max-prob 1.0 \
-    --batch-size 32 \
+    --batch-size 16 \
     --lr 1e-5 \
     --pose-lr 1e-5 \
     --adapt-lr 1e-4 \

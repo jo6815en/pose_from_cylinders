@@ -7,7 +7,7 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --gpus=1
 #SBATCH -t 12:00:00
-#SBATCH -J vision_geometry_dinov2_d5_w05
+#SBATCH -J vision_geometry_dinov2
 #SBATCH -o logs/%x-%j.out
 #SBATCH -e logs/%x-%j.err
 
@@ -34,12 +34,8 @@ echo "Python:"
 which python
 python --version
 
-OCCUPANCY_JOB_ID="REPLACE_WITH_DINOV2_OCCUPANCY_JOB_ID"
-OCCUPANCY_CHECKPOINT="runs/slurm_vision_occupancy_dinov2_${OCCUPANCY_JOB_ID}/checkpoints/best_vision.pt"
-if [[ "$OCCUPANCY_JOB_ID" == "REPLACE_WITH_DINOV2_OCCUPANCY_JOB_ID" || ! -f "$OCCUPANCY_CHECKPOINT" ]]; then
-    echo "Set OCCUPANCY_JOB_ID to the completed DINOv2 occupancy job ID; expected checkpoint: $OCCUPANCY_CHECKPOINT" >&2
-    exit 1
-fi
+OCCUPANCY_JOB_ID="slurm_vision_occupancy_dinov2_5690832"
+OCCUPANCY_CHECKPOINT="runs/${OCCUPANCY_JOB_ID}/checkpoints/best_vision.pt"
 
 echo "Starting DINOv2 geometry training..."
 srun python -u train_vision_dinov2.py \

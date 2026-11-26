@@ -6,8 +6,8 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --gpus=1
-#SBATCH -t 4:00:00
-#SBATCH -J vision_occupancy_big
+#SBATCH -t 12:00:00
+#SBATCH -J vision_occupancy_224_2
 #SBATCH -o logs/%x-%j.out
 #SBATCH -e logs/%x-%j.err
 
@@ -40,6 +40,7 @@ srun python -u train_vision.py \
     --epochs 200 \
     --batch-size 16 \
     --lr 5e-4 \
+    --img-size 224 \
     --num-workers 4 \
     --seed 0 \
     --output-dir "runs/slurm_${SLURM_JOB_NAME}_${SLURM_JOB_ID}" \
