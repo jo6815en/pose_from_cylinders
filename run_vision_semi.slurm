@@ -37,6 +37,8 @@ python --version
 echo "Starting semi-supervised vision training..."
 srun python -u train_vision_semi.py \
     --stage full \
+    --forest-dir forestdataset/skrylle \
+    --forest-stride 1 \
     --epochs 100 \
     --batch-size 16 \
     --lr 5e-5 \

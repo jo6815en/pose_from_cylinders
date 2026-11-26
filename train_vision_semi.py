@@ -36,10 +36,11 @@ from losses import (
 class ForestConsistencyDataset(Dataset):
     """Unlabeled forest images with two independent photometric views."""
 
-    def __init__(self, dataset_dir, image_size):
+    def __init__(self, dataset_dir, image_size, stride=1):
         self.root = Path(dataset_dir)
         self.image_dir = self.root / "images"
-        with open(self.root / "relative_poses.json", "r", encoding="utf-8") as f:
+        poses_file = self.root / f"relative_poses_stride_{stride}.json"
+        with open(poses_file, "r", encoding="utf-8") as f:
             pairs = json.load(f)
         # Each pair contributes its two images. Duplicates are harmless and
         # retain the complete image set used by the pair dataset.
@@ -285,7 +286,9 @@ def validate(model, loader, device, args):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--data-dir", default="/nobackup/proj/disk/midlevel_representations/personal/johanna/data")
-    parser.add_argument("--forest-dir", default="forest_torpa", help="Folder containing images/ and relative_poses.json")
+    parser.add_argument("--forest-dir", default="forest_torpa", help="Folder containing images/ and relative_poses_stride_<N>.json")
+    parser.add_argument("--forest-stride", type=int, default=1,
+                        help="Use relative_poses_stride_<N>.json from the forest dataset")
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--lr", type=float, default=5e-5)
@@ -361,7 +364,7 @@ def main():
     val_dataset = SceneTwoPairsDataset(root_dir=os.path.join(args.data_dir, "testdataset"),
         image_size=args.img_size, debug=False, return_two_pairs=False,
         transform=build_eval_transform(args.img_size))
-    forest_dataset = ForestConsistencyDataset(args.forest_dir, args.img_size)
+    forest_dataset = ForestConsistencyDataset(args.forest_dir, args.img_size, args.forest_stride)
     
     loader_kwargs = dict(batch_size=args.batch_size, num_workers=args.num_workers,
                          pin_memory=(device.type == "cuda"), persistent_workers=(args.num_workers > 0))
