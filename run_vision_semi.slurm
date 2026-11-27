@@ -17,7 +17,8 @@ set -eo pipefail
 
 cd /nobackup/proj/disk/midlevel_representations/personal/johanna/pose_from_cylinders
 
-mkdir -p "runs/slurm_${SLURM_JOB_NAME}_${SLURM_JOB_ID}/evaluation"
+RUN_DIR="$(pwd)/runs/slurm_${SLURM_JOB_NAME}_${SLURM_JOB_ID}"
+mkdir -p "$RUN_DIR/evaluation"
 
 module load GPU/Miniforge/26.9.4-1-eb
 eval "$(conda shell.bash hook)"
@@ -26,7 +27,7 @@ conda activate /home/johanna/.conda-hpc/el9_gh200/envs/pose_cylinders
 echo "Host: $(hostname)"
 echo "Job ID: $SLURM_JOB_ID"
 echo "Job name: $SLURM_JOB_NAME"
-echo "Run directory: runs/slurm_${SLURM_JOB_NAME}_${SLURM_JOB_ID}"
+echo "Run directory: $RUN_DIR"
 echo "GPU:"
 nvidia-smi --query-gpu=name,memory.total --format=csv
 
@@ -44,16 +45,16 @@ srun python -u train_vision_semi.py \
     --lr 5e-5 \
     --num-workers 8 \
     --seed 0 \
-    --output-dir "runs/slurm_${SLURM_JOB_NAME}_${SLURM_JOB_ID}" \
-    2>&1 | tee "runs/slurm_${SLURM_JOB_NAME}_${SLURM_JOB_ID}/train.log"
+    --output-dir "$RUN_DIR" \
+    2>&1 | tee "$RUN_DIR/train.log"
 
 echo "Training finished. Evaluating best.pt on testdataset..."
 srun python -u eval_vision.py \
-    --checkpoint "runs/slurm_${SLURM_JOB_NAME}_${SLURM_JOB_ID}/checkpoints/best.pt" \
+    --checkpoint "$RUN_DIR/checkpoints/best.pt" \
     --split testdataset \
     --batch-size 16 \
     --num-workers 8 \
     --occ-threshold 0.20 \
-    2>&1 | tee "runs/slurm_${SLURM_JOB_NAME}_${SLURM_JOB_ID}/evaluation/test_best.log"
+    2>&1 | tee "$RUN_DIR/evaluation/test_best.log"
 
-echo "Evaluation finished: runs/slurm_${SLURM_JOB_NAME}_${SLURM_JOB_ID}/evaluation/test_best.log"
+echo "Evaluation finished: $RUN_DIR/evaluation/test_best.log"
