@@ -38,8 +38,8 @@ python --version
 echo "Starting semi-supervised vision training..."
 srun python -u train_vision_semi.py \
     --stage geometry \
-    --init-checkpoint runs/slurm_vision_geometry_224_2_5658352/checkpoints/best_vision.pt
-    --forest-dir forestdataset/skrylle \
+    --init-checkpoint runs/slurm_vision_geometry_224_2_5658352/checkpoints/best_vision.pt \
+    --forest-dir ../data/forestdataset/skrylle \
     --forest-stride 1 \
     --epochs 100 \
     --batch-size 16 \
