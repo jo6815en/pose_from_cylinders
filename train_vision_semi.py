@@ -16,12 +16,10 @@ from pathlib import Path
 
 import numpy as np
 import torch
-import torch.nn.functional as F
-from PIL import Image
-from torch.utils.data import DataLoader, Dataset
-from torchvision import transforms
+from torch.utils.data import DataLoader
 
 from dataset import SceneTwoPairsDataset
+from forest_dataset import ForestConsistencyDataset
 from augmentations import build_train_transform, build_eval_transform
 from model import PairImageCylinderModel
 from metrics import relative_cylinder_errors
@@ -30,109 +28,13 @@ from losses import (
     patch_correspondence_loss,
     relative_depth_structure_loss,
     matched_depth_delta_loss,
+    consistency_loss,
+    occupancy_entropy,
+    topk_agreement_feedback,
+    occupancy_supervision_loss,
+    occupancy_rate_prior_loss,
 )
-
-
-class ForestConsistencyDataset(Dataset):
-    """Unlabeled forest images with two independent photometric views."""
-
-    def __init__(self, dataset_dir, image_size, stride=1):
-        self.root = Path(dataset_dir)
-        self.image_dir = self.root / "images"
-        poses_file = self.root / f"relative_poses_stride_{stride}.json"
-        with open(poses_file, "r", encoding="utf-8") as f:
-            pairs = json.load(f)
-        # Each pair contributes its two images. Duplicates are harmless and
-        # retain the complete image set used by the pair dataset.
-        self.image_names = [name for pair in pairs for name in
-                            (pair["from_image"], pair["to_image"])]
-        self.base_transform = build_eval_transform(image_size)
-        self.photo = transforms.ColorJitter(
-            brightness=0.25, contrast=0.25, saturation=0.20, hue=0.04
-        )
-        self.gray = transforms.RandomGrayscale(p=0.08)
-
-    def __len__(self):
-        return len(self.image_names)
-
-    def __getitem__(self, idx):
-        path = self.image_dir / self.image_names[idx]
-        with Image.open(path) as im:
-            image = im.convert("RGB")
-        # ColorJitter/Grayscale alter appearance only; the same deterministic
-        # resize/crop/normalization is applied to both views.
-        view_a = self.base_transform(self.gray(self.photo(image.copy())))
-        view_b = self.base_transform(self.gray(self.photo(image.copy())))
-        return view_a, view_b
-
-
-def move_batch_to_device(batch, device):
-    return tuple(x.to(device, non_blocking=True) for x in batch)
-
-
-def consistency_loss(pred_a, pred_b, occ_thresh=0.5, occupancy_only=False):
-    """Return total consistency and its occupancy/geometry components."""
-    with torch.autocast(device_type=pred_a.device.type, enabled=False):
-        a, b = pred_a.float(), pred_b.float()
-        occ = F.mse_loss(a[..., 0], b[..., 0])
-        if occupancy_only:
-            return occ, occ, occ.new_zeros(()), occ.new_zeros(())
-        # Avoid forcing arbitrary radius/depth/width values in empty bins.
-        mask = ((a[..., 0].detach() > occ_thresh) |
-                (b[..., 0].detach() > occ_thresh)).float()
-        geometry = F.smooth_l1_loss(a[..., 1:], b[..., 1:], reduction="none")
-        active_fraction = mask.mean()
-        geometry = (geometry * mask.unsqueeze(-1)).sum() / (
-            mask.sum().clamp_min(1.0) * geometry.shape[-1]
-        )
-        return occ + geometry, occ, geometry, active_fraction
-
-
-def occupancy_entropy(pred_a, pred_b):
-    """Mean Bernoulli entropy of the two forest-view occupancy predictions.
-
-    Minimizing this term favors confident probabilities near 0 or 1. The
-    batch-level occupancy prior remains active to constrain their mean rate.
-    """
-    with torch.autocast(device_type=pred_a.device.type, enabled=False):
-        eps = 1e-6
-        p = torch.cat((pred_a[..., 0].float().reshape(-1),
-                       pred_b[..., 0].float().reshape(-1)))
-        p = p.clamp(eps, 1.0 - eps)
-        return -(p * p.log() + (1.0 - p) * torch.log1p(-p)).mean()
-
-
-def topk_agreement_feedback(pred_a, pred_b, topk_fraction=0.072):
-    """Give weak positive pseudo-feedback to bins ranked highly in both views.
-
-    The top-k selection is detached from autograd. Only bins selected by both
-    augmentations receive positive targets; all other bins are left unlabeled
-    by this term. The occupancy-rate prior controls the overall prediction rate.
-    """
-    with torch.autocast(device_type=pred_a.device.type, enabled=False):
-        p_a = pred_a[..., 0].float()
-        p_b = pred_b[..., 0].float()
-        batch_size, num_bins = p_a.shape
-        k = max(1, min(num_bins, int(math.ceil(topk_fraction * num_bins))))
-
-        idx_a = torch.topk(p_a.detach(), k=k, dim=1).indices
-        idx_b = torch.topk(p_b.detach(), k=k, dim=1).indices
-        mask_a = torch.zeros_like(p_a, dtype=torch.bool).scatter_(1, idx_a, True)
-        mask_b = torch.zeros_like(p_b, dtype=torch.bool).scatter_(1, idx_b, True)
-        mutual_mask = mask_a & mask_b
-        mutual_count = mutual_mask.sum(dim=1).float()
-        overlap_fraction = (mutual_count / float(k)).mean()
-
-        if mutual_mask.any():
-            selected_a = p_a[mutual_mask].clamp(1e-6, 1.0 - 1e-6)
-            selected_b = p_b[mutual_mask].clamp(1e-6, 1.0 - 1e-6)
-            loss_a = F.binary_cross_entropy(selected_a, torch.ones_like(selected_a))
-            loss_b = F.binary_cross_entropy(selected_b, torch.ones_like(selected_b))
-            feedback_loss = 0.5 * (loss_a + loss_b)
-        else:
-            feedback_loss = (p_a.sum() + p_b.sum()) * 0.0
-
-        return feedback_loss, mutual_count.mean(), overlap_fraction
+from utils import move_batch_to_device
 
 
 def train_one_epoch(model, loader, forest_loader, optimizer, device, args, scaler,
@@ -166,8 +68,8 @@ def train_one_epoch(model, loader, forest_loader, optimizer, device, args, scale
             pred_a, pred_b = out[:2]
             if args.occupancy_only:
                 with torch.autocast(device_type=device.type, enabled=False):
-                    occ_a = F.binary_cross_entropy(pred_a[..., 0].float().clamp(1e-6, 1-1e-6), vision_a[..., 0].float())
-                    occ_b = F.binary_cross_entropy(pred_b[..., 0].float().clamp(1e-6, 1-1e-6), vision_b[..., 0].float())
+                    occ_a = occupancy_supervision_loss(pred_a, vision_a)
+                    occ_b = occupancy_supervision_loss(pred_b, vision_b)
                 vis_loss = args.lambda_occ * 0.5 * (occ_a + occ_b)
                 rad_a = rad_b = dep_a = dep_b = width_a = width_b = vis_loss.new_zeros(())
                 corr = struct = delta = vis_loss.new_zeros(())
@@ -200,11 +102,9 @@ def train_one_epoch(model, loader, forest_loader, optimizer, device, args, scale
             )
             # Occupancy predictions are probabilities (already passed through
             # sigmoid), so use BCE in float32 with autocast disabled.
-            with torch.autocast(device_type=device.type, enabled=False):
-                occupancy_prior = F.binary_cross_entropy(
-                    forest_occ_mean.float().clamp(1e-6, 1.0 - 1e-6),
-                    supervised_occ_target.float().clamp(1e-6, 1.0 - 1e-6),
-                )
+            occupancy_prior = occupancy_rate_prior_loss(
+                forest_occ_mean, supervised_occ_target
+            )
             entropy = occupancy_entropy(pred_fa, pred_fb)
             topk_feedback, topk_mutual_bins, topk_overlap_fraction = (
                 topk_agreement_feedback(pred_fa, pred_fb, args.topk_fraction)
@@ -257,8 +157,8 @@ def validate(model, loader, device, args):
         out = model(img_a, img_b, return_corr=not args.occupancy_only, compute_pose=False)
         pa, pb = out[:2]
         if args.occupancy_only:
-            occ_a = F.binary_cross_entropy(pa[..., 0].float().clamp(1e-6, 1-1e-6), vision_a[..., 0].float())
-            occ_b = F.binary_cross_entropy(pb[..., 0].float().clamp(1e-6, 1-1e-6), vision_b[..., 0].float())
+            occ_a = occupancy_supervision_loss(pa, vision_a)
+            occ_b = occupancy_supervision_loss(pb, vision_b)
             vis = args.lambda_occ * 0.5 * (occ_a + occ_b)
             ra = rb = da = db = wa = wb = vis.new_zeros(())
             corr = struct = delta = vis.new_zeros(())
@@ -286,7 +186,8 @@ def validate(model, loader, device, args):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--data-dir", default="/nobackup/proj/disk/midlevel_representations/personal/johanna/data")
-    parser.add_argument("--forest-dir", default="forest_torpa", help="Folder containing images/ and relative_poses_stride_<N>.json")
+    parser.add_argument("--forest-dir", default="forestdataset/skrylle",
+                        help="Folder containing images/ and relative_poses_stride_<N>.json")
     parser.add_argument("--forest-stride", type=int, default=1,
                         help="Use relative_poses_stride_<N>.json from the forest dataset")
     parser.add_argument("--epochs", type=int, default=100)

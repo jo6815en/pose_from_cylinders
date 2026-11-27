@@ -1,3 +1,5 @@
+import math
+
 import torch
 import torch.nn.functional as F
 
@@ -512,6 +514,90 @@ def vision_loss(
     total = (lambda_occ * occ_loss + lambda_radius * rad_loss + lambda_depth * dep_loss + lambda_width * width_loss)
 
     return total, occ_loss, rad_loss, dep_loss, width_loss
+
+
+def consistency_loss(pred_a, pred_b, occ_thresh=0.5, occupancy_only=False):
+    """Return total consistency and its occupancy/geometry components."""
+    with torch.autocast(device_type=pred_a.device.type, enabled=False):
+        a, b = pred_a.float(), pred_b.float()
+        occ = F.mse_loss(a[..., 0], b[..., 0])
+        if occupancy_only:
+            return occ, occ, occ.new_zeros(()), occ.new_zeros(())
+        # Avoid forcing arbitrary radius/depth/width values in empty bins.
+        mask = ((a[..., 0].detach() > occ_thresh) |
+                (b[..., 0].detach() > occ_thresh)).float()
+        geometry = F.smooth_l1_loss(a[..., 1:], b[..., 1:], reduction="none")
+        active_fraction = mask.mean()
+        geometry = (geometry * mask.unsqueeze(-1)).sum() / (
+            mask.sum().clamp_min(1.0) * geometry.shape[-1]
+        )
+        return occ + geometry, occ, geometry, active_fraction
+
+
+def occupancy_entropy(pred_a, pred_b):
+    """Mean Bernoulli entropy of the two forest-view occupancy predictions.
+
+    Minimizing this term favors confident probabilities near 0 or 1. The
+    batch-level occupancy prior remains active to constrain their mean rate.
+    """
+    with torch.autocast(device_type=pred_a.device.type, enabled=False):
+        eps = 1e-6
+        p = torch.cat((pred_a[..., 0].float().reshape(-1),
+                       pred_b[..., 0].float().reshape(-1)))
+        p = p.clamp(eps, 1.0 - eps)
+        return -(p * p.log() + (1.0 - p) * torch.log1p(-p)).mean()
+
+
+def topk_agreement_feedback(pred_a, pred_b, topk_fraction=0.072):
+    """Give weak positive pseudo-feedback to bins ranked highly in both views.
+
+    The top-k selection is detached from autograd. Only bins selected by both
+    augmentations receive positive targets; all other bins are left unlabeled
+    by this term. The occupancy-rate prior controls the overall prediction rate.
+    """
+    with torch.autocast(device_type=pred_a.device.type, enabled=False):
+        p_a = pred_a[..., 0].float()
+        p_b = pred_b[..., 0].float()
+        num_bins = p_a.shape[1]
+        k = max(1, min(num_bins, int(math.ceil(topk_fraction * num_bins))))
+
+        idx_a = torch.topk(p_a.detach(), k=k, dim=1).indices
+        idx_b = torch.topk(p_b.detach(), k=k, dim=1).indices
+        mask_a = torch.zeros_like(p_a, dtype=torch.bool).scatter_(1, idx_a, True)
+        mask_b = torch.zeros_like(p_b, dtype=torch.bool).scatter_(1, idx_b, True)
+        mutual_mask = mask_a & mask_b
+        mutual_count = mutual_mask.sum(dim=1).float()
+        overlap_fraction = (mutual_count / float(k)).mean()
+
+        if mutual_mask.any():
+            selected_a = p_a[mutual_mask].clamp(1e-6, 1.0 - 1e-6)
+            selected_b = p_b[mutual_mask].clamp(1e-6, 1.0 - 1e-6)
+            loss_a = F.binary_cross_entropy(selected_a, torch.ones_like(selected_a))
+            loss_b = F.binary_cross_entropy(selected_b, torch.ones_like(selected_b))
+            feedback_loss = 0.5 * (loss_a + loss_b)
+        else:
+            feedback_loss = (p_a.sum() + p_b.sum()) * 0.0
+
+        return feedback_loss, mutual_count.mean(), overlap_fraction
+
+
+def occupancy_supervision_loss(prediction, target):
+    """Binary cross-entropy for occupancy-only supervised training."""
+    with torch.autocast(device_type=prediction.device.type, enabled=False):
+        return F.binary_cross_entropy(
+            prediction[..., 0].float().clamp(1e-6, 1.0 - 1e-6),
+            target[..., 0].float(),
+        )
+
+
+def occupancy_rate_prior_loss(predicted_rate, target_rate):
+    """Match the mean predicted occupancy rate to a target rate."""
+    with torch.autocast(device_type=predicted_rate.device.type, enabled=False):
+        return F.binary_cross_entropy(
+            predicted_rate.float().clamp(1e-6, 1.0 - 1e-6),
+            target_rate.float().clamp(1e-6, 1.0 - 1e-6),
+        )
+
 
 def relative_pose_loss_2d(pred_pose, target_pose, t_weight=1.0, r_weight=1.0):
     pred_t = F.normalize(pred_pose[:, :2], dim=-1)

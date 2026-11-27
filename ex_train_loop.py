@@ -2,14 +2,14 @@ import torch
 from torch.utils.data import DataLoader
 from torchvision import transforms
 
-from colmap_pair_dataset import ColmapPairDataset
+from forest_dataset import ForestPairDataset
 
 transform = transforms.Compose([
     transforms.Resize((256, 256)),
     transforms.ToTensor(),
 ])
 
-dataset = ColmapPairDataset(
+dataset = ForestPairDataset(
     dataset_dir="forest_torpa",
     transform=transform,
     return_names=True,

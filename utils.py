@@ -3,6 +3,12 @@ import numpy as np
 from matplotlib.patches import Rectangle
 import torch
 
+
+def move_batch_to_device(batch, device):
+    """Move every tensor in a collated batch to the requested device."""
+    return tuple(x.to(device, non_blocking=True) for x in batch)
+
+
 def save_checkpoint(path, model, optimizer, history, epoch, val_metrics):
     torch.save({
         "epoch": epoch,

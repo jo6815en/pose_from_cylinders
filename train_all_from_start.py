@@ -21,10 +21,7 @@ from losses import (
     relative_pose_loss_2d,
     masked_relative_pose_loss_2d
 )
-
-
-def move_batch_to_device(batch, device):
-    return tuple(x.to(device, non_blocking=True) for x in batch)
+from utils import move_batch_to_device
 
 
 def train_one_epoch(

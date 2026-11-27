@@ -6,6 +6,8 @@ from torch.utils.data import Dataset
 from PIL import Image
 from torchvision import transforms
 
+from augmentations import build_eval_transform
+
 
 class ForestPairDataset(Dataset):
     """Image-pair dataset for forest sequences and their relative camera poses.
@@ -84,3 +86,36 @@ class ForestPairDataset(Dataset):
                 "image_b_name": image_b_name,
             }
         return image_a, image_b, T_ab
+
+
+class ForestConsistencyDataset(Dataset):
+    """Unlabeled forest images with two independent photometric views."""
+
+    def __init__(self, dataset_dir, image_size, stride=1):
+        self.root = Path(dataset_dir)
+        self.image_dir = self.root / "images"
+        poses_file = self.root / f"relative_poses_stride_{stride}.json"
+        with open(poses_file, "r", encoding="utf-8") as f:
+            pairs = json.load(f)
+        # Each pair contributes its two images. Duplicates are harmless and
+        # retain the complete image set used by the pair dataset.
+        self.image_names = [name for pair in pairs for name in
+                            (pair["from_image"], pair["to_image"])]
+        self.base_transform = build_eval_transform(image_size)
+        self.photo = transforms.ColorJitter(
+            brightness=0.25, contrast=0.25, saturation=0.20, hue=0.04
+        )
+        self.gray = transforms.RandomGrayscale(p=0.08)
+
+    def __len__(self):
+        return len(self.image_names)
+
+    def __getitem__(self, idx):
+        path = self.image_dir / self.image_names[idx]
+        with Image.open(path) as im:
+            image = im.convert("RGB")
+        # ColorJitter/Grayscale alter appearance only; the same deterministic
+        # resize/crop/normalization is applied to both views.
+        view_a = self.base_transform(self.gray(self.photo(image.copy())))
+        view_b = self.base_transform(self.gray(self.photo(image.copy())))
+        return view_a, view_b

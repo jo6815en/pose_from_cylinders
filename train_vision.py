@@ -31,10 +31,7 @@ from losses import (
     relative_depth_structure_loss,
     matched_depth_delta_loss,
 )
-
-
-def move_batch_to_device(batch, device):
-    return tuple(x.to(device, non_blocking=True) for x in batch)
+from utils import move_batch_to_device
 
 
 def train_one_epoch(

@@ -16,11 +16,11 @@ Training is organized as scripts: `train_vision.py` pretrains the vision model, 
 - `analyze_dataset.ipynb`: dataset and camera-pose analysis/debugging.
 - `model.py`: pair model with patch embedding, Transformer backbone, vision head, and pose head.
 - `dataset.py`: dataset class for synthetic cylinder scenes with `labels.json` annotations.
-- `colmap_pair_dataset.py`: dataset class for image pairs with relative COLMAP poses.
+- `forest_dataset.py`: dataset classes for forest image pairs and unlabeled forest consistency views.
 - `losses.py`: supervised loss, pose loss, vision loss, Sinkhorn matching, radius consistency, and reprojection loss.
 - `utils.py`: plotting utilities and small pose/vision helper functions.
 - `debugger.py`: helpers for inspecting cameras, yaw, and dataset entries.
-- `ex_train_loop.py`: minimal example for reading `ColmapPairDataset`.
+- `ex_train_loop.py`: minimal example for reading `ForestPairDataset`.
 - `working_requirements.txt`: dependencies used in the working environment.
 
 ## Data
@@ -69,7 +69,7 @@ The model predicts the corresponding `(num_bins, 3)` representation:
 
 ### Forest/COLMAP Data
 
-`ColmapPairDataset` reads:
+`ForestPairDataset` reads:
 
 ```text
 forestdataset/
@@ -152,7 +152,7 @@ The training notebooks include cells for:
 Check that the Python files compile:
 
 ```bash
-venv/bin/python -m py_compile model.py dataset.py colmap_pair_dataset.py losses.py utils.py debugger.py
+venv/bin/python -m py_compile model.py dataset.py forest_dataset.py losses.py utils.py debugger.py
 ```
 
 ## License
