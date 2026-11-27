@@ -36,7 +36,8 @@ python --version
 
 echo "Starting semi-supervised vision training..."
 srun python -u train_vision_semi.py \
-    --stage full \
+    --stage geometry \
+    --init-checkpoint runs/slurm_vision_geometry_224_2_5658352/checkpoints/best_vision.pt
     --epochs 100 \
     --batch-size 16 \
     --lr 5e-5 \
