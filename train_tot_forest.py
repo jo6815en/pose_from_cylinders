@@ -36,52 +36,94 @@ from utils import plot_estimated_cylinders_on_images, plot_relative_pose, pose_t
 from utils import move_batch_to_device
 
 
+# CLI options mirror train_tot.py and expose forest-specific settings.
+parser = argparse.ArgumentParser(description="Train the total model with forest consistency.")
+parser.add_argument("--data-dir", type=Path, default=Path("."))
+parser.add_argument("--vision-checkpoint", type=Path, default=Path("runs/vision_semi_good/checkpoints/latest.pt"))
+parser.add_argument("--pose-checkpoint", type=Path, default=Path("arrhenius_runs/slurm_pose_only_5842490/checkpoints/best.pt"))
+parser.add_argument("--output-dir", type=Path, default=Path("runs/total_finetune_224_skrylle"))
+parser.add_argument("--epochs", type=int, default=200)
+parser.add_argument("--freeze-vision-epoch", type=int, default=50)
+parser.add_argument("--pred-match-ramp-epochs", type=int, default=None)
+parser.add_argument("--pred-match-max-prob", type=float, default=1.0)
+parser.add_argument("--resume-training", action="store_true")
+parser.add_argument("--resume-checkpoint", default=None)
+parser.add_argument("--batch-size", type=int, default=8)
+parser.add_argument("--lr", type=float, default=1e-5)
+parser.add_argument("--pose-lr", type=float, default=1e-5)
+parser.add_argument("--adapt-lr", type=float, default=1e-4)
+parser.add_argument("--adapt-epochs", type=int, default=10)
+parser.add_argument("--val-interval", type=int, default=10)
+parser.add_argument("--num-workers", type=int, default=4)
+parser.add_argument("--seed", type=int, default=0)
+parser.add_argument("--img-size", type=int, default=224)
+parser.add_argument("--patch-size", type=int, nargs=2, default=(16, 4))
+parser.add_argument("--embed-dim", type=int, default=192)
+parser.add_argument("--depth", type=int, default=4)
+parser.add_argument("--num-heads", type=int, default=4)
+parser.add_argument("--num-bins", type=int, default=128)
+parser.add_argument("--dropout", type=float, default=0.1)
+parser.add_argument("--occ-thresh", type=float, default=0.5)
+parser.add_argument("--lambda-occ", type=float, default=10.0)
+parser.add_argument("--lambda-radius", type=float, default=10.0)
+parser.add_argument("--lambda-width", type=float, default=0.1)
+parser.add_argument("--lambda-corr", type=float, default=1.0)
+parser.add_argument("--lambda-depth-delta", type=float, default=0.35)
+parser.add_argument("--lambda-pose", type=float, default=2.0)
+parser.add_argument("--lambda-sinkhorn", type=float, default=0.1)
+parser.add_argument("--forest-enabled", action=argparse.BooleanOptionalAction, default=True)
+parser.add_argument("--forest-start-epoch", type=int, default=1)
+parser.add_argument("--forest-batch-size", type=int, default=2)
+parser.add_argument("--forest-dataset-preset", choices=("torpa", "skrylle_stride_1", "skrylle_stride_5", "skrylle_stride_10", "skrylle_stride_20"), default="skrylle_stride_20")
+args = parser.parse_args()
+
+
 # -----------------------------------------------------------------------------
 # Configuration
 # -----------------------------------------------------------------------------
-DATA_DIR = Path(".")
-OUTPUT_DIR = Path("runs/total_finetune_224_skrylle")
+DATA_DIR = args.data_dir
+OUTPUT_DIR = args.output_dir
 #VISION_CHECKPOINT = Path("runs/vision_geometry_org_new_corr_new_data/checkpoints/best_vision.pt")
-VISION_CHECKPOINT = Path("runs/vision_semi_good/checkpoints/latest.pt")
-POSE_CHECKPOINT = Path("arrhenius_runs/slurm_pose_only_5842490/checkpoints/best.pt")
+VISION_CHECKPOINT = args.vision_checkpoint
+POSE_CHECKPOINT = args.pose_checkpoint
 
-BATCH_SIZE = 8
-NUM_EPOCHS = 200  # Total epochs; vision freezes after FREEZE_VISION_EPOCH.
-ADAPT_EPOCHS = 10
-FREEZE_VISION_EPOCH = 50  # Epochs 1–50 train vision; epoch 51 onward is pose-only.
+BATCH_SIZE = args.batch_size
+NUM_EPOCHS = args.epochs
+ADAPT_EPOCHS = args.adapt_epochs
+FREEZE_VISION_EPOCH = args.freeze_vision_epoch
 
-PRED_MATCH_RAMP_EPOCHS = FREEZE_VISION_EPOCH - ADAPT_EPOCHS
-PRED_MATCH_MAX_PROB = 1.0  # Reach 100% predicted matches by the freeze phase.
+PRED_MATCH_RAMP_EPOCHS = (FREEZE_VISION_EPOCH - ADAPT_EPOCHS if args.pred_match_ramp_epochs is None else args.pred_match_ramp_epochs)
+PRED_MATCH_MAX_PROB = args.pred_match_max_prob
 
-ADAPT_LEARNING_RATE = 1e-4
-LEARNING_RATE = 1e-5  # Vision LR during joint fine-tuning.
-POSE_LEARNING_RATE = 1e-5  # Pose LR during joint fine-tuning.
+ADAPT_LEARNING_RATE = args.adapt_lr
+LEARNING_RATE = args.lr
+POSE_LEARNING_RATE = args.pose_lr
 
-VAL_INTERVAL = 10
-SEED = 0
+VAL_INTERVAL = args.val_interval
+SEED = args.seed
 
-NUM_WORKERS = 4
-IMG_SIZE = 224
-PATCH_SIZE = (16, 4)
-NUM_BINS = 128
-EMBED_DIM = 192
-DEPTH = 4
-NUM_HEADS = 4
-DROPOUT = 0.1
+NUM_WORKERS = args.num_workers
+IMG_SIZE = args.img_size
+PATCH_SIZE = tuple(args.patch_size)
+NUM_BINS = args.num_bins
+EMBED_DIM = args.embed_dim
+DEPTH = args.depth
+NUM_HEADS = args.num_heads
+DROPOUT = args.dropout
  
-LAMBDA_OCC = 10.0
-LAMBDA_RADIUS = 10.0
-OCC_THRESH = 0.5
-LAMBDA_CORR = 1.0
-LAMBDA_POSE = 2.0
-LAMBDA_DEPTH_DELTA = 0.35
-LAMBDA_WIDTH = 0.1
-LAMBDA_SINKHORN = 0.1
+LAMBDA_OCC = args.lambda_occ
+LAMBDA_RADIUS = args.lambda_radius
+OCC_THRESH = args.occ_thresh
+LAMBDA_CORR = args.lambda_corr
+LAMBDA_POSE = args.lambda_pose
+LAMBDA_DEPTH_DELTA = args.lambda_depth_delta
+LAMBDA_WIDTH = args.lambda_width
+LAMBDA_SINKHORN = args.lambda_sinkhorn
 
 BEST_MODEL_PATH = str(OUTPUT_DIR / "checkpoints" / "best.pt")
 LATEST_MODEL_PATH = str(OUTPUT_DIR / "checkpoints" / "latest.pt")
-RESUME_TRAINING = False
-RESUME_CHECKPOINT_PATH = LATEST_MODEL_PATH
+RESUME_TRAINING = args.resume_training
+RESUME_CHECKPOINT_PATH = args.resume_checkpoint or LATEST_MODEL_PATH
 
 BEST_ADAPT_PATH = str(OUTPUT_DIR / "checkpoints" / "best_adapt.pt")
 BEST_POSE_PATH = str(OUTPUT_DIR / "checkpoints" / "best_pose.pt")
@@ -90,16 +132,16 @@ INFERENCE_BATCH_SIZE = 4
 INFERENCE_SHOW_TEXT = False
 INFERENCE_SHOW_IMAGES = True
 VISION_SAMPLE_IDX = 0
-FOREST_ENABLED = True
-FOREST_START_EPOCH = 1
-FOREST_BATCH_SIZE = 2
+FOREST_ENABLED = args.forest_enabled
+FOREST_START_EPOCH = args.forest_start_epoch
+FOREST_BATCH_SIZE = args.forest_batch_size
 FOREST_SAMPLE_IDX = 0
 FOREST_OCC_THRESHOLD = 0.3
 
 # Default keeps the existing training/evaluation data unchanged.
 # Set FOREST_DATASET_PRESET to one of the Skrylle entries to use that stride
 # for the forest batches used during training.
-FOREST_DATASET_PRESET = "skrylle_stride_20"
+FOREST_DATASET_PRESET = args.forest_dataset_preset
 
 FOREST_DATASET_PRESETS = {
     "torpa": (DATA_DIR / "forest_torpa", "relative_poses.json"),
@@ -116,7 +158,6 @@ FOREST_EVAL_PRESETS = ["snoge_stride_*"]
 
 
 # Check component settings, configure device and seeds (same as train_tot.py).
-parser = argparse.ArgumentParser()
 if not 0 <= ADAPT_EPOCHS < FREEZE_VISION_EPOCH < NUM_EPOCHS:
     parser.error("Require 0 <= --adapt-epochs < --freeze-vision-epoch < --epochs")
 
